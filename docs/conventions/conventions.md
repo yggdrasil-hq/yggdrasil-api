@@ -1,4 +1,4 @@
-# Backend — local conventions
+# API — local conventions
 
 **Read this when:** you need conventions specific to this repo (style, patterns,
 structure) that aren't covered by the suite-wide conventions.

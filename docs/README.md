@@ -1,4 +1,4 @@
-# Backend docs — index
+# API docs — index
 
 Agent + developer docs for this repo. Start from [`../CLAUDE.md`](../CLAUDE.md).
 Suite-wide docs live in the meta repo's `../../docs/`.

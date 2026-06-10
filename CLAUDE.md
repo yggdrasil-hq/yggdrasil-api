@@ -1,4 +1,4 @@
-# CLAUDE.md — Backend (Yggdrasil API)
+# CLAUDE.md — API (Yggdrasil API)
 
 > Canonical agent guide for this repo. `AGENTS.md` is a thin pointer to this
 > file. This repo is a **git submodule** of the Yggdrasil meta repo.
@@ -15,12 +15,12 @@
 
 Single source of truth for all persistent state: users, teams, projects, features,
 agent jobs, test suites, test reports, and notifications. Manages GitHub OAuth
-tokens, dispatches jobs to the Forge, and delivers real-time events to the
-Frontend.
+tokens, dispatches jobs to the Orchestrator, and delivers real-time events to the
+Web app.
 
-- **Role in Yggdrasil:** Backend
+- **Role in Yggdrasil:** API
 - **Stack:** REST + WebSocket API, PostgreSQL, object storage for logs/reports/recordings (planned)
-- **Talks to:** Frontend (REST + WebSocket), Forge (job dispatch + streamed events), GitHub (OAuth, scoped tokens for runs)
+- **Talks to:** Web (REST + WebSocket), Orchestrator (job dispatch + streamed events), GitHub (OAuth, scoped tokens for runs)
 
 ## Suite-wide context (up-links to the meta repo)
 
@@ -29,7 +29,7 @@ Frontend.
 - Product & scope: `../docs/overview/product.md`
 - Architecture / data flow: `../docs/overview/architecture.md`
 - Glossary: `../docs/overview/glossary.md`
-- This component's bridge page: `../docs/components/backend.md`
+- This component's bridge page: `../docs/components/api.md`
 - Job dispatch contract: `../docs/concepts/job-dispatch.md`
 - Roadmap & open questions: `../docs/roadmap/`
 
