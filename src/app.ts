@@ -4,9 +4,16 @@ import type pg from "pg";
 import { createAuthRouter, createSettingsRouter } from "./auth/routes.js";
 import { LoginRateLimiter } from "./auth/rate-limit.js";
 import { SessionService } from "./auth/sessions.js";
+import { FeatureRepository } from "./features/repository.js";
 import { createGitHubRouter } from "./github/routes.js";
 import { GithubTokenRepository } from "./github/token-repository.js";
 import { OAuthStateRepository } from "./github/oauth.js";
+import { JobRepository } from "./jobs/repository.js";
+import { NotificationRepository } from "./notifications/repository.js";
+import { createNotificationsRouter } from "./notifications/routes.js";
+import { ProjectRepository } from "./projects/repository.js";
+import { createProjectsRouter } from "./projects/routes.js";
+import { TestRepository } from "./tests/repository.js";
 import { UserRepository } from "./users/repository.js";
 
 export interface AppDependencies {
@@ -32,10 +39,38 @@ export function createApp(deps?: AppDependencies): Express {
   const rateLimiter = new LoginRateLimiter(deps.pool);
   const githubTokens = new GithubTokenRepository(deps.pool);
   const oauthStates = new OAuthStateRepository(deps.pool);
+  const projects = new ProjectRepository(deps.pool);
+  const features = new FeatureRepository(deps.pool);
+  const tests = new TestRepository(deps.pool);
+  const jobs = new JobRepository(deps.pool);
+  const notifications = new NotificationRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions, rateLimiter }));
   app.use("/auth", createGitHubRouter({ users, sessions, oauthStates, githubTokens }));
   app.use("/settings", createSettingsRouter({ users, sessions, githubTokens }));
+  app.use(
+    "/projects",
+    createProjectsRouter({
+      users,
+      sessions,
+      projects,
+      features,
+      tests,
+      jobs,
+      notifications,
+    }),
+  );
+  app.use(
+    "/notifications",
+    createNotificationsRouter({ users, sessions, notifications }),
+  );
+
+  app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error(err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Internal server error" });
+    }
+  });
 
   return app;
 }
