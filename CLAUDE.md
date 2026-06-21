@@ -37,6 +37,7 @@ Web app.
 
 | If your task is about…        | Read                          |
 |-------------------------------|-------------------------------|
+| Authentication / sessions / OAuth | Meta: `../docs/concepts/authentication.md` → `docs/concepts/authentication.md` |
 | Orientation / how it's built  | `docs/overview/architecture.md` |
 | Local dev / setup             | `docs/overview/setup.md`      |
 | Conventions specific to here  | `docs/conventions/`           |

@@ -1,20 +1,24 @@
-import express from "express";
+import { createApp } from "./app.js";
+import { config } from "./config.js";
+import { runMigrations } from "./db/migrate.js";
+import { closePool, getPool } from "./db/pool.js";
 
-export function createApp() {
-  const app = express();
+async function main(): Promise<void> {
+  const pool = getPool();
+  await runMigrations(pool);
 
-  app.get("/health", (_req, res) => {
-    res.json({ status: "ok", service: "yggdrasil-api" });
+  const app = createApp({ pool });
+  app.listen(config.port, "0.0.0.0", () => {
+    console.log(`API listening on :${config.port}`);
   });
-
-  return app;
 }
-
-const port = Number(process.env.PORT) || 3000;
 
 if (process.env.NODE_ENV !== "test") {
-  const app = createApp();
-  app.listen(port, "0.0.0.0", () => {
-    console.log(`API listening on :${port}`);
+  main().catch(async (error) => {
+    console.error(error);
+    await closePool();
+    process.exit(1);
   });
 }
+
+export { createApp };

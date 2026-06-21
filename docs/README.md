@@ -15,7 +15,7 @@ before reading the body.
 ## concepts/
 | Doc | Read this when |
 |-----|----------------|
-| _add docs as the component grows_ | |
+| [`concepts/authentication.md`](concepts/authentication.md) | Auth routes, sessions, OAuth, migrations. |
 
 ## conventions/
 | Doc | Read this when |
