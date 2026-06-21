@@ -7,4 +7,6 @@ RUN npm ci
 COPY . .
 
 ENV NODE_ENV=test
-CMD ["npm", "test"]
+RUN chmod +x scripts/run-tests.sh
+
+CMD ["scripts/run-tests.sh"]
