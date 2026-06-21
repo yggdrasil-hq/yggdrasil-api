@@ -35,3 +35,19 @@ export function assertDatabaseUrl(): string {
 export function isGitHubOAuthConfigured(): boolean {
   return Boolean(config.github.clientId && config.github.clientSecret);
 }
+
+/** Build a browser redirect URL under APP_PUBLIC_URL (avoids `new URL` absolute-path pitfall). */
+export function appPublicRedirect(
+  path: string,
+  params?: Record<string, string>,
+): string {
+  const base = config.appPublicUrl.replace(/\/$/, "");
+  const suffix = path === "/" ? "" : path.startsWith("/") ? path : `/${path}`;
+  const url = new URL(`${base}${suffix}`);
+  if (params) {
+    for (const [key, value] of Object.entries(params)) {
+      url.searchParams.set(key, value);
+    }
+  }
+  return url.toString();
+}

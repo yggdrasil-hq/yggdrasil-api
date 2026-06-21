@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { config, isGitHubOAuthConfigured } from "../config.js";
+import { config, isGitHubOAuthConfigured, appPublicRedirect } from "../config.js";
 import { clearSessionCookie, setSessionCookie } from "../auth/cookies.js";
 import { createAuthMiddleware, optionalAuth } from "../auth/middleware.js";
 import type { SessionService } from "../auth/sessions.js";
@@ -16,16 +16,6 @@ import { UserRepository } from "../users/repository.js";
 import { toPublicUser } from "../users/types.js";
 
 const intentSchema = new Set<OAuthIntent>(["login", "signup", "link", "upgrade"]);
-
-function redirectUrl(path: string, params?: Record<string, string>): string {
-  const url = new URL(path, config.appPublicUrl);
-  if (params) {
-    for (const [key, value] of Object.entries(params)) {
-      url.searchParams.set(key, value);
-    }
-  }
-  return url.toString();
-}
 
 export function createGitHubRouter(deps: {
   users: UserRepository;
@@ -77,26 +67,26 @@ export function createGitHubRouter(deps: {
 
   router.get("/github/callback", async (req, res) => {
     if (!isGitHubOAuthConfigured()) {
-      res.redirect(redirectUrl("/login", { error: "github_not_configured" }));
+      res.redirect(appPublicRedirect("/login", { error: "github_not_configured" }));
       return;
     }
 
     const error = typeof req.query.error === "string" ? req.query.error : null;
     if (error) {
-      res.redirect(redirectUrl("/login", { error: "github_denied" }));
+      res.redirect(appPublicRedirect("/login", { error: "github_denied" }));
       return;
     }
 
     const code = typeof req.query.code === "string" ? req.query.code : null;
     const state = typeof req.query.state === "string" ? req.query.state : null;
     if (!code || !state) {
-      res.redirect(redirectUrl("/login", { error: "github_invalid" }));
+      res.redirect(appPublicRedirect("/login", { error: "github_invalid" }));
       return;
     }
 
     const oauthState = await deps.oauthStates.consume(state);
     if (!oauthState) {
-      res.redirect(redirectUrl("/login", { error: "github_state_invalid" }));
+      res.redirect(appPublicRedirect("/login", { error: "github_state_invalid" }));
       return;
     }
 
@@ -111,14 +101,14 @@ export function createGitHubRouter(deps: {
 
       if (oauthState.intent === "link" || oauthState.intent === "upgrade") {
         if (!oauthState.userId) {
-          res.redirect(redirectUrl("/settings/account", { error: "auth_required" }));
+          res.redirect(appPublicRedirect("/settings/account", { error: "auth_required" }));
           return;
         }
 
         const existing = await deps.users.findByGithubId(githubId);
         if (existing && existing.id !== oauthState.userId) {
           res.redirect(
-            redirectUrl("/settings/account", { error: "github_already_linked" }),
+            appPublicRedirect("/settings/account", { error: "github_already_linked" }),
           );
           return;
         }
@@ -130,7 +120,7 @@ export function createGitHubRouter(deps: {
         );
         await deps.users.linkGithub(oauthState.userId, githubId, githubUser.login);
 
-        res.redirect(redirectUrl("/settings/account", { github: "connected" }));
+        res.redirect(appPublicRedirect("/settings/account", { github: "connected" }));
         return;
       }
 
@@ -140,17 +130,17 @@ export function createGitHubRouter(deps: {
         setSessionCookie(res, session.id, false);
 
         if (linkedUser.onboardingState === "pending_username") {
-          res.redirect(redirectUrl("/onboarding/confirm-username"));
+          res.redirect(appPublicRedirect("/onboarding/confirm-username"));
           return;
         }
 
-        res.redirect(redirectUrl(oauthState.returnTo ?? "/"));
+        res.redirect(appPublicRedirect(oauthState.returnTo ?? "/"));
         return;
       }
 
       if (oauthState.intent === "login") {
         res.redirect(
-          redirectUrl("/login", {
+          appPublicRedirect("/login", {
             error: "github_unlinked",
             github_login: githubUser.login,
           }),
@@ -177,9 +167,9 @@ export function createGitHubRouter(deps: {
 
       const session = await deps.sessions.create(user, false);
       setSessionCookie(res, session.id, false);
-      res.redirect(redirectUrl("/onboarding/confirm-username"));
+      res.redirect(appPublicRedirect("/onboarding/confirm-username"));
     } catch {
-      res.redirect(redirectUrl("/login", { error: "github_failed" }));
+      res.redirect(appPublicRedirect("/login", { error: "github_failed" }));
     }
   });
 
