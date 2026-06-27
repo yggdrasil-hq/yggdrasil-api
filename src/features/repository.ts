@@ -161,6 +161,18 @@ export class FeatureRepository {
     return result.rows[0] ? mapFeature(result.rows[0]) : null;
   }
 
+  async hasBlockingStatuses(projectId: string): Promise<boolean> {
+    const result = await this.db.query<{ exists: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM features
+         WHERE project_id = $1
+           AND status IN ('draft', 'queued', 'running')
+       ) AS exists`,
+      [projectId],
+    );
+    return result.rows[0]?.exists ?? false;
+  }
+
   async updateStatus(
     featureId: string,
     status: FeatureStatus,

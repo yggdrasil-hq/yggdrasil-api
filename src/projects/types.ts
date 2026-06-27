@@ -35,6 +35,7 @@ export interface PublicProject {
   description: string;
   status: ProjectStatus;
   repositories: PublicProjectRepository[];
+  repositoryRemovalBlockedReason: string | null;
 }
 
 export interface FeatureCounts {
@@ -66,7 +67,10 @@ export interface ProjectOverview {
   actionQueue: ActionQueueItem[];
 }
 
-export function toPublicProject(project: Project): PublicProject {
+export function toPublicProject(
+  project: Project,
+  repositoryRemovalBlockedReason: string | null = null,
+): PublicProject {
   return {
     id: project.id,
     name: project.name,
@@ -79,6 +83,7 @@ export function toPublicProject(project: Project): PublicProject {
       githubRepo: repo.githubRepo,
       isPrimary: repo.isPrimary,
     })),
+    repositoryRemovalBlockedReason,
   };
 }
 

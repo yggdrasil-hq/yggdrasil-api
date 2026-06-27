@@ -16,7 +16,9 @@ import {
 } from "../tests/types.js";
 import { buildProjectOverview } from "./overview.js";
 import type { ProjectRepository } from "./repository.js";
+import { getRepositoryRemovalBlockedReason } from "./repository-removal.js";
 import { toPublicProject } from "./types.js";
+import type { Project } from "./types.js";
 import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
 
@@ -75,6 +77,11 @@ const updateTestSchema = z.object({
   enabled: z.boolean().optional(),
 });
 
+const addSubRepositorySchema = z.object({
+  githubOwner: z.string().trim().min(1),
+  githubRepo: z.string().trim().min(1),
+});
+
 export function createProjectsRouter(deps: {
   users: UserRepository;
   sessions: SessionService;
@@ -100,10 +107,22 @@ export function createProjectsRouter(deps: {
     return isUuid(featureId) ? featureId : null;
   }
 
+  async function toPublicProjectWithRemovalMeta(project: Project) {
+    const repositoryRemovalBlockedReason = await getRepositoryRemovalBlockedReason(
+      project,
+      deps.features,
+      deps.jobs,
+    );
+    return toPublicProject(project, repositoryRemovalBlockedReason);
+  }
+
   router.get("/", requireAuth, async (req, res) => {
     const user = req.currentUser!;
     const projects = await deps.projects.listForUser(user.id);
-    res.json(projects.map(toPublicProject));
+    const publicProjects = await Promise.all(
+      projects.map((project) => toPublicProjectWithRemovalMeta(project)),
+    );
+    res.json(publicProjects);
   });
 
   router.post("/", requireAuth, async (req, res) => {
@@ -142,7 +161,7 @@ export function createProjectsRouter(deps: {
       linkPath: `/projects/${project.id}`,
     });
 
-    res.status(201).json(toPublicProject(project));
+    res.status(201).json(await toPublicProjectWithRemovalMeta(project));
   });
 
   router.get("/:projectId", requireAuth, async (req, res) => {
@@ -151,7 +170,99 @@ export function createProjectsRouter(deps: {
       res.status(404).json({ error: "Project not found" });
       return;
     }
-    res.json(toPublicProject(project));
+    res.json(await toPublicProjectWithRemovalMeta(project));
+  });
+
+  router.post("/:projectId/repositories", requireAuth, async (req, res) => {
+    const parsed = parseBody(addSubRepositorySchema, req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    if (
+      deps.projects.matchesPrimaryRepository(
+        project,
+        parsed.data.githubOwner,
+        parsed.data.githubRepo,
+      )
+    ) {
+      res.status(409).json({ error: "Primary repository is already linked to this project" });
+      return;
+    }
+
+    try {
+      const created = await deps.projects.addSubRepository(project.id, parsed.data);
+      if (!created) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === "Repository is already linked to this project"
+      ) {
+        res.status(409).json({ error: error.message });
+        return;
+      }
+      throw error;
+    }
+
+    const updated = await deps.projects.findByIdForUser(project.id, req.currentUser!.id);
+    if (!updated) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    res.status(201).json(await toPublicProjectWithRemovalMeta(updated));
+  });
+
+  router.delete("/:projectId/repositories/:repositoryId", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const repositoryId = routeParam(req.params.repositoryId);
+    if (!isUuid(repositoryId)) {
+      res.status(404).json({ error: "Repository not found" });
+      return;
+    }
+
+    const blockedReason = await getRepositoryRemovalBlockedReason(
+      project,
+      deps.features,
+      deps.jobs,
+    );
+    if (blockedReason) {
+      res.status(409).json({ error: blockedReason });
+      return;
+    }
+
+    const result = await deps.projects.deleteSubRepository(project.id, repositoryId);
+    if (result === "not_found") {
+      res.status(404).json({ error: "Repository not found" });
+      return;
+    }
+    if (result === "primary") {
+      res.status(409).json({ error: "Primary repository cannot be removed" });
+      return;
+    }
+
+    const updated = await deps.projects.findByIdForUser(project.id, req.currentUser!.id);
+    if (!updated) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    res.json(await toPublicProjectWithRemovalMeta(updated));
   });
 
   router.post("/:projectId/complete-init", requireAuth, async (req, res) => {
@@ -179,7 +290,7 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    res.json(toPublicProject(updated));
+    res.json(await toPublicProjectWithRemovalMeta(updated));
   });
 
   router.get("/:projectId/overview", requireAuth, async (req, res) => {

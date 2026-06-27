@@ -54,6 +54,19 @@ export class JobRepository {
     return mapJob(result.rows[0]);
   }
 
+  async hasActiveTestRunsForProject(projectId: string): Promise<boolean> {
+    const result = await this.db.query<{ exists: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM jobs
+         WHERE project_id = $1
+           AND kind = 'test_run'
+           AND status IN ('pending', 'running')
+       ) AS exists`,
+      [projectId],
+    );
+    return result.rows[0]?.exists ?? false;
+  }
+
   async hasActiveTestRun(testId: string): Promise<boolean> {
     const result = await this.db.query<{ exists: boolean }>(
       `SELECT EXISTS(

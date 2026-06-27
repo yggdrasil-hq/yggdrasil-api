@@ -165,6 +165,105 @@ export class ProjectRepository {
     );
   }
 
+  async addSubRepository(
+    projectId: string,
+    input: { githubOwner: string; githubRepo: string },
+  ): Promise<ProjectRepositoryRecord | null> {
+    const projectResult = await this.db.query<{ id: string }>(
+      `SELECT id FROM projects WHERE id = $1`,
+      [projectId],
+    );
+    if (!projectResult.rows[0]) {
+      return null;
+    }
+
+    const owner = input.githubOwner.trim();
+    const repo = input.githubRepo.trim();
+    const normalizedOwner = owner.toLowerCase();
+    const normalizedRepo = repo.toLowerCase();
+
+    const existing = await this.db.query<RepositoryRow>(
+      `SELECT id, project_id, github_owner, github_repo, is_primary, sort_order
+       FROM project_repositories
+       WHERE project_id = $1
+         AND LOWER(github_owner) = $2
+         AND LOWER(github_repo) = $3`,
+      [projectId, normalizedOwner, normalizedRepo],
+    );
+    if (existing.rows[0]) {
+      throw new Error("Repository is already linked to this project");
+    }
+
+    const sortOrderResult = await this.db.query<{ next_order: number }>(
+      `SELECT COALESCE(MAX(sort_order), -1) + 1 AS next_order
+       FROM project_repositories
+       WHERE project_id = $1`,
+      [projectId],
+    );
+    const sortOrder = sortOrderResult.rows[0]?.next_order ?? 0;
+
+    const repoResult = await this.db.query<RepositoryRow>(
+      `INSERT INTO project_repositories
+         (project_id, github_owner, github_repo, is_primary, sort_order)
+       VALUES ($1, $2, $3, FALSE, $4)
+       RETURNING id, project_id, github_owner, github_repo, is_primary, sort_order`,
+      [projectId, owner, repo, sortOrder],
+    );
+
+    await this.db.query(
+      `UPDATE projects SET updated_at = NOW() WHERE id = $1`,
+      [projectId],
+    );
+
+    return mapRepository(repoResult.rows[0]);
+  }
+
+  async deleteSubRepository(
+    projectId: string,
+    repositoryId: string,
+  ): Promise<"not_found" | "primary" | "deleted"> {
+    const existing = await this.db.query<{ is_primary: boolean }>(
+      `SELECT is_primary FROM project_repositories
+       WHERE project_id = $1 AND id = $2`,
+      [projectId, repositoryId],
+    );
+
+    if (!existing.rows[0]) {
+      return "not_found";
+    }
+
+    if (existing.rows[0].is_primary) {
+      return "primary";
+    }
+
+    await this.db.query(
+      `DELETE FROM project_repositories WHERE project_id = $1 AND id = $2`,
+      [projectId, repositoryId],
+    );
+
+    await this.db.query(
+      `UPDATE projects SET updated_at = NOW() WHERE id = $1`,
+      [projectId],
+    );
+
+    return "deleted";
+  }
+
+  matchesPrimaryRepository(
+    project: Project,
+    githubOwner: string,
+    githubRepo: string,
+  ): boolean {
+    const primary = project.repositories.find((repo) => repo.isPrimary);
+    if (!primary) {
+      return false;
+    }
+    return (
+      primary.githubOwner.toLowerCase() === githubOwner.trim().toLowerCase() &&
+      primary.githubRepo.toLowerCase() === githubRepo.trim().toLowerCase()
+    );
+  }
+
   async isSlugTaken(ownerUserId: string, slug: string): Promise<boolean> {
     const result = await this.db.query<{ exists: boolean }>(
       `SELECT EXISTS(
