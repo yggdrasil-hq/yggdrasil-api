@@ -11,6 +11,8 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     description: "",
     status: "ready",
     settings: {},
+    installationId: null,
+    githubAccessWarning: false,
     repositories: [
       {
         id: "repo_1",

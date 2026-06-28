@@ -6,6 +6,10 @@ import { LoginRateLimiter } from "./auth/rate-limit.js";
 import { SessionService } from "./auth/sessions.js";
 import { FeatureRepository } from "./features/repository.js";
 import { createGitHubRouter } from "./github/routes.js";
+import { createGitHubAppRouter } from "./github/install-routes.js";
+import { GithubInstallationRepository } from "./github/installation-repository.js";
+import { InstallStateRepository } from "./github/install-state.js";
+import { createGitHubWebhookRouter } from "./github/webhook-routes.js";
 import { GithubTokenRepository } from "./github/token-repository.js";
 import { OAuthStateRepository } from "./github/oauth.js";
 import { JobRepository } from "./jobs/repository.js";
@@ -23,7 +27,6 @@ export interface AppDependencies {
 export function createApp(deps?: AppDependencies): Express {
   const app = express();
   app.set("trust proxy", 1);
-  app.use(express.json());
   app.use(cookieParser());
 
   app.get("/health", (_req, res) => {
@@ -31,14 +34,21 @@ export function createApp(deps?: AppDependencies): Express {
   });
 
   if (!deps?.pool) {
+    app.use(express.json());
     return app;
   }
+
+  const installations = new GithubInstallationRepository(deps.pool);
+  app.use("/webhooks", createGitHubWebhookRouter({ installations }));
+
+  app.use(express.json());
 
   const users = new UserRepository(deps.pool);
   const sessions = new SessionService(deps.pool);
   const rateLimiter = new LoginRateLimiter(deps.pool);
   const githubTokens = new GithubTokenRepository(deps.pool);
   const oauthStates = new OAuthStateRepository(deps.pool);
+  const installStates = new InstallStateRepository(deps.pool);
   const projects = new ProjectRepository(deps.pool);
   const features = new FeatureRepository(deps.pool);
   const tests = new TestRepository(deps.pool);
@@ -49,6 +59,15 @@ export function createApp(deps?: AppDependencies): Express {
   app.use("/auth", createGitHubRouter({ users, sessions, oauthStates, githubTokens }));
   app.use("/settings", createSettingsRouter({ users, sessions, githubTokens }));
   app.use(
+    "/github",
+    createGitHubAppRouter({
+      users,
+      sessions,
+      installations,
+      installStates,
+    }),
+  );
+  app.use(
     "/projects",
     createProjectsRouter({
       users,
@@ -58,6 +77,7 @@ export function createApp(deps?: AppDependencies): Express {
       tests,
       jobs,
       notifications,
+      installations,
     }),
   );
   app.use(

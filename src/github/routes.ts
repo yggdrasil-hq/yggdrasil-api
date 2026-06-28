@@ -15,7 +15,7 @@ import {
 import { UserRepository } from "../users/repository.js";
 import { toPublicUser } from "../users/types.js";
 
-const intentSchema = new Set<OAuthIntent>(["login", "signup", "link", "upgrade"]);
+const intentSchema = new Set<OAuthIntent>(["login", "signup", "link"]);
 
 export function createGitHubRouter(deps: {
   users: UserRepository;
@@ -40,7 +40,7 @@ export function createGitHubRouter(deps: {
     }
     const intent = intentParam as OAuthIntent;
 
-    if ((intent === "link" || intent === "upgrade") && !req.currentUser) {
+    if (intent === "link" && !req.currentUser) {
       res.status(401).json({ error: "Authentication required" });
       return;
     }
@@ -99,7 +99,7 @@ export function createGitHubRouter(deps: {
       const githubUser = await fetchGitHubUser(token.accessToken);
       const githubId = String(githubUser.id);
 
-      if (oauthState.intent === "link" || oauthState.intent === "upgrade") {
+      if (oauthState.intent === "link") {
         if (!oauthState.userId) {
           res.redirect(appPublicRedirect("/settings/account", { error: "auth_required" }));
           return;

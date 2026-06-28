@@ -19,7 +19,7 @@ handles `GITHUB_CLIENT_SECRET` or stores GitHub tokens.
 src/
   auth/           # routes, session middleware, rate limiting
   users/          # user CRUD, onboarding state
-  github/         # OAuth start/callback, token encryption, scope upgrade
+  github/         # OAuth (identity), App install/callback, webhooks, installation tokens
   db/             # migrations, session + user repositories
 ```
 
@@ -30,6 +30,10 @@ From `api/.env.example`:
 ```
 GITHUB_CLIENT_ID=
 GITHUB_CLIENT_SECRET=
+GITHUB_APP_ID=
+GITHUB_APP_SLUG=
+GITHUB_APP_PRIVATE_KEY=
+GITHUB_APP_WEBHOOK_SECRET=
 SESSION_SECRET=        # cookie signing
 DATABASE_URL=
 ```
@@ -48,4 +52,4 @@ Callback URL (dev): `{API_PUBLIC_URL}/auth/github/callback`
 
 ## Related
 
-- Meta ADR: [`../../../docs/adr/001-authentication.md`](../../../docs/adr/001-authentication.md)
+- Meta GitHub App spec: [`../../../docs/concepts/github-app.md`](../../../docs/concepts/github-app.md)

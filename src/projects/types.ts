@@ -16,6 +16,8 @@ export interface Project {
   description: string;
   status: ProjectStatus;
   settings: Record<string, unknown>;
+  installationId: string | null;
+  githubAccessWarning: boolean;
   repositories: ProjectRepositoryRecord[];
   createdAt: Date;
   updatedAt: Date;
@@ -34,6 +36,8 @@ export interface PublicProject {
   slug: string;
   description: string;
   status: ProjectStatus;
+  installationId: string | null;
+  githubAccessWarning: boolean;
   repositories: PublicProjectRepository[];
   repositoryRemovalBlockedReason: string | null;
 }
@@ -51,7 +55,8 @@ export type ActionQueueType =
   | "pr_review"
   | "changes_requested"
   | "test_failure"
-  | "failed_build";
+  | "failed_build"
+  | "fix_github_access";
 
 export interface ActionQueueItem {
   type: ActionQueueType;
@@ -77,6 +82,8 @@ export function toPublicProject(
     slug: project.slug,
     description: project.description,
     status: project.status,
+    installationId: project.installationId,
+    githubAccessWarning: project.githubAccessWarning,
     repositories: project.repositories.map((repo) => ({
       id: repo.id,
       githubOwner: repo.githubOwner,

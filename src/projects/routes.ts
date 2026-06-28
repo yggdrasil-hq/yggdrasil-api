@@ -21,6 +21,7 @@ import { toPublicProject } from "./types.js";
 import type { Project } from "./types.js";
 import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
+import type { GithubInstallationRepository } from "../github/installation-repository.js";
 
 function parseBody<T>(schema: z.ZodType<T>, body: unknown):
   | { success: true; data: T }
@@ -41,6 +42,7 @@ const repositorySchema = z.object({
 const createProjectSchema = z.object({
   name: z.string().trim().min(1).max(128),
   description: z.string().max(2000).optional().default(""),
+  installationId: z.string().uuid(),
   repositories: z.array(repositorySchema).min(1),
 }).superRefine((value, ctx) => {
   const primaryCount = value.repositories.filter((repo) => repo.isPrimary).length;
@@ -90,6 +92,7 @@ export function createProjectsRouter(deps: {
   tests: TestRepository;
   jobs: JobRepository;
   notifications: NotificationRepository;
+  installations: GithubInstallationRepository;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -116,6 +119,38 @@ export function createProjectsRouter(deps: {
     return toPublicProject(project, repositoryRemovalBlockedReason);
   }
 
+  async function assertInstallationReady(installationId: string): Promise<string | null> {
+    const installation = await deps.installations.findById(installationId);
+    if (!installation || installation.suspendedAt) {
+      return "GitHub App installation not found or suspended";
+    }
+    return null;
+  }
+
+  async function assertReposOnInstallation(
+    installationId: string,
+    repositories: Array<{ githubOwner: string; githubRepo: string }>,
+  ): Promise<string | null> {
+    for (const repo of repositories) {
+      const fullName = `${repo.githubOwner.trim()}/${repo.githubRepo.trim()}`;
+      const granted = await deps.installations.hasRepository(installationId, fullName);
+      if (!granted) {
+        return `Repository ${fullName} is not granted on the GitHub App installation`;
+      }
+    }
+    return null;
+  }
+
+  function assertGitHubAccess(project: Project): string | null {
+    if (project.githubAccessWarning) {
+      return "GitHub access for this project needs to be fixed before running jobs";
+    }
+    if (!project.installationId) {
+      return "Project is missing a GitHub App installation";
+    }
+    return null;
+  }
+
   router.get("/", requireAuth, async (req, res) => {
     const user = req.currentUser!;
     const projects = await deps.projects.listForUser(user.id);
@@ -133,10 +168,27 @@ export function createProjectsRouter(deps: {
     }
 
     const user = req.currentUser!;
+
+    const installationError = await assertInstallationReady(parsed.data.installationId);
+    if (installationError) {
+      res.status(400).json({ error: installationError });
+      return;
+    }
+
+    const repoError = await assertReposOnInstallation(
+      parsed.data.installationId,
+      parsed.data.repositories,
+    );
+    if (repoError) {
+      res.status(400).json({ error: repoError });
+      return;
+    }
+
     const project = await deps.projects.create({
       ownerUserId: user.id,
       name: parsed.data.name,
       description: parsed.data.description,
+      installationId: parsed.data.installationId,
       repositories: parsed.data.repositories,
     });
 
@@ -183,6 +235,25 @@ export function createProjectsRouter(deps: {
     const project = await getOwnedProject(req, routeParam(req.params.projectId));
     if (!project) {
       res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    if (!project.installationId) {
+      res.status(409).json({ error: "Project is missing a GitHub App installation" });
+      return;
+    }
+
+    const installationError = await assertInstallationReady(project.installationId);
+    if (installationError) {
+      res.status(409).json({ error: installationError });
+      return;
+    }
+
+    const repoError = await assertReposOnInstallation(project.installationId, [
+      parsed.data,
+    ]);
+    if (repoError) {
+      res.status(400).json({ error: repoError });
       return;
     }
 
@@ -303,6 +374,7 @@ export function createProjectsRouter(deps: {
     const overview = await buildProjectOverview({
       projectId: project.id,
       projectSlug: project.slug,
+      githubAccessWarning: project.githubAccessWarning,
       features: deps.features,
       jobs: deps.jobs,
       tests: deps.tests,
@@ -339,6 +411,12 @@ export function createProjectsRouter(deps: {
       res.status(409).json({
         error: "Project initialization must complete before creating features",
       });
+      return;
+    }
+
+    const accessError = assertGitHubAccess(project);
+    if (accessError) {
+      res.status(409).json({ error: accessError });
       return;
     }
 
@@ -443,6 +521,12 @@ export function createProjectsRouter(deps: {
     if (parsed.data.startBuild) {
       if (feature.status !== "spec_ready" || !feature.adrApproved) {
         res.status(409).json({ error: "Approve the ADR before starting build" });
+        return;
+      }
+
+      const accessError = assertGitHubAccess(project);
+      if (accessError) {
+        res.status(409).json({ error: accessError });
         return;
       }
 

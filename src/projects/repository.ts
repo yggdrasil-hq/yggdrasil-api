@@ -10,6 +10,8 @@ interface ProjectRow {
   description: string;
   status: ProjectStatus;
   settings: Record<string, unknown>;
+  installation_id: string | null;
+  github_access_warning: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -24,7 +26,8 @@ interface RepositoryRow {
 }
 
 const projectColumns = `
-  id, owner_user_id, name, slug, description, status, settings, created_at, updated_at
+  id, owner_user_id, name, slug, description, status, settings,
+  installation_id, github_access_warning, created_at, updated_at
 `;
 
 function mapRepository(row: RepositoryRow): ProjectRepositoryRecord {
@@ -46,6 +49,8 @@ function mapProject(row: ProjectRow, repositories: ProjectRepositoryRecord[]): P
     description: row.description,
     status: row.status,
     settings: row.settings ?? {},
+    installationId: row.installation_id,
+    githubAccessWarning: row.github_access_warning,
     repositories,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -102,6 +107,7 @@ export class ProjectRepository {
     ownerUserId: string;
     name: string;
     description: string;
+    installationId: string;
     repositories: Array<{
       githubOwner: string;
       githubRepo: string;
@@ -123,10 +129,10 @@ export class ProjectRepository {
       });
 
       const projectResult = await client.query<ProjectRow>(
-        `INSERT INTO projects (owner_user_id, name, slug, description, status)
-         VALUES ($1, $2, $3, $4, 'initializing')
+        `INSERT INTO projects (owner_user_id, name, slug, description, status, installation_id)
+         VALUES ($1, $2, $3, $4, 'initializing', $5)
          RETURNING ${projectColumns}`,
-        [input.ownerUserId, input.name, slug, input.description],
+        [input.ownerUserId, input.name, slug, input.description, input.installationId],
       );
       const projectRow = projectResult.rows[0];
 

@@ -12,6 +12,7 @@ import { getFeatureBucket } from "./types.js";
 export async function buildProjectOverview(deps: {
   projectId: string;
   projectSlug: string;
+  githubAccessWarning: boolean;
   features: FeatureRepository;
   jobs: JobRepository;
   tests: TestRepository;
@@ -29,6 +30,7 @@ export async function buildProjectOverview(deps: {
   const actionQueue = buildActionQueue(
     featureList,
     deps.projectId,
+    deps.githubAccessWarning,
     await deps.jobs.listRecentFailedTestRuns(deps.projectId),
     await deps.tests.listByProject(deps.projectId),
   );
@@ -39,10 +41,20 @@ export async function buildProjectOverview(deps: {
 function buildActionQueue(
   features: Feature[],
   projectId: string,
+  githubAccessWarning: boolean,
   failedTestJobs: Awaited<ReturnType<JobRepository["listRecentFailedTestRuns"]>>,
   tests: Awaited<ReturnType<TestRepository["listByProject"]>>,
 ): ActionQueueItem[] {
   const items: ActionQueueItem[] = [];
+
+  if (githubAccessWarning) {
+    items.push({
+      type: "fix_github_access",
+      title: "Fix GitHub access",
+      waitingSince: new Date().toISOString(),
+      linkPath: `/projects/${projectId}/settings`,
+    });
+  }
 
   for (const feature of features) {
     const basePath = `/projects/${projectId}/features/${feature.id}`;

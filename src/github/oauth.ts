@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type pg from "pg";
 
-export type OAuthIntent = "login" | "signup" | "link" | "upgrade";
+export type OAuthIntent = "login" | "signup" | "link";
 
 export interface OAuthStateRecord {
   state: string;
@@ -69,12 +69,8 @@ export class OAuthStateRepository {
 }
 
 export const GITHUB_READ_USER_SCOPE = "read:user";
-export const GITHUB_REPO_SCOPE = "repo";
 
-export function scopesForIntent(intent: OAuthIntent): string[] {
-  if (intent === "upgrade") {
-    return [GITHUB_READ_USER_SCOPE, GITHUB_REPO_SCOPE];
-  }
+export function scopesForIntent(_intent: OAuthIntent): string[] {
   return [GITHUB_READ_USER_SCOPE];
 }
 

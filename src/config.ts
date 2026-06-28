@@ -17,6 +17,10 @@ export const config = {
   github: {
     clientId: process.env.GITHUB_CLIENT_ID ?? "",
     clientSecret: process.env.GITHUB_CLIENT_SECRET ?? "",
+    appId: process.env.GITHUB_APP_ID ?? "",
+    appPrivateKey: process.env.GITHUB_APP_PRIVATE_KEY ?? "",
+    appWebhookSecret: process.env.GITHUB_APP_WEBHOOK_SECRET ?? "",
+    appSlug: process.env.GITHUB_APP_SLUG ?? "",
   },
   sessionTtl: {
     defaultMs: 24 * 60 * 60 * 1000,
@@ -34,6 +38,14 @@ export function assertDatabaseUrl(): string {
 
 export function isGitHubOAuthConfigured(): boolean {
   return Boolean(config.github.clientId && config.github.clientSecret);
+}
+
+export function isGitHubAppConfigured(): boolean {
+  return Boolean(
+    config.github.appId &&
+      config.github.appPrivateKey &&
+      config.github.appSlug,
+  );
 }
 
 /** Build a browser redirect URL under APP_PUBLIC_URL (avoids `new URL` absolute-path pitfall). */
