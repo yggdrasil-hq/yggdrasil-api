@@ -65,17 +65,30 @@ export async function fetchInstallationRepositories(
   appId: string,
   privateKeyPem: string,
 ): Promise<GitHubInstallationRepo[]> {
+  const { token } = await mintInstallationAccessToken(installationId, appId, privateKeyPem);
   const repos: GitHubInstallationRepo[] = [];
   let page = 1;
 
   while (true) {
-    const batch = await githubAppFetch<GitHubInstallationRepo[]>(
-      `/app/installations/${installationId}/repositories?per_page=100&page=${page}`,
-      appId,
-      privateKeyPem,
+    const response = await fetch(
+      `${GITHUB_API}/installation/repositories?per_page=100&page=${page}`,
+      {
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${token}`,
+          "User-Agent": "yggdrasil-api",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      },
     );
-    repos.push(...batch);
-    if (batch.length < 100) {
+
+    if (!response.ok) {
+      throw new Error(`GitHub API /installation/repositories failed: ${response.status}`);
+    }
+
+    const batch = (await response.json()) as { repositories: GitHubInstallationRepo[] };
+    repos.push(...batch.repositories);
+    if (batch.repositories.length < 100) {
       break;
     }
     page += 1;
