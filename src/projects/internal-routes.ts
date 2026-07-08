@@ -22,6 +22,26 @@ export function createProjectsInternalRouter(deps: {
   const router = Router();
 
   router.get(
+    "/projects/:projectId/slug",
+    requireInternalApiToken,
+    async (req, res) => {
+      const projectId = routeParam(req.params.projectId);
+      if (!isUuid(projectId)) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+
+      const project = await deps.projects.findById(projectId);
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+
+      res.json({ slug: project.slug });
+    },
+  );
+
+  router.get(
     "/projects/:projectId/chart",
     requireInternalApiToken,
     async (req, res) => {
