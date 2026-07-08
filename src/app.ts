@@ -17,6 +17,7 @@ import { NotificationRepository } from "./notifications/repository.js";
 import { createNotificationsRouter } from "./notifications/routes.js";
 import { ProjectRepository } from "./projects/repository.js";
 import { createProjectsRouter } from "./projects/routes.js";
+import { createProjectsInternalRouter } from "./projects/internal-routes.js";
 import { SecretRepository } from "./secrets/repository.js";
 import { createSecretsRouter } from "./secrets/routes.js";
 import { createSecretsInternalRouter } from "./secrets/internal-routes.js";
@@ -90,6 +91,7 @@ export function createApp(deps?: AppDependencies): Express {
   );
   app.use("/projects", createSecretsRouter({ users, sessions, projects, secrets }));
   app.use("/internal", createSecretsInternalRouter({ secrets }));
+  app.use("/internal", createProjectsInternalRouter({ projects, installations }));
 
   app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     console.error(err);

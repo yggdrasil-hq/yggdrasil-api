@@ -71,6 +71,22 @@ export class ProjectRepository {
     return result.rows.map(mapRepository);
   }
 
+  /** No owner scoping — internal (non-session) callers only, e.g. the Orchestrator's chart fetch. */
+  async findById(projectId: string): Promise<Project | null> {
+    const result = await this.db.query<ProjectRow>(
+      `SELECT ${projectColumns}
+       FROM projects
+       WHERE id = $1`,
+      [projectId],
+    );
+    const row = result.rows[0];
+    if (!row) {
+      return null;
+    }
+    const repositories = await this.loadRepositories(row.id);
+    return mapProject(row, repositories);
+  }
+
   async findByIdForUser(projectId: string, userId: string): Promise<Project | null> {
     const result = await this.db.query<ProjectRow>(
       `SELECT ${projectColumns}

@@ -15,6 +15,7 @@ import {
   toPublicTest,
 } from "../tests/types.js";
 import { buildProjectOverview } from "./overview.js";
+import { scaffoldChart } from "./chart-scaffold.js";
 import type { ProjectRepository } from "./repository.js";
 import { getRepositoryRemovalBlockedReason } from "./repository-removal.js";
 import { toPublicProject } from "./types.js";
@@ -212,6 +213,24 @@ export function createProjectsRouter(deps: {
       body: "Complete project initialization to unlock features and tests.",
       linkPath: `/projects/${project.id}`,
     });
+
+    // Best-effort: scaffolding the Helm chart (ADR 003 §12) never blocks
+    // project creation — a failure here just means the Orchestrator falls
+    // back to its embedded placeholder chart at deploy time.
+    const installation = await deps.installations.findById(parsed.data.installationId);
+    if (installation) {
+      const scaffolded = await scaffoldChart(project, installation);
+      if (!scaffolded) {
+        await deps.notifications.create({
+          userId: user.id,
+          projectId: project.id,
+          kind: "chart_scaffold_failed",
+          title: `Couldn't scaffold Helm chart for ${project.name}`,
+          body: "Deploys will use a placeholder chart until this is resolved.",
+          linkPath: `/projects/${project.id}`,
+        });
+      }
+    }
 
     res.status(201).json(await toPublicProjectWithRemovalMeta(project));
   });
