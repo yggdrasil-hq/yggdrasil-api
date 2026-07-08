@@ -255,6 +255,25 @@ export class ProjectRepository {
     return "deleted";
   }
 
+  async findByPrimaryRepository(
+    githubOwner: string,
+    githubRepo: string,
+  ): Promise<{ id: string; status: ProjectStatus } | null> {
+    const normalizedOwner = githubOwner.trim().toLowerCase();
+    const normalizedRepo = githubRepo.trim().toLowerCase();
+
+    const result = await this.db.query<{ id: string; status: ProjectStatus }>(
+      `SELECT p.id, p.status
+       FROM projects p
+       JOIN project_repositories r ON r.project_id = p.id
+       WHERE r.is_primary = TRUE
+         AND LOWER(r.github_owner) = $1
+         AND LOWER(r.github_repo) = $2`,
+      [normalizedOwner, normalizedRepo],
+    );
+    return result.rows[0] ?? null;
+  }
+
   matchesPrimaryRepository(
     project: Project,
     githubOwner: string,

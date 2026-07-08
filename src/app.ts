@@ -17,6 +17,9 @@ import { NotificationRepository } from "./notifications/repository.js";
 import { createNotificationsRouter } from "./notifications/routes.js";
 import { ProjectRepository } from "./projects/repository.js";
 import { createProjectsRouter } from "./projects/routes.js";
+import { SecretRepository } from "./secrets/repository.js";
+import { createSecretsRouter } from "./secrets/routes.js";
+import { createSecretsInternalRouter } from "./secrets/internal-routes.js";
 import { TestRepository } from "./tests/repository.js";
 import { UserRepository } from "./users/repository.js";
 
@@ -39,7 +42,9 @@ export function createApp(deps?: AppDependencies): Express {
   }
 
   const installations = new GithubInstallationRepository(deps.pool);
-  app.use("/webhooks", createGitHubWebhookRouter({ installations }));
+  const projects = new ProjectRepository(deps.pool);
+  const jobs = new JobRepository(deps.pool);
+  app.use("/webhooks", createGitHubWebhookRouter({ installations, projects, jobs }));
 
   app.use(express.json());
 
@@ -49,11 +54,10 @@ export function createApp(deps?: AppDependencies): Express {
   const githubTokens = new GithubTokenRepository(deps.pool);
   const oauthStates = new OAuthStateRepository(deps.pool);
   const installStates = new InstallStateRepository(deps.pool);
-  const projects = new ProjectRepository(deps.pool);
   const features = new FeatureRepository(deps.pool);
   const tests = new TestRepository(deps.pool);
-  const jobs = new JobRepository(deps.pool);
   const notifications = new NotificationRepository(deps.pool);
+  const secrets = new SecretRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions, rateLimiter }));
   app.use("/auth", createGitHubRouter({ users, sessions, oauthStates, githubTokens }));
@@ -84,6 +88,8 @@ export function createApp(deps?: AppDependencies): Express {
     "/notifications",
     createNotificationsRouter({ users, sessions, notifications }),
   );
+  app.use("/projects", createSecretsRouter({ users, sessions, projects, secrets }));
+  app.use("/internal", createSecretsInternalRouter({ secrets }));
 
   app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     console.error(err);

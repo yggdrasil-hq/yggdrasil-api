@@ -22,6 +22,8 @@ export const config = {
     appWebhookSecret: process.env.GITHUB_APP_WEBHOOK_SECRET ?? "",
     appSlug: process.env.GITHUB_APP_SLUG ?? "",
   },
+  secretsEncryptionKey: process.env.SECRETS_ENCRYPTION_KEY ?? "",
+  internalApiToken: process.env.INTERNAL_API_TOKEN ?? "",
   sessionTtl: {
     defaultMs: 24 * 60 * 60 * 1000,
     rememberMs: 30 * 24 * 60 * 60 * 1000,
@@ -34,6 +36,20 @@ export const config = {
 
 export function assertDatabaseUrl(): string {
   return required("DATABASE_URL", config.databaseUrl || undefined);
+}
+
+const SECRETS_ENCRYPTION_KEY_BYTES = 32;
+
+/** Validated at the config boundary: a wrong-length key fails AES-256-GCM silently otherwise. */
+export function assertSecretsEncryptionKey(): Buffer {
+  const raw = required("SECRETS_ENCRYPTION_KEY", config.secretsEncryptionKey || undefined);
+  const key = Buffer.from(raw, "base64");
+  if (key.length !== SECRETS_ENCRYPTION_KEY_BYTES) {
+    throw new Error(
+      `SECRETS_ENCRYPTION_KEY must decode to ${SECRETS_ENCRYPTION_KEY_BYTES} bytes (got ${key.length}); generate one with: openssl rand -base64 32`,
+    );
+  }
+  return key;
 }
 
 export function isGitHubOAuthConfigured(): boolean {

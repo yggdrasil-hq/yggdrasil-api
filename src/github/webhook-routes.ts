@@ -2,6 +2,9 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { Router, type Request } from "express";
 import express from "express";
 import { config, isGitHubAppConfigured } from "../config.js";
+import { dispatchJob } from "../jobs/dispatch.js";
+import type { JobRepository } from "../jobs/repository.js";
+import type { ProjectRepository } from "../projects/repository.js";
 import { GithubInstallationRepository } from "./installation-repository.js";
 import { syncInstallationFromGitHub } from "./sync-installation.js";
 
@@ -35,8 +38,40 @@ interface WebhookPayload {
   repositories_removed?: Array<{ full_name: string; id: number }>;
 }
 
+interface PushWebhookPayload {
+  ref: string;
+  repository: {
+    name: string;
+    owner: { login: string };
+  };
+}
+
+const MAIN_BRANCH_REF = "refs/heads/main";
+
+/**
+ * Enqueues a `deploy` job when a push lands on the primary repo's `main`
+ * branch of a project that has finished `project_init` (ADR 003 §9-13).
+ */
+export async function handlePushEvent(
+  payload: PushWebhookPayload,
+  deps: { projects: ProjectRepository; jobs: JobRepository },
+): Promise<void> {
+  if (payload.ref !== MAIN_BRANCH_REF || !payload.repository) {
+    return;
+  }
+  const project = await deps.projects.findByPrimaryRepository(
+    payload.repository.owner.login,
+    payload.repository.name,
+  );
+  if (project && project.status === "ready") {
+    await dispatchJob(deps.jobs, { projectId: project.id, kind: "deploy" });
+  }
+}
+
 export function createGitHubWebhookRouter(deps: {
   installations: GithubInstallationRepository;
+  projects: ProjectRepository;
+  jobs: JobRepository;
 }): Router {
   const router = Router();
 
@@ -82,6 +117,10 @@ export function createGitHubWebhookRouter(deps: {
           } else if (data.action === "created" || data.action === "unsuspend") {
             await syncInstallationFromGitHub(deps.installations, installationId, null);
           }
+        }
+
+        if (event === "push") {
+          await handlePushEvent(data as unknown as PushWebhookPayload, deps);
         }
 
         if (event === "installation_repositories") {
