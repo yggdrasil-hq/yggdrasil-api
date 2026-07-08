@@ -1,4 +1,4 @@
-export type JobKind = "spec_grill" | "feature_build" | "test_run";
+export type JobKind = "spec_grill" | "feature_build" | "test_run" | "deploy";
 export type JobStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 
 export interface Job {
