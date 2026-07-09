@@ -52,7 +52,7 @@ export function createJobsInternalRouter(deps: {
         return;
       }
 
-      await syncAwaitingUserInput(deps, jobId, parsed.data.type);
+      await syncFeatureState(deps, jobId, parsed.data);
       res.status(201).json({ id: event.id });
     },
   );
@@ -61,26 +61,33 @@ export function createJobsInternalRouter(deps: {
 }
 
 /**
- * Flips the job's feature's `awaiting_user_input` flag (ADR 006 item 10) in
- * reaction to the event just persisted: `ask_user` sets it, so the API/Web
- * app can tell a grill is paused on a human; `run_failed`/`run_cancelled`
- * both clear it, so a job that stops (dies, or is deliberately cancelled —
- * ADR 006's cancel/abort follow-up, item 13) while still waiting on a reply
- * doesn't leave the flag stuck true forever (the reply endpoint,
- * `projects/routes.ts`, is what clears it on the success path). `submit_adr`
- * needs no handling here — by the time a run reaches it, any prior
- * `ask_user` has already been resolved by a reply, which already cleared
- * the flag.
+ * Reacts to the event just persisted by updating the feature it belongs to
+ * (ADR 006 items 10-11): `ask_user` sets `awaiting_user_input`, so the
+ * API/Web app can tell a grill is paused on a human; `run_failed`/
+ * `run_cancelled` both clear it, so a job that stops (dies, or is
+ * deliberately cancelled — ADR 006's cancel/abort follow-up, item 13) while
+ * still waiting on a reply doesn't leave the flag stuck true forever (the
+ * reply endpoint, `projects/routes.ts`, is what clears it on the success
+ * path). `submit_adr` is the run's terminal event: it stores the submitted
+ * markdown and moves the feature `draft` -> `spec_ready`
+ * (`FeatureRepository.setSpecReady`, which also clears
+ * `awaiting_user_input` itself) — without this, a feature stays stuck on
+ * `draft` forever even after a successful grill.
  *
  * Best-effort: a failure here doesn't undo the 201 already sent for the
  * event itself, since the event was persisted successfully regardless.
  */
-async function syncAwaitingUserInput(
+async function syncFeatureState(
   deps: { jobs: JobRepository; features: FeatureRepository },
   jobId: string,
-  eventType: z.infer<typeof jobEventSchema>["type"],
+  event: Pick<z.infer<typeof jobEventSchema>, "type" | "markdown">,
 ): Promise<void> {
-  if (eventType !== "ask_user" && eventType !== "run_failed" && eventType !== "run_cancelled") {
+  if (
+    event.type !== "ask_user" &&
+    event.type !== "run_failed" &&
+    event.type !== "run_cancelled" &&
+    event.type !== "submit_adr"
+  ) {
     return;
   }
   try {
@@ -88,8 +95,12 @@ async function syncAwaitingUserInput(
     if (!job?.featureId) {
       return;
     }
-    await deps.features.setAwaitingUserInput(job.featureId, eventType === "ask_user");
+    if (event.type === "submit_adr") {
+      await deps.features.setSpecReady(job.featureId, event.markdown ?? "");
+      return;
+    }
+    await deps.features.setAwaitingUserInput(job.featureId, event.type === "ask_user");
   } catch (error) {
-    console.error(`failed to sync awaiting_user_input for job ${jobId}:`, error);
+    console.error(`failed to sync feature state for job ${jobId}:`, error);
   }
 }

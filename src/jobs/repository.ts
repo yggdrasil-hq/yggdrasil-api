@@ -131,6 +131,27 @@ export class JobRepository {
   }
 
   /**
+   * Finds a feature's most recent spec_grill job regardless of status —
+   * the read-side counterpart to findActiveSpecGrillJob, used by the
+   * user-facing events endpoint (`GET
+   * /:projectId/features/:featureId/events`) so the Web app can still show
+   * the grill conversation and its outcome after the job has finished,
+   * failed, or been cancelled, not just while it's running.
+   */
+  async findLatestSpecGrillJob(featureId: string): Promise<Job | null> {
+    const result = await this.db.query<JobRow>(
+      `SELECT ${jobColumns}
+       FROM jobs
+       WHERE feature_id = $1
+         AND kind = 'spec_grill'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [featureId],
+    );
+    return result.rows[0] ? mapJob(result.rows[0]) : null;
+  }
+
+  /**
    * Marks a running job cancelled and notifies the Orchestrator via
    * Postgres LISTEN/NOTIFY on 'job_cancellations' (ADR 006's cancel/abort
    * follow-up) — insert-then-notify, mirroring

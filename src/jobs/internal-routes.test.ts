@@ -45,11 +45,13 @@ function buildApp(deps: {
   create?: (input: CreateInput) => Promise<JobEvent>;
   findById?: (jobId: string) => Promise<Job | null>;
   setAwaitingUserInput?: (featureId: string, awaiting: boolean) => Promise<null>;
+  setSpecReady?: (featureId: string, adrMarkdown: string) => Promise<null>;
 }) {
   const create: (input: CreateInput) => Promise<JobEvent> =
     deps.create ?? (async (input) => makeEvent({ jobId: input.jobId, type: input.type }));
   const findById = deps.findById ?? (async (jobId: string) => makeJob({ id: jobId }));
   const setAwaitingUserInput = deps.setAwaitingUserInput ?? (async () => null);
+  const setSpecReady = deps.setSpecReady ?? (async () => null);
 
   const app = express();
   app.use(express.json());
@@ -58,7 +60,7 @@ function buildApp(deps: {
     createJobsInternalRouter({
       jobEvents: { create } as never,
       jobs: { findById } as never,
-      features: { setAwaitingUserInput } as never,
+      features: { setAwaitingUserInput, setSpecReady } as never,
     }),
   );
   return app;
@@ -202,6 +204,38 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .send({ type: "submit_adr", markdown: "# ADR" });
 
     expect(setAwaitingUserInput).not.toHaveBeenCalled();
+  });
+
+  it("moves the feature to spec_ready with the submitted markdown when a submit_adr event arrives", async () => {
+    const setSpecReady = vi.fn(async () => null);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42" }),
+      setSpecReady,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_adr", markdown: "# ADR 1" });
+
+    expect(res.status).toBe(201);
+    expect(setSpecReady).toHaveBeenCalledWith("feature_42", "# ADR 1");
+  });
+
+  it("skips setSpecReady for a submit_adr event on a job with no feature", async () => {
+    const setSpecReady = vi.fn(async () => null);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: null }),
+      setSpecReady,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_adr", markdown: "# ADR 1" });
+
+    expect(res.status).toBe(201);
+    expect(setSpecReady).not.toHaveBeenCalled();
   });
 
   it("skips the awaiting_user_input sync for a job with no feature (not a spec_grill job)", async () => {

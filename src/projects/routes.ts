@@ -4,6 +4,7 @@ import { createAuthMiddleware } from "../auth/middleware.js";
 import type { SessionService } from "../auth/sessions.js";
 import { dispatchJob } from "../jobs/dispatch.js";
 import type { JobRepository } from "../jobs/repository.js";
+import type { JobEventRepository } from "../jobs/events-repository.js";
 import type { JobMessageRepository } from "../jobs/messages-repository.js";
 import type { NotificationRepository } from "../notifications/repository.js";
 import { UserRepository } from "../users/repository.js";
@@ -97,6 +98,7 @@ export function createProjectsRouter(deps: {
   features: FeatureRepository;
   tests: TestRepository;
   jobs: JobRepository;
+  jobEvents: JobEventRepository;
   jobMessages: JobMessageRepository;
   notifications: NotificationRepository;
   installations: GithubInstallationRepository;
@@ -658,6 +660,40 @@ export function createProjectsRouter(deps: {
     }
 
     res.status(200).json({});
+  });
+
+  // Reads a spec_grill job's curated event history for a feature (ADR 006
+  // item 8's read side) — the Web app polls this to render/refresh the
+  // live grill conversation, since WebSocket relay is still not built.
+  // jobStatus lets the Web app tell an in-progress grill apart from one
+  // that finished, failed, or was cancelled, without a second request.
+  router.get("/:projectId/features/:featureId/events", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const featureId = parseFeatureId(routeParam(req.params.featureId));
+    if (!featureId) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+
+    const feature = await deps.features.findById(project.id, featureId);
+    if (!feature) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+
+    const job = await deps.jobs.findLatestSpecGrillJob(featureId);
+    if (!job) {
+      res.json({ jobStatus: null, events: [] });
+      return;
+    }
+
+    const events = await deps.jobEvents.listByJob(job.id);
+    res.json({ jobStatus: job.status, events });
   });
 
   router.get("/:projectId/tests", requireAuth, async (req, res) => {

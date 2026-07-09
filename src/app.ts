@@ -87,6 +87,7 @@ export function createApp(deps?: AppDependencies): Express {
       features,
       tests,
       jobs,
+      jobEvents,
       jobMessages,
       notifications,
       installations,

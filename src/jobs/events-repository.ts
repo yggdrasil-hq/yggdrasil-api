@@ -41,9 +41,11 @@ function mapJobEvent(row: JobEventRow): JobEvent {
 
 /**
  * Persists the curated events the Orchestrator relays from a running job's
- * Pi RPC session (ADR 006 item 8). Read-side (a GET endpoint, WebSocket
- * relay to the Web app, notifications) is a tracked follow-up — this
- * repository only writes.
+ * Pi RPC session (ADR 006 item 8), and serves them back out to the Web app
+ * (item 8's original "GET endpoint" follow-up, since landed via
+ * `GET /:projectId/features/:featureId/events` in `projects/routes.ts`).
+ * WebSocket relay/notifications are still not implemented — the Web app
+ * polls listByJob instead.
  */
 export class JobEventRepository {
   constructor(private readonly db: pg.Pool) {}
@@ -68,5 +70,17 @@ export class JobEventRepository {
       ],
     );
     return mapJobEvent(result.rows[0]);
+  }
+
+  /** Lists a job's events in chronological order. */
+  async listByJob(jobId: string): Promise<JobEvent[]> {
+    const result = await this.db.query<JobEventRow>(
+      `SELECT id, job_id, type, question, markdown, message, created_at
+       FROM job_events
+       WHERE job_id = $1
+       ORDER BY created_at ASC`,
+      [jobId],
+    );
+    return result.rows.map(mapJobEvent);
   }
 }
