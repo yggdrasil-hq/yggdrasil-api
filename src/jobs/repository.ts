@@ -54,6 +54,21 @@ export class JobRepository {
     return mapJob(result.rows[0]);
   }
 
+  /**
+   * Looks up a job by id, used by the internal job-events endpoint to
+   * resolve which feature (if any) an incoming curated event belongs to,
+   * so it can flip `awaiting_user_input` (ADR 006 item 10).
+   */
+  async findById(jobId: string): Promise<Job | null> {
+    const result = await this.db.query<JobRow>(
+      `SELECT ${jobColumns}
+       FROM jobs
+       WHERE id = $1`,
+      [jobId],
+    );
+    return result.rows[0] ? mapJob(result.rows[0]) : null;
+  }
+
   async hasActiveTestRunsForProject(projectId: string): Promise<boolean> {
     const result = await this.db.query<{ exists: boolean }>(
       `SELECT EXISTS(
@@ -92,5 +107,50 @@ export class JobRepository {
       [projectId],
     );
     return result.rows.map(mapJob);
+  }
+
+  /**
+   * Finds the running spec_grill job for a feature, if any — the target
+   * for a human's reply to an in-progress grill (ADR 006 items 9-10).
+   * `null` (not an error) means there's nothing currently waiting on a
+   * reply for this feature: the grill hasn't started, already finished, or
+   * failed.
+   */
+  async findActiveSpecGrillJob(featureId: string): Promise<Job | null> {
+    const result = await this.db.query<JobRow>(
+      `SELECT ${jobColumns}
+       FROM jobs
+       WHERE feature_id = $1
+         AND kind = 'spec_grill'
+         AND status = 'running'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [featureId],
+    );
+    return result.rows[0] ? mapJob(result.rows[0]) : null;
+  }
+
+  /**
+   * Marks a running job cancelled and notifies the Orchestrator via
+   * Postgres LISTEN/NOTIFY on 'job_cancellations' (ADR 006's cancel/abort
+   * follow-up) — insert-then-notify, mirroring
+   * JobMessageRepository.create's own reasoning about NOTIFY visibility.
+   * Only transitions from 'running' (guarded in SQL), so a job that
+   * finished on its own between the caller's own check and this call can't
+   * be clobbered back to 'cancelled'. Returns false (not an error) if
+   * nothing was actually running to cancel.
+   */
+  async cancel(jobId: string): Promise<boolean> {
+    const result = await this.db.query(
+      `UPDATE jobs
+       SET status = 'cancelled', completed_at = now()
+       WHERE id = $1 AND status = 'running'`,
+      [jobId],
+    );
+    if (result.rowCount === 0) {
+      return false;
+    }
+    await this.db.query("SELECT pg_notify('job_cancellations', $1)", [jobId]);
+    return true;
   }
 }

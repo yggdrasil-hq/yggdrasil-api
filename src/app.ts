@@ -5,6 +5,7 @@ import { createAuthRouter, createSettingsRouter } from "./auth/routes.js";
 import { LoginRateLimiter } from "./auth/rate-limit.js";
 import { SessionService } from "./auth/sessions.js";
 import { FeatureRepository } from "./features/repository.js";
+import { createFeaturesInternalRouter } from "./features/internal-routes.js";
 import { createGitHubRouter } from "./github/routes.js";
 import { createGitHubAppRouter } from "./github/install-routes.js";
 import { GithubInstallationRepository } from "./github/installation-repository.js";
@@ -13,6 +14,9 @@ import { createGitHubWebhookRouter } from "./github/webhook-routes.js";
 import { GithubTokenRepository } from "./github/token-repository.js";
 import { OAuthStateRepository } from "./github/oauth.js";
 import { JobRepository } from "./jobs/repository.js";
+import { JobEventRepository } from "./jobs/events-repository.js";
+import { JobMessageRepository } from "./jobs/messages-repository.js";
+import { createJobsInternalRouter } from "./jobs/internal-routes.js";
 import { NotificationRepository } from "./notifications/repository.js";
 import { createNotificationsRouter } from "./notifications/routes.js";
 import { ProjectRepository } from "./projects/repository.js";
@@ -59,6 +63,8 @@ export function createApp(deps?: AppDependencies): Express {
   const tests = new TestRepository(deps.pool);
   const notifications = new NotificationRepository(deps.pool);
   const secrets = new SecretRepository(deps.pool);
+  const jobEvents = new JobEventRepository(deps.pool);
+  const jobMessages = new JobMessageRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions, rateLimiter }));
   app.use("/auth", createGitHubRouter({ users, sessions, oauthStates, githubTokens }));
@@ -81,6 +87,7 @@ export function createApp(deps?: AppDependencies): Express {
       features,
       tests,
       jobs,
+      jobMessages,
       notifications,
       installations,
     }),
@@ -92,6 +99,8 @@ export function createApp(deps?: AppDependencies): Express {
   app.use("/projects", createSecretsRouter({ users, sessions, projects, secrets }));
   app.use("/internal", createSecretsInternalRouter({ secrets }));
   app.use("/internal", createProjectsInternalRouter({ projects, installations }));
+  app.use("/internal", createFeaturesInternalRouter({ features, projects, installations }));
+  app.use("/internal", createJobsInternalRouter({ jobEvents, jobs, features }));
 
   app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     console.error(err);

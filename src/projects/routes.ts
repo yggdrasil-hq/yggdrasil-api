@@ -4,6 +4,7 @@ import { createAuthMiddleware } from "../auth/middleware.js";
 import type { SessionService } from "../auth/sessions.js";
 import { dispatchJob } from "../jobs/dispatch.js";
 import type { JobRepository } from "../jobs/repository.js";
+import type { JobMessageRepository } from "../jobs/messages-repository.js";
 import type { NotificationRepository } from "../notifications/repository.js";
 import { UserRepository } from "../users/repository.js";
 import type { FeatureRepository } from "../features/repository.js";
@@ -66,6 +67,10 @@ const updateFeatureSchema = z.object({
   startBuild: z.boolean().optional(),
 });
 
+const createFeatureMessageSchema = z.object({
+  content: z.string().trim().min(1).max(8000),
+});
+
 const createTestSchema = z.object({
   name: z.string().trim().min(1).max(256),
   specMarkdown: z.string().min(1),
@@ -92,6 +97,7 @@ export function createProjectsRouter(deps: {
   features: FeatureRepository;
   tests: TestRepository;
   jobs: JobRepository;
+  jobMessages: JobMessageRepository;
   notifications: NotificationRepository;
   installations: GithubInstallationRepository;
 }): Router {
@@ -573,6 +579,85 @@ export function createProjectsRouter(deps: {
     }
 
     res.json(toPublicFeature(feature));
+  });
+
+  // Queues a human's reply to a running spec_grill job's ask_user question
+  // (ADR 006 items 9-10). The Orchestrator picks it up via Postgres
+  // LISTEN/NOTIFY on 'job_replies', not by polling this endpoint or any
+  // other — this route's only job is to persist the reply and notify.
+  router.post("/:projectId/features/:featureId/messages", requireAuth, async (req, res) => {
+    const parsed = parseBody(createFeatureMessageSchema, req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const featureId = parseFeatureId(routeParam(req.params.featureId));
+    if (!featureId) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+
+    const feature = await deps.features.findById(project.id, featureId);
+    if (!feature) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+
+    const job = await deps.jobs.findActiveSpecGrillJob(featureId);
+    if (!job) {
+      res.status(409).json({ error: "No active grill session is waiting for a reply" });
+      return;
+    }
+
+    await deps.jobMessages.create({ jobId: job.id, content: parsed.data.content });
+    await deps.features.setAwaitingUserInput(featureId, false);
+    res.status(201).json({});
+  });
+
+  // Cancels a running spec_grill job (ADR 006's cancel/abort follow-up).
+  // The Orchestrator picks this up via Postgres LISTEN/NOTIFY on
+  // 'job_cancellations' — this route's only job is to flip the job's status
+  // and notify; the Orchestrator decides how to actually stop the session
+  // (sending Pi an abort command if attached, then deleting the pod).
+  router.post("/:projectId/features/:featureId/cancel", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const featureId = parseFeatureId(routeParam(req.params.featureId));
+    if (!featureId) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+
+    const feature = await deps.features.findById(project.id, featureId);
+    if (!feature) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+
+    const job = await deps.jobs.findActiveSpecGrillJob(featureId);
+    if (!job) {
+      res.status(409).json({ error: "No active grill session to cancel" });
+      return;
+    }
+
+    const cancelled = await deps.jobs.cancel(job.id);
+    if (!cancelled) {
+      res.status(409).json({ error: "No active grill session to cancel" });
+      return;
+    }
+
+    res.status(200).json({});
   });
 
   router.get("/:projectId/tests", requireAuth, async (req, res) => {
