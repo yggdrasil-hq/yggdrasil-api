@@ -117,15 +117,25 @@ export function createGitHubRouter(deps: {
           oauthState.userId,
           token.accessToken,
           token.scopes.length > 0 ? token.scopes : oauthState.scopes,
+          token.refreshToken,
         );
         await deps.users.linkGithub(oauthState.userId, githubId, githubUser.login);
 
-        res.redirect(appPublicRedirect("/settings/account", { github: "connected" }));
+        res.redirect(
+          appPublicRedirect(oauthState.returnTo ?? "/settings/account", { github: "connected" }),
+        );
         return;
       }
 
       const linkedUser = await deps.users.findByGithubId(githubId);
       if (linkedUser) {
+        await deps.githubTokens.upsert(
+          linkedUser.id,
+          token.accessToken,
+          token.scopes.length > 0 ? token.scopes : oauthState.scopes,
+          token.refreshToken,
+        );
+
         const session = await deps.sessions.create(linkedUser, false);
         setSessionCookie(res, session.id, false);
 
@@ -163,7 +173,7 @@ export function createGitHubRouter(deps: {
         githubLogin: githubUser.login,
       });
 
-      await deps.githubTokens.upsert(user.id, token.accessToken, token.scopes);
+      await deps.githubTokens.upsert(user.id, token.accessToken, token.scopes, token.refreshToken);
 
       const session = await deps.sessions.create(user, false);
       setSessionCookie(res, session.id, false);

@@ -78,6 +78,7 @@ interface GitHubTokenResponse {
   access_token: string;
   scope: string;
   token_type: string;
+  refresh_token?: string;
 }
 
 interface GitHubUserResponse {
@@ -91,7 +92,7 @@ export async function exchangeGitHubCode(
   code: string,
   clientId: string,
   clientSecret: string,
-): Promise<{ accessToken: string; scopes: string[] }> {
+): Promise<{ accessToken: string; scopes: string[]; refreshToken: string | null }> {
   const response = await fetch("https://github.com/login/oauth/access_token", {
     method: "POST",
     headers: {
@@ -115,7 +116,7 @@ export async function exchangeGitHubCode(
   }
 
   const scopes = data.scope ? data.scope.split(",").map((s) => s.trim()).filter(Boolean) : [];
-  return { accessToken: data.access_token, scopes };
+  return { accessToken: data.access_token, scopes, refreshToken: data.refresh_token ?? null };
 }
 
 export async function fetchGitHubUser(accessToken: string): Promise<GitHubUserResponse> {

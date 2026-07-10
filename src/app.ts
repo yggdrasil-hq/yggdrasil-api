@@ -12,6 +12,7 @@ import { GithubInstallationRepository } from "./github/installation-repository.j
 import { InstallStateRepository } from "./github/install-state.js";
 import { createGitHubWebhookRouter } from "./github/webhook-routes.js";
 import { GithubTokenRepository } from "./github/token-repository.js";
+import { UserGithubAccessRepository } from "./github/user-github-access-repository.js";
 import { OAuthStateRepository } from "./github/oauth.js";
 import { JobRepository } from "./jobs/repository.js";
 import { JobEventRepository } from "./jobs/events-repository.js";
@@ -57,6 +58,7 @@ export function createApp(deps?: AppDependencies): Express {
   const sessions = new SessionService(deps.pool);
   const rateLimiter = new LoginRateLimiter(deps.pool);
   const githubTokens = new GithubTokenRepository(deps.pool);
+  const userGithubAccess = new UserGithubAccessRepository(deps.pool);
   const oauthStates = new OAuthStateRepository(deps.pool);
   const installStates = new InstallStateRepository(deps.pool);
   const features = new FeatureRepository(deps.pool);
@@ -76,6 +78,8 @@ export function createApp(deps?: AppDependencies): Express {
       sessions,
       installations,
       installStates,
+      githubTokens,
+      userGithubAccess,
     }),
   );
   app.use(

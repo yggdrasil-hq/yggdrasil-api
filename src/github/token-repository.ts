@@ -1,7 +1,44 @@
 import type pg from "pg";
 
+export interface GithubUserToken {
+  accessToken: string;
+  refreshToken: string | null;
+  scopes: string[];
+}
+
+interface TokenRow {
+  access_token: string;
+  refresh_token: string | null;
+  scopes: string[];
+}
+
 export class GithubTokenRepository {
   constructor(private readonly db: pg.Pool) {}
+
+  async get(userId: string): Promise<GithubUserToken | null> {
+    const result = await this.db.query<TokenRow>(
+      `SELECT access_token, refresh_token, scopes FROM github_tokens WHERE user_id = $1`,
+      [userId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+    return { accessToken: row.access_token, refreshToken: row.refresh_token, scopes: row.scopes };
+  }
+
+  async updateAccessToken(
+    userId: string,
+    accessToken: string,
+    refreshToken?: string | null,
+  ): Promise<void> {
+    await this.db.query(
+      `UPDATE github_tokens SET
+         access_token = $2,
+         refresh_token = COALESCE($3, refresh_token),
+         updated_at = NOW()
+       WHERE user_id = $1`,
+      [userId, accessToken, refreshToken ?? null],
+    );
+  }
 
   async upsert(
     userId: string,

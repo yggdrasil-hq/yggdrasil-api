@@ -90,6 +90,53 @@ export class GithubInstallationRepository {
     return result.rows.map(mapInstallation);
   }
 
+  /** Installations visible to a specific user (via `user_installation_access`), not the global list. */
+  async listForUser(userId: string): Promise<GithubInstallation[]> {
+    const result = await this.db.query<InstallationRow>(
+      `SELECT gi.id, gi.github_installation_id, gi.account_type, gi.account_login, gi.account_id,
+              gi.installed_by_user_id, gi.suspended_at, gi.created_at, gi.updated_at
+       FROM github_installations gi
+       JOIN user_installation_access uia ON uia.installation_id = gi.id
+       WHERE uia.user_id = $1 AND gi.suspended_at IS NULL
+       ORDER BY gi.account_login ASC`,
+      [userId],
+    );
+    return result.rows.map(mapInstallation);
+  }
+
+  /** Repos across every installation this user can see, flattened for the project-creation picker. */
+  async listRepositoriesForUser(
+    userId: string,
+  ): Promise<Array<GithubInstallationRepo & { accountLogin: string; accountType: "Organization" | "User" }>> {
+    const result = await this.db.query<
+      RepoRow & { account_login: string; account_type: "Organization" | "User" }
+    >(
+      `SELECT gir.installation_id, gir.repo_full_name, gir.github_repo_id,
+              gi.account_login, gi.account_type
+       FROM github_installation_repos gir
+       JOIN github_installations gi ON gi.id = gir.installation_id
+       JOIN user_installation_access uia ON uia.installation_id = gi.id
+       WHERE uia.user_id = $1 AND gi.suspended_at IS NULL
+       ORDER BY gi.account_login ASC, gir.repo_full_name ASC`,
+      [userId],
+    );
+    return result.rows.map((row) => ({
+      installationId: row.installation_id,
+      repoFullName: row.repo_full_name,
+      githubRepoId: Number(row.github_repo_id),
+      accountLogin: row.account_login,
+      accountType: row.account_type,
+    }));
+  }
+
+  async hasAnyRepositories(installationId: string): Promise<boolean> {
+    const result = await this.db.query<{ exists: boolean }>(
+      `SELECT EXISTS(SELECT 1 FROM github_installation_repos WHERE installation_id = $1) AS exists`,
+      [installationId],
+    );
+    return result.rows[0]?.exists ?? false;
+  }
+
   async upsertFromGitHub(input: {
     githubInstallationId: number;
     accountType: "Organization" | "User";

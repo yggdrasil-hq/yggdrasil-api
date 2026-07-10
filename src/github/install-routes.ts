@@ -5,13 +5,20 @@ import type { SessionService } from "../auth/sessions.js";
 import { UserRepository } from "../users/repository.js";
 import { InstallStateRepository } from "./install-state.js";
 import { GithubInstallationRepository } from "./installation-repository.js";
+import { GithubTokenRepository } from "./token-repository.js";
+import { UserGithubAccessRepository } from "./user-github-access-repository.js";
 import { syncInstallationFromGitHub } from "./sync-installation.js";
+import { reconcileUserInstallations } from "./reconcile-user-installations.js";
+
+const SYNC_STALE_MS = 60 * 60 * 1000; // 1 hour
 
 export function createGitHubAppRouter(deps: {
   users: UserRepository;
   sessions: SessionService;
   installations: GithubInstallationRepository;
   installStates: InstallStateRepository;
+  githubTokens: GithubTokenRepository;
+  userGithubAccess: UserGithubAccessRepository;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -41,6 +48,10 @@ export function createGitHubAppRouter(deps: {
     });
 
     const params = new URLSearchParams({ state: installState.state });
+    const targetId = typeof req.query.target_id === "string" ? req.query.target_id.trim() : "";
+    if (targetId) {
+      params.set("target_id", targetId);
+    }
     const installUrl = `https://github.com/apps/${config.github.appSlug}/installations/new?${params.toString()}`;
     res.redirect(installUrl);
   });
@@ -78,6 +89,7 @@ export function createGitHubAppRouter(deps: {
         githubInstallationId,
         installState.userId,
       );
+      await deps.userGithubAccess.upsertAccess(installState.userId, synced.id);
 
       const params: Record<string, string> = {
         step: "repos",
@@ -97,16 +109,53 @@ export function createGitHubAppRouter(deps: {
     }
   });
 
-  router.get("/installations", requireAuth, async (_req, res) => {
-    const installations = await deps.installations.listAll();
-    res.json(
-      installations.map((installation) => ({
+  router.get("/installations", requireAuth, async (req, res) => {
+    const userId = req.currentUser!.id;
+    const forceRefresh = req.query.refresh === "1";
+
+    let reauthRequired = false;
+    let stale = false;
+
+    const lastSyncedAt = await deps.userGithubAccess.getLastSyncedAt(userId);
+    const isStale = !lastSyncedAt || Date.now() - lastSyncedAt.getTime() > SYNC_STALE_MS;
+
+    if (forceRefresh || isStale) {
+      const result = await reconcileUserInstallations({
+        githubTokens: deps.githubTokens,
+        installations: deps.installations,
+        userGithubAccess: deps.userGithubAccess,
+        userId,
+      });
+      if (result.status === "reauth_required") {
+        reauthRequired = true;
+      } else if (result.status === "soft_fail") {
+        stale = true;
+      }
+    }
+
+    const installations = await deps.installations.listForUser(userId);
+    const repos = await deps.installations.listRepositoriesForUser(userId);
+
+    res.json({
+      installations: installations.map((installation) => ({
         id: installation.id,
         accountType: installation.accountType,
         accountLogin: installation.accountLogin,
         githubInstallationId: installation.githubInstallationId,
       })),
-    );
+      repos: repos.map((repo) => {
+        const [owner, name] = repo.repoFullName.split("/");
+        return {
+          installationId: repo.installationId,
+          accountLogin: repo.accountLogin,
+          fullName: repo.repoFullName,
+          githubOwner: owner,
+          githubRepo: name,
+        };
+      }),
+      reauthRequired,
+      stale,
+    });
   });
 
   router.get("/installations/:installationId/repos", requireAuth, async (req, res) => {

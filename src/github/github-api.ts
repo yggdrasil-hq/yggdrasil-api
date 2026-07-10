@@ -216,6 +216,93 @@ export async function fetchRepositoryDirectory(
   return files;
 }
 
+export class GithubApiUnauthorizedError extends Error {
+  constructor(path: string) {
+    super(`GitHub API ${path} returned 401`);
+    this.name = "GithubApiUnauthorizedError";
+  }
+}
+
+/**
+ * Installations of this App visible to the given user's own OAuth token
+ * (`GET /user/installations`) — distinct from the App-level JWT calls above,
+ * this reflects exactly what the user can see on GitHub right now, so it's
+ * the source of truth for reconciling installations that predate or missed
+ * a webhook delivery.
+ */
+export async function fetchUserInstallations(
+  userAccessToken: string,
+): Promise<GitHubInstallationResponse[]> {
+  const installations: GitHubInstallationResponse[] = [];
+  let page = 1;
+
+  while (true) {
+    const response = await fetch(
+      `${GITHUB_API}/user/installations?per_page=100&page=${page}`,
+      {
+        headers: {
+          Accept: "application/vnd.github+json",
+          Authorization: `Bearer ${userAccessToken}`,
+          "User-Agent": "yggdrasil-api",
+          "X-GitHub-Api-Version": "2022-11-28",
+        },
+      },
+    );
+
+    if (response.status === 401) {
+      throw new GithubApiUnauthorizedError("/user/installations");
+    }
+    if (!response.ok) {
+      throw new Error(`GitHub API /user/installations failed: ${response.status}`);
+    }
+
+    const batch = (await response.json()) as { installations: GitHubInstallationResponse[] };
+    installations.push(...batch.installations);
+    if (batch.installations.length < 100) {
+      break;
+    }
+    page += 1;
+  }
+
+  return installations;
+}
+
+/** Refreshes a GitHub App user-to-server token using its refresh_token grant. */
+export async function refreshUserOAuthToken(
+  refreshToken: string,
+  clientId: string,
+  clientSecret: string,
+): Promise<{ accessToken: string; refreshToken: string | null }> {
+  const response = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      client_id: clientId,
+      client_secret: clientSecret,
+      grant_type: "refresh_token",
+      refresh_token: refreshToken,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new GithubApiUnauthorizedError("/login/oauth/access_token (refresh)");
+  }
+
+  const data = (await response.json()) as {
+    access_token?: string;
+    refresh_token?: string;
+    error?: string;
+  };
+  if (data.error || !data.access_token) {
+    throw new GithubApiUnauthorizedError("/login/oauth/access_token (refresh)");
+  }
+
+  return { accessToken: data.access_token, refreshToken: data.refresh_token ?? null };
+}
+
 export async function mintInstallationAccessToken(
   installationId: number,
   appId: string,
