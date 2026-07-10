@@ -41,6 +41,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     settings: {},
     installationId: "install_1",
     githubAccessWarning: false,
+    modelConfigWarning: false,
     repositories: [
       { id: "repo_1", githubOwner: "acme", githubRepo: "web", isPrimary: true, sortOrder: 0 },
       { id: "repo_2", githubOwner: "acme", githubRepo: "worker", isPrimary: false, sortOrder: 1 },

@@ -26,6 +26,8 @@ import { createProjectsInternalRouter } from "./projects/internal-routes.js";
 import { SecretRepository } from "./secrets/repository.js";
 import { createSecretsRouter } from "./secrets/routes.js";
 import { createSecretsInternalRouter } from "./secrets/internal-routes.js";
+import { UserSecretRepository } from "./secrets/user-repository.js";
+import { createUserSecretsRouter } from "./secrets/user-routes.js";
 import { TestRepository } from "./tests/repository.js";
 import { UserRepository } from "./users/repository.js";
 
@@ -65,12 +67,14 @@ export function createApp(deps?: AppDependencies): Express {
   const tests = new TestRepository(deps.pool);
   const notifications = new NotificationRepository(deps.pool);
   const secrets = new SecretRepository(deps.pool);
+  const userSecrets = new UserSecretRepository(deps.pool);
   const jobEvents = new JobEventRepository(deps.pool);
   const jobMessages = new JobMessageRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions, rateLimiter }));
   app.use("/auth", createGitHubRouter({ users, sessions, oauthStates, githubTokens }));
   app.use("/settings", createSettingsRouter({ users, sessions, githubTokens }));
+  app.use("/settings", createUserSecretsRouter({ users, sessions, userSecrets }));
   app.use(
     "/github",
     createGitHubAppRouter({
@@ -95,14 +99,19 @@ export function createApp(deps?: AppDependencies): Express {
       jobMessages,
       notifications,
       installations,
+      secrets,
+      userSecrets,
     }),
   );
   app.use(
     "/notifications",
     createNotificationsRouter({ users, sessions, notifications }),
   );
-  app.use("/projects", createSecretsRouter({ users, sessions, projects, secrets }));
-  app.use("/internal", createSecretsInternalRouter({ secrets }));
+  app.use(
+    "/projects",
+    createSecretsRouter({ users, sessions, projects, secrets, userSecrets }),
+  );
+  app.use("/internal", createSecretsInternalRouter({ secrets, userSecrets, projects }));
   app.use("/internal", createProjectsInternalRouter({ projects, installations }));
   app.use("/internal", createFeaturesInternalRouter({ features, projects, installations }));
   app.use("/internal", createJobsInternalRouter({ jobEvents, jobs, features }));

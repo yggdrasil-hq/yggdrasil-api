@@ -6,7 +6,9 @@ import { UserRepository } from "../users/repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
 import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
+import { MODEL_CONFIG_KEYS, resolveModelConfig } from "./model-config.js";
 import type { SecretRepository } from "./repository.js";
+import type { UserSecretRepository } from "./user-repository.js";
 
 const upsertSecretSchema = z.object({
   key: z.string().trim().min(1).max(128),
@@ -18,6 +20,7 @@ export function createSecretsRouter(deps: {
   sessions: SessionService;
   projects: ProjectRepository;
   secrets: SecretRepository;
+  userSecrets: UserSecretRepository;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -56,6 +59,14 @@ export function createSecretsRouter(deps: {
     }
 
     const secret = await deps.secrets.upsert(project.id, parsed.data.key, parsed.data.value);
+
+    if (project.modelConfigWarning && (MODEL_CONFIG_KEYS as readonly string[]).includes(parsed.data.key)) {
+      const resolved = await resolveModelConfig(deps, project.id, project.ownerUserId);
+      if (resolved) {
+        await deps.projects.clearModelConfigWarning(project.id);
+      }
+    }
+
     res.status(200).json(secret);
   });
 

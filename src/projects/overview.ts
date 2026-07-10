@@ -13,6 +13,7 @@ export async function buildProjectOverview(deps: {
   projectId: string;
   projectSlug: string;
   githubAccessWarning: boolean;
+  modelConfigWarning: boolean;
   features: FeatureRepository;
   jobs: JobRepository;
   tests: TestRepository;
@@ -31,6 +32,7 @@ export async function buildProjectOverview(deps: {
     featureList,
     deps.projectId,
     deps.githubAccessWarning,
+    deps.modelConfigWarning,
     await deps.jobs.listRecentFailedTestRuns(deps.projectId),
     await deps.tests.listByProject(deps.projectId),
   );
@@ -42,6 +44,7 @@ function buildActionQueue(
   features: Feature[],
   projectId: string,
   githubAccessWarning: boolean,
+  modelConfigWarning: boolean,
   failedTestJobs: Awaited<ReturnType<JobRepository["listRecentFailedTestRuns"]>>,
   tests: Awaited<ReturnType<TestRepository["listByProject"]>>,
 ): ActionQueueItem[] {
@@ -51,6 +54,15 @@ function buildActionQueue(
     items.push({
       type: "fix_github_access",
       title: "Fix GitHub access",
+      waitingSince: new Date().toISOString(),
+      linkPath: `/projects/${projectId}/settings`,
+    });
+  }
+
+  if (modelConfigWarning) {
+    items.push({
+      type: "fix_model_configuration",
+      title: "Fix model configuration",
       waitingSince: new Date().toISOString(),
       linkPath: `/projects/${projectId}/settings`,
     });

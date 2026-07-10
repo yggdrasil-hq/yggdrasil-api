@@ -12,6 +12,7 @@ interface ProjectRow {
   settings: Record<string, unknown>;
   installation_id: string | null;
   github_access_warning: boolean;
+  model_config_warning: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -27,7 +28,7 @@ interface RepositoryRow {
 
 const projectColumns = `
   id, owner_user_id, name, slug, description, status, settings,
-  installation_id, github_access_warning, created_at, updated_at
+  installation_id, github_access_warning, model_config_warning, created_at, updated_at
 `;
 
 function mapRepository(row: RepositoryRow): ProjectRepositoryRecord {
@@ -51,6 +52,7 @@ function mapProject(row: ProjectRow, repositories: ProjectRepositoryRecord[]): P
     settings: row.settings ?? {},
     installationId: row.installation_id,
     githubAccessWarning: row.github_access_warning,
+    modelConfigWarning: row.model_config_warning,
     repositories,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -183,6 +185,22 @@ export class ProjectRepository {
   async markReady(projectId: string): Promise<void> {
     await this.db.query(
       `UPDATE projects SET status = 'ready', updated_at = NOW() WHERE id = $1`,
+      [projectId],
+    );
+  }
+
+  /** Set when a dispatch site can't resolve a model configuration for this project (ADR 007). */
+  async setModelConfigWarning(projectId: string): Promise<void> {
+    await this.db.query(
+      `UPDATE projects SET model_config_warning = TRUE, updated_at = NOW() WHERE id = $1`,
+      [projectId],
+    );
+  }
+
+  /** Cleared the next time resolution succeeds for this project (ADR 007). */
+  async clearModelConfigWarning(projectId: string): Promise<void> {
+    await this.db.query(
+      `UPDATE projects SET model_config_warning = FALSE, updated_at = NOW() WHERE id = $1`,
       [projectId],
     );
   }

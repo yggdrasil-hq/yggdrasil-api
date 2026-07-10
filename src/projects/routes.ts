@@ -25,6 +25,10 @@ import type { Project } from "./types.js";
 import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
 import type { GithubInstallationRepository } from "../github/installation-repository.js";
+import { MODEL_CONFIG_KEYS, resolveModelConfig } from "../secrets/model-config.js";
+import type { ModelConfigBundle } from "../secrets/model-config.js";
+import type { SecretRepository } from "../secrets/repository.js";
+import type { UserSecretRepository } from "../secrets/user-repository.js";
 
 function parseBody<T>(schema: z.ZodType<T>, body: unknown):
   | { success: true; data: T }
@@ -42,11 +46,19 @@ const repositorySchema = z.object({
   isPrimary: z.boolean(),
 });
 
+const modelConfigBundleSchema = z.object({
+  modelBaseUrl: z.string().trim().min(1),
+  modelApiKey: z.string().trim().min(1),
+  modelId: z.string().trim().min(1),
+});
+
 const createProjectSchema = z.object({
   name: z.string().trim().min(1).max(128),
   description: z.string().max(2000).optional().default(""),
   installationId: z.string().uuid(),
   repositories: z.array(repositorySchema).min(1),
+  modelConfig: modelConfigBundleSchema.optional(),
+  saveModelConfigAsDefault: z.boolean().optional().default(false),
 }).superRefine((value, ctx) => {
   const primaryCount = value.repositories.filter((repo) => repo.isPrimary).length;
   if (primaryCount !== 1) {
@@ -57,6 +69,14 @@ const createProjectSchema = z.object({
     });
   }
 });
+
+function toModelConfigBundle(input: z.infer<typeof modelConfigBundleSchema>): ModelConfigBundle {
+  return {
+    MODEL_BASE_URL: input.modelBaseUrl,
+    MODEL_API_KEY: input.modelApiKey,
+    MODEL_ID: input.modelId,
+  };
+}
 
 const createFeatureSchema = z.object({
   title: z.string().trim().min(1).max(256),
@@ -102,6 +122,8 @@ export function createProjectsRouter(deps: {
   jobMessages: JobMessageRepository;
   notifications: NotificationRepository;
   installations: GithubInstallationRepository;
+  secrets: SecretRepository;
+  userSecrets: UserSecretRepository;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -160,6 +182,22 @@ export function createProjectsRouter(deps: {
     return null;
   }
 
+  /**
+   * Gate enforced at every job-dispatch site (ADR 007): resolves live,
+   * project bundle first then the owning user's account default, and
+   * refuses to dispatch if neither resolves. Distinct from
+   * `assertGitHubAccess` — model config and repo access are independent
+   * prerequisites.
+   */
+  async function assertModelConfigResolvable(project: Project): Promise<string | null> {
+    const resolved = await resolveModelConfig(deps, project.id, project.ownerUserId);
+    if (resolved) {
+      return null;
+    }
+    return "No model configuration is set for this project or your account default. " +
+      "Set one in Account settings, or configure this project directly on its settings page.";
+  }
+
   router.get("/", requireAuth, async (req, res) => {
     const user = req.currentUser!;
     const projects = await deps.projects.listForUser(user.id);
@@ -193,6 +231,28 @@ export function createProjectsRouter(deps: {
       return;
     }
 
+    // Resolve model config before creating anything (ADR 007): a request
+    // bundle wins, else fall back to the user's account default.
+    const requestedModelConfig = parsed.data.modelConfig
+      ? toModelConfigBundle(parsed.data.modelConfig)
+      : null;
+    let effectiveModelConfig = requestedModelConfig;
+    if (!effectiveModelConfig) {
+      const userSecrets = await deps.userSecrets.decryptAllForUser(user.id);
+      effectiveModelConfig = MODEL_CONFIG_KEYS.every((key) => userSecrets[key])
+        ? (Object.fromEntries(
+            MODEL_CONFIG_KEYS.map((key) => [key, userSecrets[key]]),
+          ) as ModelConfigBundle)
+        : null;
+    }
+    if (!effectiveModelConfig) {
+      res.status(400).json({
+        error:
+          "Set a default model configuration in Account settings, or provide one for this project.",
+      });
+      return;
+    }
+
     const project = await deps.projects.create({
       ownerUserId: user.id,
       name: parsed.data.name,
@@ -200,6 +260,17 @@ export function createProjectsRouter(deps: {
       installationId: parsed.data.installationId,
       repositories: parsed.data.repositories,
     });
+
+    if (requestedModelConfig) {
+      for (const key of MODEL_CONFIG_KEYS) {
+        await deps.secrets.upsert(project.id, key, requestedModelConfig[key]);
+      }
+      if (parsed.data.saveModelConfigAsDefault) {
+        for (const key of MODEL_CONFIG_KEYS) {
+          await deps.userSecrets.upsert(user.id, key, requestedModelConfig[key]);
+        }
+      }
+    }
 
     const initFeature = await deps.features.create({
       projectId: project.id,
@@ -402,6 +473,7 @@ export function createProjectsRouter(deps: {
       projectId: project.id,
       projectSlug: project.slug,
       githubAccessWarning: project.githubAccessWarning,
+      modelConfigWarning: project.modelConfigWarning,
       features: deps.features,
       jobs: deps.jobs,
       tests: deps.tests,
@@ -444,6 +516,12 @@ export function createProjectsRouter(deps: {
     const accessError = assertGitHubAccess(project);
     if (accessError) {
       res.status(409).json({ error: accessError });
+      return;
+    }
+
+    const modelConfigError = await assertModelConfigResolvable(project);
+    if (modelConfigError) {
+      res.status(400).json({ error: modelConfigError });
       return;
     }
 
@@ -557,6 +635,12 @@ export function createProjectsRouter(deps: {
         return;
       }
 
+      const modelConfigError = await assertModelConfigResolvable(project);
+      if (modelConfigError) {
+        res.status(400).json({ error: modelConfigError });
+        return;
+      }
+
       const updated = await deps.features.queueBuild(feature.id);
       if (!updated) {
         res.status(409).json({ error: "Unable to queue build" });
@@ -661,6 +745,65 @@ export function createProjectsRouter(deps: {
 
     res.status(200).json({});
   });
+
+  // Recovers a project stuck in `initializing` whose project_init spec_grill
+  // never had a resolvable model config to run against (ADR 007). Scoped to
+  // project_init only — general re-grilling of normal features is a
+  // separate, still-open question (ADR 002 follow-ups).
+  router.post(
+    "/:projectId/features/:featureId/retry-grill",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      if (!featureId) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      const feature = await deps.features.findById(project.id, featureId);
+      if (!feature) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      if (feature.featureType !== "project_init") {
+        res.status(409).json({ error: "Retry is only available for project initialization" });
+        return;
+      }
+
+      if (feature.status !== "draft" && feature.status !== "failed") {
+        res.status(409).json({ error: "Feature is not in a retryable state" });
+        return;
+      }
+
+      const activeJob = await deps.jobs.findActiveSpecGrillJob(featureId);
+      if (activeJob) {
+        res.status(409).json({ error: "A grill session is already running for this feature" });
+        return;
+      }
+
+      const modelConfigError = await assertModelConfigResolvable(project);
+      if (modelConfigError) {
+        res.status(400).json({ error: modelConfigError });
+        return;
+      }
+
+      await deps.features.setAwaitingUserInput(featureId, false);
+      await dispatchJob(deps.jobs, {
+        projectId: project.id,
+        kind: "spec_grill",
+        featureId: feature.id,
+      });
+
+      res.status(201).json({});
+    },
+  );
 
   // Reads a spec_grill job's curated event history for a feature (ADR 006
   // item 8's read side) — the Web app polls this to render/refresh the

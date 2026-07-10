@@ -18,6 +18,7 @@ export interface Project {
   settings: Record<string, unknown>;
   installationId: string | null;
   githubAccessWarning: boolean;
+  modelConfigWarning: boolean;
   repositories: ProjectRepositoryRecord[];
   createdAt: Date;
   updatedAt: Date;
@@ -38,6 +39,7 @@ export interface PublicProject {
   status: ProjectStatus;
   installationId: string | null;
   githubAccessWarning: boolean;
+  modelConfigWarning: boolean;
   repositories: PublicProjectRepository[];
   repositoryRemovalBlockedReason: string | null;
 }
@@ -56,7 +58,8 @@ export type ActionQueueType =
   | "changes_requested"
   | "test_failure"
   | "failed_build"
-  | "fix_github_access";
+  | "fix_github_access"
+  | "fix_model_configuration";
 
 export interface ActionQueueItem {
   type: ActionQueueType;
@@ -84,6 +87,7 @@ export function toPublicProject(
     status: project.status,
     installationId: project.installationId,
     githubAccessWarning: project.githubAccessWarning,
+    modelConfigWarning: project.modelConfigWarning,
     repositories: project.repositories.map((repo) => ({
       id: repo.id,
       githubOwner: repo.githubOwner,
