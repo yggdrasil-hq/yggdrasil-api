@@ -63,16 +63,17 @@ export function createJobsInternalRouter(deps: {
 /**
  * Reacts to the event just persisted by updating the feature it belongs to
  * (ADR 006 items 10-11): `ask_user` sets `awaiting_user_input`, so the
- * API/Web app can tell a grill is paused on a human; `run_failed`/
- * `run_cancelled` both clear it, so a job that stops (dies, or is
- * deliberately cancelled — ADR 006's cancel/abort follow-up, item 13) while
- * still waiting on a reply doesn't leave the flag stuck true forever (the
- * reply endpoint, `projects/routes.ts`, is what clears it on the success
- * path). `submit_adr` is the run's terminal event: it stores the submitted
- * markdown and moves the feature `draft` -> `spec_ready`
- * (`FeatureRepository.setSpecReady`, which also clears
- * `awaiting_user_input` itself) — without this, a feature stays stuck on
- * `draft` forever even after a successful grill.
+ * API/Web app can tell a grill is paused on a human. `submit_adr` is the
+ * run's successful terminal event: it stores the submitted markdown and
+ * moves the feature `draft` -> `spec_ready` (`FeatureRepository.setSpecReady`,
+ * which also clears `awaiting_user_input` itself). `run_failed`/
+ * `run_cancelled` are the run's unsuccessful terminal events: each clears
+ * `awaiting_user_input` (so a job that stops — dies, or is deliberately
+ * cancelled, ADR 006 item 13 — while still waiting on a reply doesn't leave
+ * the flag stuck true forever) and moves the feature to `failed`/`cancelled`
+ * respectively (ADR 007 item 8's retry-grill route depends on a
+ * `project_init` feature actually reaching `failed`, not staying on `draft`
+ * forever) — without this, the Web app has no way to tell a grill died.
  *
  * Best-effort: a failure here doesn't undo the 201 already sent for the
  * event itself, since the event was persisted successfully regardless.
@@ -100,6 +101,11 @@ async function syncFeatureState(
       return;
     }
     await deps.features.setAwaitingUserInput(job.featureId, event.type === "ask_user");
+    if (event.type === "run_failed") {
+      await deps.features.updateStatus(job.featureId, "failed");
+    } else if (event.type === "run_cancelled") {
+      await deps.features.updateStatus(job.featureId, "cancelled");
+    }
   } catch (error) {
     console.error(`failed to sync feature state for job ${jobId}:`, error);
   }

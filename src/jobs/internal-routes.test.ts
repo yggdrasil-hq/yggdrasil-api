@@ -46,12 +46,14 @@ function buildApp(deps: {
   findById?: (jobId: string) => Promise<Job | null>;
   setAwaitingUserInput?: (featureId: string, awaiting: boolean) => Promise<null>;
   setSpecReady?: (featureId: string, adrMarkdown: string) => Promise<null>;
+  updateStatus?: (featureId: string, status: string) => Promise<null>;
 }) {
   const create: (input: CreateInput) => Promise<JobEvent> =
     deps.create ?? (async (input) => makeEvent({ jobId: input.jobId, type: input.type }));
   const findById = deps.findById ?? (async (jobId: string) => makeJob({ id: jobId }));
   const setAwaitingUserInput = deps.setAwaitingUserInput ?? (async () => null);
   const setSpecReady = deps.setSpecReady ?? (async () => null);
+  const updateStatus = deps.updateStatus ?? (async () => null);
 
   const app = express();
   app.use(express.json());
@@ -60,7 +62,7 @@ function buildApp(deps: {
     createJobsInternalRouter({
       jobEvents: { create } as never,
       jobs: { findById } as never,
-      features: { setAwaitingUserInput, setSpecReady } as never,
+      features: { setAwaitingUserInput, setSpecReady, updateStatus } as never,
     }),
   );
   return app;
@@ -192,6 +194,53 @@ describe("POST /internal/jobs/:jobId/events", () => {
 
     expect(res.status).toBe(201);
     expect(setAwaitingUserInput).toHaveBeenCalledWith("feature_42", false);
+  });
+
+  it("moves the feature to failed when a run_failed event arrives", async () => {
+    const updateStatus = vi.fn(async () => null);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42" }),
+      updateStatus,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "run_failed", message: "404: model not found" });
+
+    expect(res.status).toBe(201);
+    expect(updateStatus).toHaveBeenCalledWith("feature_42", "failed");
+  });
+
+  it("moves the feature to cancelled when a run_cancelled event arrives", async () => {
+    const updateStatus = vi.fn(async () => null);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42" }),
+      updateStatus,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "run_cancelled", message: "job cancelled" });
+
+    expect(res.status).toBe(201);
+    expect(updateStatus).toHaveBeenCalledWith("feature_42", "cancelled");
+  });
+
+  it("does not touch status for ask_user events", async () => {
+    const updateStatus = vi.fn(async () => null);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42" }),
+      updateStatus,
+    });
+
+    await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "ask_user", question: "x" });
+
+    expect(updateStatus).not.toHaveBeenCalled();
   });
 
   it("does not touch awaiting_user_input for submit_adr or agent_text events", async () => {

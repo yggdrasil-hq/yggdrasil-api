@@ -303,10 +303,21 @@ export async function refreshUserOAuthToken(
   return { accessToken: data.access_token, refreshToken: data.refresh_token ?? null };
 }
 
+/**
+ * `permissions`, when passed, requests a token scoped to strictly less than
+ * the GitHub App's own installation permissions (Contents read/write, Pull
+ * requests read/write, Metadata read — ADR 005 §7) — e.g. `{ contents:
+ * "read" }` for a job kind that must never be able to push, regardless of
+ * what tools happen to be reachable inside its container. Omitted entirely
+ * (not just empty), the GitHub API mints a token with every permission the
+ * installation has, matching every caller's behavior before this param
+ * existed.
+ */
 export async function mintInstallationAccessToken(
   installationId: number,
   appId: string,
   privateKeyPem: string,
+  permissions?: Record<string, string>,
 ): Promise<{ token: string; expiresAt: Date }> {
   const jwt = createGitHubAppJwt(appId, normalizePrivateKey(privateKeyPem));
   const response = await fetch(
@@ -318,7 +329,9 @@ export async function mintInstallationAccessToken(
         Authorization: `Bearer ${jwt}`,
         "User-Agent": "yggdrasil-api",
         "X-GitHub-Api-Version": "2022-11-28",
+        ...(permissions ? { "Content-Type": "application/json" } : {}),
       },
+      body: permissions ? JSON.stringify({ permissions }) : undefined,
     },
   );
 

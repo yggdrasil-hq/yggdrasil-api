@@ -53,10 +53,17 @@ export function createFeaturesInternalRouter(deps: {
       }
 
       try {
+        // spec_grill only ever reads (explores the repo, conducts the grill
+        // interview, submits an ADR) — scoping the token to contents:read
+        // means a stray `git push`/`gh pr create` from inside the container
+        // (its bash tool is unrestricted; only the yggdrasil-contract tools
+        // are allowlisted) fails at GitHub regardless, instead of relying
+        // solely on the skill's own instructions and tool allowlist.
         const { token } = await mintInstallationAccessToken(
           installation.githubInstallationId,
           config.github.appId,
           config.github.appPrivateKey,
+          { contents: "read" },
         );
 
         res.json({

@@ -113,7 +113,12 @@ describe("GET /internal/projects/:projectId/features/:featureId/spec", () => {
       ],
       githubToken: "ghs_minted-token",
     });
-    expect(mintInstallationAccessToken).toHaveBeenCalledWith(42, expect.any(String), expect.any(String));
+    // spec_grill's token is scoped to contents:read (ADR 005 item 16,
+    // amended 2026-07-11) — it must never be write-capable, even though its
+    // bash tool is unrestricted.
+    expect(mintInstallationAccessToken).toHaveBeenCalledWith(42, expect.any(String), expect.any(String), {
+      contents: "read",
+    });
   });
 
   it("returns 404 for an unknown feature", async () => {
