@@ -38,7 +38,3 @@ CREATE TABLE IF NOT EXISTS install_states (
 );
 
 CREATE INDEX IF NOT EXISTS idx_install_states_expires_at ON install_states(expires_at);
-
-ALTER TABLE oauth_states DROP CONSTRAINT IF EXISTS oauth_states_intent_check;
-ALTER TABLE oauth_states ADD CONSTRAINT oauth_states_intent_check
-  CHECK (intent IN ('login', 'signup', 'link'));
