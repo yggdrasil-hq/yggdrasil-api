@@ -9,15 +9,23 @@ import { isUuid } from "../shared/uuid.js";
 import type { FeatureRepository } from "./repository.js";
 
 /**
- * Serves a spec_grill job's payload back to the Orchestrator at claim time
- * (ADR 006 item 5): the feature title, its featureType ("normal" |
- * "project_init" — ADR 008 item 1, lets buildInitialPrompt pick the right
- * skill instead of the model inferring it from the title), and the
- * project's linked repos, plus a fresh job-scoped GitHub installation
- * token. The token is minted here rather than read from `project_secrets`
- * — it's short-lived and per-job (ADR 005 §14), the same as the
- * chart-fetch/chart-scaffold token, not a static project secret like the
- * model config (ADR 004).
+ * Serves a job's feature payload back to the Orchestrator at claim time
+ * (ADR 006 item 5, widened by ADR 010 item 1): the feature title, its
+ * featureType ("normal" | "project_init" — ADR 008 item 1, lets
+ * buildInitialPrompt pick the right skill instead of the model inferring it
+ * from the title), and the project's linked repos, plus a fresh job-scoped
+ * GitHub installation token. The token is minted here rather than read from
+ * `project_secrets` — it's short-lived and per-job (ADR 005 §14), the same
+ * as the chart-fetch/chart-scaffold token, not a static project secret like
+ * the model config (ADR 004).
+ *
+ * The `kind` query param (passed by the Orchestrator, which already knows
+ * its own job.Kind) branches both the response shape and the minted
+ * token's scope — this is the existing internal, bearer-token-only surface
+ * (`requireInternalApiToken`), not user-facing, so a caller-supplied kind
+ * carries no privilege-escalation risk beyond what an internal service is
+ * already trusted with. Anything other than "feature_build" (including no
+ * kind at all) preserves spec_grill's original behavior exactly.
  */
 export function createFeaturesInternalRouter(deps: {
   features: FeatureRepository;
@@ -36,6 +44,7 @@ export function createFeaturesInternalRouter(deps: {
         res.status(404).json({ error: "Feature not found" });
         return;
       }
+      const isFeatureBuild = req.query.kind === "feature_build";
 
       const feature = await deps.features.findById(projectId, featureId);
       if (!feature) {
@@ -62,11 +71,14 @@ export function createFeaturesInternalRouter(deps: {
         // (its bash tool is unrestricted; only the yggdrasil-contract tools
         // are allowlisted) fails at GitHub regardless, instead of relying
         // solely on the skill's own instructions and tool allowlist.
+        // feature_build is the opposite case: it's expected to commit and
+        // open a draft PR (job-dispatch.md), so it needs a write-capable
+        // token instead (ADR 010 item 1).
         const { token } = await mintInstallationAccessToken(
           installation.githubInstallationId,
           config.github.appId,
           config.github.appPrivateKey,
-          { contents: "read" },
+          isFeatureBuild ? { contents: "write", pull_requests: "write" } : { contents: "read" },
         );
 
         res.json({
@@ -77,6 +89,19 @@ export function createFeaturesInternalRouter(deps: {
             isPrimary: repo.isPrimary,
           })),
           githubToken: token,
+          // adrMarkdown/branch satisfy feature_build/skills/implement/
+          // SKILL.md's own documented assumptions (ADR 010 item 3): the
+          // approved ADR to implement, and the feature branch name
+          // (job-dispatch.md's yggdrasil/<feature-slug>-<id> convention)
+          // entrypoint.sh checks out before Pi starts. Both omitted for
+          // spec_grill, which has no ADR yet and clones each repo's default
+          // branch.
+          ...(isFeatureBuild
+            ? {
+                adrMarkdown: feature.adrMarkdown ?? "",
+                branch: `yggdrasil/${feature.slug}-${feature.id}`,
+              }
+            : {}),
         });
       } catch (error) {
         console.error(`feature spec fetch failed for feature ${featureId}:`, error);

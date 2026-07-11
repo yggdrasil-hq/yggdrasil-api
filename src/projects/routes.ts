@@ -669,8 +669,9 @@ export function createProjectsRouter(deps: {
 
   // Queues a human's reply to a running spec_grill job's ask_user question
   // (ADR 006 items 9-10). The Orchestrator picks it up via Postgres
-  // LISTEN/NOTIFY on 'job_replies', not by polling this endpoint or any
-  // other — this route's only job is to persist the reply and notify.
+  // LISTEN/NOTIFY on 'job_replies'. Also records the reply as a 'user_message'
+  // job_event so it appears in GET .../events alongside agent-authored events
+  // and survives a page refresh, since the Web app only reads from job_events.
   router.post("/:projectId/features/:featureId/messages", requireAuth, async (req, res) => {
     const parsed = parseBody(createFeatureMessageSchema, req.body);
     if (!parsed.success) {
@@ -703,6 +704,7 @@ export function createProjectsRouter(deps: {
     }
 
     await deps.jobMessages.create({ jobId: job.id, content: parsed.data.content });
+    await deps.jobEvents.create({ jobId: job.id, type: "user_message", message: parsed.data.content });
     await deps.features.setAwaitingUserInput(featureId, false);
     res.status(201).json({});
   });

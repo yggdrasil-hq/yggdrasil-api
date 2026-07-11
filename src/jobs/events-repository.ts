@@ -5,7 +5,9 @@ export type JobEventType =
   | "ask_user"
   | "submit_adr"
   | "run_failed"
-  | "run_cancelled";
+  | "run_cancelled"
+  | "user_message"
+  | "submit_build_result";
 
 export interface JobEvent {
   id: string;
@@ -14,6 +16,9 @@ export interface JobEvent {
   question: string | null;
   markdown: string | null;
   message: string | null;
+  status: string | null;
+  prUrl: string | null;
+  summary: string | null;
   createdAt: Date;
 }
 
@@ -24,6 +29,9 @@ interface JobEventRow {
   question: string | null;
   markdown: string | null;
   message: string | null;
+  status: string | null;
+  pr_url: string | null;
+  summary: string | null;
   created_at: Date;
 }
 
@@ -35,6 +43,9 @@ function mapJobEvent(row: JobEventRow): JobEvent {
     question: row.question,
     markdown: row.markdown,
     message: row.message,
+    status: row.status,
+    prUrl: row.pr_url,
+    summary: row.summary,
     createdAt: row.created_at,
   };
 }
@@ -56,17 +67,23 @@ export class JobEventRepository {
     question?: string;
     markdown?: string;
     message?: string;
+    status?: string;
+    prUrl?: string;
+    summary?: string;
   }): Promise<JobEvent> {
     const result = await this.db.query<JobEventRow>(
-      `INSERT INTO job_events (job_id, type, question, markdown, message)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, job_id, type, question, markdown, message, created_at`,
+      `INSERT INTO job_events (job_id, type, question, markdown, message, status, pr_url, summary)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, job_id, type, question, markdown, message, status, pr_url, summary, created_at`,
       [
         input.jobId,
         input.type,
         input.question ?? null,
         input.markdown ?? null,
         input.message ?? null,
+        input.status ?? null,
+        input.prUrl ?? null,
+        input.summary ?? null,
       ],
     );
     return mapJobEvent(result.rows[0]);
@@ -75,7 +92,7 @@ export class JobEventRepository {
   /** Lists a job's events in chronological order. */
   async listByJob(jobId: string): Promise<JobEvent[]> {
     const result = await this.db.query<JobEventRow>(
-      `SELECT id, job_id, type, question, markdown, message, created_at
+      `SELECT id, job_id, type, question, markdown, message, status, pr_url, summary, created_at
        FROM job_events
        WHERE job_id = $1
        ORDER BY created_at ASC`,

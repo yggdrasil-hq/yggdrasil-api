@@ -147,6 +147,28 @@ export class FeatureRepository {
     return result.rows[0] ? mapFeature(result.rows[0]) : null;
   }
 
+  /**
+   * Moves a feature to in_review on a successful feature_build run (ADR 010
+   * item 9) and persists the opened draft PR's URL. Deliberately no
+   * `WHERE status = ...` guard, unlike approveAdr: nothing in this codebase
+   * yet flips a feature to 'running' when its feature_build job actually
+   * starts (a separate, undecided gap — the job goes straight from
+   * 'queued' to whatever this call sets), and run_failed/run_cancelled's
+   * own updateStatus calls below are equally unguarded — this matches that
+   * existing precedent rather than silently no-op'ing on a status this
+   * feature was never actually moved into.
+   */
+  async setInReview(featureId: string, prUrl: string): Promise<Feature | null> {
+    const result = await this.db.query<FeatureRow>(
+      `UPDATE features
+       SET status = 'in_review', pr_url = $2, updated_at = NOW()
+       WHERE id = $1
+       RETURNING ${featureColumns}`,
+      [featureId, prUrl],
+    );
+    return result.rows[0] ? mapFeature(result.rows[0]) : null;
+  }
+
   async setAwaitingUserInput(
     featureId: string,
     awaiting: boolean,

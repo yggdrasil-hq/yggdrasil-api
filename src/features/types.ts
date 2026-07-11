@@ -44,6 +44,23 @@ export interface PublicFeature {
   updatedAt: string;
 }
 
+/**
+ * Strips common inline markdown syntax from a single line so it reads as
+ * plain text. Deliberately a hand-rolled regex strip rather than a
+ * markdown-parser round-trip: this feeds a one-line card excerpt, which
+ * shouldn't render block-level markdown (headings, lists) in the first
+ * place — it should just look like plain text.
+ */
+function stripMarkdownSyntax(line: string): string {
+  return line
+    .replace(/^[-*+]\s+/, "")
+    .replace(/^\d+\.\s+/, "")
+    .replace(/\*\*(.+?)\*\*/g, "$1")
+    .replace(/\*(.+?)\*/g, "$1")
+    .replace(/`(.+?)`/g, "$1")
+    .trim();
+}
+
 function excerptFromAdr(adrMarkdown: string | null, title: string): string {
   if (!adrMarkdown?.trim()) {
     return "Spec in progress…";
@@ -54,7 +71,12 @@ function excerptFromAdr(adrMarkdown: string | null, title: string): string {
     .map((line) => line.trim())
     .filter((line) => line.length > 0 && !line.startsWith("#"));
 
-  return lines[0]?.slice(0, 240) ?? title;
+  const firstLine = lines[0];
+  if (!firstLine) {
+    return title;
+  }
+
+  return stripMarkdownSyntax(firstLine).slice(0, 240);
 }
 
 export function toPublicFeature(feature: Feature): PublicFeature {

@@ -148,6 +148,58 @@ describe("GET /internal/projects/:projectId/features/:featureId/spec", () => {
     expect(res.body.featureType).toBe("project_init");
   });
 
+  it("includes adrMarkdown/branch and mints a write-scoped token for kind=feature_build", async () => {
+    const app = buildApp({
+      features: {
+        findById: async () =>
+          makeFeature({
+            id: "9f1b6b0e-7a3f-4a3a-8b8e-2e1a6f0c9a11",
+            slug: "add-dark-mode",
+            adrMarkdown: "# Add dark mode\n\n...",
+          }),
+      },
+    });
+
+    const res = await request(app)
+      .get(`/internal/projects/${PROJECT_ID}/features/${FEATURE_ID}/spec?kind=feature_build`)
+      .set("Authorization", "Bearer test-internal-api-token");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      title: "Add dark mode",
+      featureType: "normal",
+      repos: [
+        { cloneUrl: "https://github.com/acme/web.git", isPrimary: true },
+        { cloneUrl: "https://github.com/acme/worker.git", isPrimary: false },
+      ],
+      githubToken: "ghs_minted-token",
+      adrMarkdown: "# Add dark mode\n\n...",
+      branch: "yggdrasil/add-dark-mode-9f1b6b0e-7a3f-4a3a-8b8e-2e1a6f0c9a11",
+    });
+    // feature_build commits and opens a draft PR (job-dispatch.md), so its
+    // token needs write access — unlike spec_grill's read-only one above
+    // (ADR 010 item 1).
+    expect(mintInstallationAccessToken).toHaveBeenCalledWith(42, expect.any(String), expect.any(String), {
+      contents: "write",
+      pull_requests: "write",
+    });
+  });
+
+  it("omits adrMarkdown/branch for spec_grill (kind omitted or explicit)", async () => {
+    const app = buildApp({});
+
+    const res = await request(app)
+      .get(`/internal/projects/${PROJECT_ID}/features/${FEATURE_ID}/spec?kind=spec_grill`)
+      .set("Authorization", "Bearer test-internal-api-token");
+
+    expect(res.status).toBe(200);
+    expect(res.body).not.toHaveProperty("adrMarkdown");
+    expect(res.body).not.toHaveProperty("branch");
+    expect(mintInstallationAccessToken).toHaveBeenCalledWith(42, expect.any(String), expect.any(String), {
+      contents: "read",
+    });
+  });
+
   it("returns 404 when the project has no GitHub installation", async () => {
     const app = buildApp({
       projects: { findById: async () => makeProject({ installationId: null }) },
