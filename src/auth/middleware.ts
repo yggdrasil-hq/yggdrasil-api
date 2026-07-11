@@ -46,37 +46,3 @@ export function createAuthMiddleware(
     next();
   };
 }
-
-export function optionalAuth(
-  sessions: SessionService,
-  users: UserRepository,
-) {
-  return async function optionalAuthMiddleware(
-    req: Request,
-    _res: Response,
-    next: NextFunction,
-  ): Promise<void> {
-    const sessionId = req.cookies?.[config.cookieName];
-    if (!sessionId || typeof sessionId !== "string") {
-      next();
-      return;
-    }
-
-    const session = await sessions.findValid(sessionId);
-    if (!session) {
-      next();
-      return;
-    }
-
-    const user = await users.findById(session.userId);
-    if (!user) {
-      next();
-      return;
-    }
-
-    await sessions.touch(session);
-    req.currentUser = user;
-    req.sessionId = session.id;
-    next();
-  };
-}

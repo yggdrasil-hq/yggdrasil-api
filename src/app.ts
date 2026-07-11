@@ -2,7 +2,6 @@ import cookieParser from "cookie-parser";
 import express, { type Express } from "express";
 import type pg from "pg";
 import { createAuthRouter, createSettingsRouter } from "./auth/routes.js";
-import { LoginRateLimiter } from "./auth/rate-limit.js";
 import { SessionService } from "./auth/sessions.js";
 import { FeatureRepository } from "./features/repository.js";
 import { createFeaturesInternalRouter } from "./features/internal-routes.js";
@@ -58,7 +57,6 @@ export function createApp(deps?: AppDependencies): Express {
 
   const users = new UserRepository(deps.pool);
   const sessions = new SessionService(deps.pool);
-  const rateLimiter = new LoginRateLimiter(deps.pool);
   const githubTokens = new GithubTokenRepository(deps.pool);
   const userGithubAccess = new UserGithubAccessRepository(deps.pool);
   const oauthStates = new OAuthStateRepository(deps.pool);
@@ -71,9 +69,9 @@ export function createApp(deps?: AppDependencies): Express {
   const jobEvents = new JobEventRepository(deps.pool);
   const jobMessages = new JobMessageRepository(deps.pool);
 
-  app.use("/auth", createAuthRouter({ users, sessions, rateLimiter }));
+  app.use("/auth", createAuthRouter({ users, sessions }));
   app.use("/auth", createGitHubRouter({ users, sessions, oauthStates, githubTokens }));
-  app.use("/settings", createSettingsRouter({ users, sessions, githubTokens }));
+  app.use("/settings", createSettingsRouter({ users, sessions }));
   app.use("/settings", createUserSecretsRouter({ users, sessions, userSecrets }));
   app.use(
     "/github",

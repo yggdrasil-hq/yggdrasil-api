@@ -4,10 +4,9 @@ export interface User {
   id: string;
   username: string;
   displayName: string;
-  passwordHash: string | null;
   onboardingState: OnboardingState;
-  githubId: string | null;
-  githubLogin: string | null;
+  githubId: string;
+  githubLogin: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -17,9 +16,7 @@ export interface PublicUser {
   username: string;
   displayName: string;
   onboardingState: OnboardingState;
-  hasPassword: boolean;
-  githubConnected: boolean;
-  githubLogin: string | null;
+  githubLogin: string;
 }
 
 export function toPublicUser(user: User): PublicUser {
@@ -28,8 +25,6 @@ export function toPublicUser(user: User): PublicUser {
     username: user.username,
     displayName: user.displayName,
     onboardingState: user.onboardingState,
-    hasPassword: user.passwordHash !== null,
-    githubConnected: user.githubId !== null,
     githubLogin: user.githubLogin,
   };
 }

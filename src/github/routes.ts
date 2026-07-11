@@ -1,7 +1,6 @@
 import { Router } from "express";
 import { config, isGitHubOAuthConfigured, appPublicRedirect } from "../config.js";
-import { clearSessionCookie, setSessionCookie } from "../auth/cookies.js";
-import { createAuthMiddleware, optionalAuth } from "../auth/middleware.js";
+import { setSessionCookie } from "../auth/cookies.js";
 import type { SessionService } from "../auth/sessions.js";
 import { GithubTokenRepository } from "./token-repository.js";
 import {
@@ -9,13 +8,8 @@ import {
   exchangeGitHubCode,
   fetchGitHubUser,
   OAuthStateRepository,
-  scopesForIntent,
-  type OAuthIntent,
 } from "./oauth.js";
 import { UserRepository } from "../users/repository.js";
-import { toPublicUser } from "../users/types.js";
-
-const intentSchema = new Set<OAuthIntent>(["login", "signup", "link"]);
 
 export function createGitHubRouter(deps: {
   users: UserRepository;
@@ -24,42 +18,22 @@ export function createGitHubRouter(deps: {
   githubTokens: GithubTokenRepository;
 }): Router {
   const router = Router();
-  const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
-  const maybeAuth = optionalAuth(deps.sessions, deps.users);
 
-  router.get("/github", maybeAuth, async (req, res) => {
+  router.get("/github", async (req, res) => {
     if (!isGitHubOAuthConfigured()) {
       res.status(503).json({ error: "GitHub OAuth is not configured" });
-      return;
-    }
-
-    const intentParam = String(req.query.intent ?? "login");
-    if (!intentSchema.has(intentParam as OAuthIntent)) {
-      res.status(400).json({ error: "Invalid OAuth intent" });
-      return;
-    }
-    const intent = intentParam as OAuthIntent;
-
-    if (intent === "link" && !req.currentUser) {
-      res.status(401).json({ error: "Authentication required" });
       return;
     }
 
     const returnTo =
       typeof req.query.return_to === "string" ? req.query.return_to : null;
 
-    const oauthState = await deps.oauthStates.create({
-      intent,
-      userId: req.currentUser?.id ?? null,
-      returnTo,
-      scopes: scopesForIntent(intent),
-    });
+    const oauthState = await deps.oauthStates.create({ returnTo });
 
     const authorizeUrl = buildGitHubAuthorizeUrl({
       clientId: config.github.clientId,
       redirectUri: `${config.apiPublicUrl}/auth/github/callback`,
       state: oauthState.state,
-      scopes: oauthState.scopes,
     });
 
     res.redirect(authorizeUrl);
@@ -99,94 +73,42 @@ export function createGitHubRouter(deps: {
       const githubUser = await fetchGitHubUser(token.accessToken);
       const githubId = String(githubUser.id);
 
-      if (oauthState.intent === "link") {
-        if (!oauthState.userId) {
-          res.redirect(appPublicRedirect("/settings/account", { error: "auth_required" }));
-          return;
+      let user = await deps.users.findByGithubId(githubId);
+      if (!user) {
+        let username = githubUser.login.toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+        if (!/^[a-z0-9_-]{3,32}$/.test(username)) {
+          username = `gh_${githubId.slice(0, 8)}`;
+        }
+        if (await deps.users.isUsernameTaken(username)) {
+          username = `${username.slice(0, 24)}_${githubId.slice(-4)}`.slice(0, 32);
         }
 
-        const existing = await deps.users.findByGithubId(githubId);
-        if (existing && existing.id !== oauthState.userId) {
-          res.redirect(
-            appPublicRedirect("/settings/account", { error: "github_already_linked" }),
-          );
-          return;
-        }
-
-        await deps.githubTokens.upsert(
-          oauthState.userId,
-          token.accessToken,
-          token.scopes.length > 0 ? token.scopes : oauthState.scopes,
-          token.refreshToken,
-        );
-        await deps.users.linkGithub(oauthState.userId, githubId, githubUser.login);
-
-        res.redirect(
-          appPublicRedirect(oauthState.returnTo ?? "/settings/account", { github: "connected" }),
-        );
-        return;
+        user = await deps.users.createGithubUser({
+          username,
+          displayName: githubUser.name ?? githubUser.login,
+          githubId,
+          githubLogin: githubUser.login,
+        });
       }
-
-      const linkedUser = await deps.users.findByGithubId(githubId);
-      if (linkedUser) {
-        await deps.githubTokens.upsert(
-          linkedUser.id,
-          token.accessToken,
-          token.scopes.length > 0 ? token.scopes : oauthState.scopes,
-          token.refreshToken,
-        );
-
-        const session = await deps.sessions.create(linkedUser, false);
-        setSessionCookie(res, session.id, false);
-
-        if (linkedUser.onboardingState === "pending_username") {
-          res.redirect(appPublicRedirect("/onboarding/confirm-username"));
-          return;
-        }
-
-        res.redirect(appPublicRedirect(oauthState.returnTo ?? "/"));
-        return;
-      }
-
-      if (oauthState.intent === "login") {
-        res.redirect(
-          appPublicRedirect("/login", {
-            error: "github_unlinked",
-            github_login: githubUser.login,
-          }),
-        );
-        return;
-      }
-
-      let username = githubUser.login.toLowerCase().replace(/[^a-z0-9_-]/g, "_");
-      if (!/^[a-z0-9_-]{3,32}$/.test(username)) {
-        username = `gh_${githubId.slice(0, 8)}`;
-      }
-      if (await deps.users.isUsernameTaken(username)) {
-        username = `${username.slice(0, 24)}_${githubId.slice(-4)}`.slice(0, 32);
-      }
-
-      const user = await deps.users.createGithubUser({
-        username,
-        displayName: githubUser.name ?? githubUser.login,
-        githubId,
-        githubLogin: githubUser.login,
-      });
 
       await deps.githubTokens.upsert(user.id, token.accessToken, token.scopes, token.refreshToken);
 
       const session = await deps.sessions.create(user, false);
       setSessionCookie(res, session.id, false);
-      res.redirect(appPublicRedirect("/onboarding/confirm-username"));
+
+      if (user.onboardingState === "pending_username") {
+        res.redirect(appPublicRedirect("/onboarding/confirm-username"));
+        return;
+      }
+
+      if (oauthState.returnTo) {
+        res.redirect(appPublicRedirect(oauthState.returnTo, { github: "connected" }));
+        return;
+      }
+      res.redirect(appPublicRedirect("/"));
     } catch {
       res.redirect(appPublicRedirect("/login", { error: "github_failed" }));
     }
-  });
-
-  router.get("/github/unlinked", (_req, res) => {
-    res.json({
-      message: "No Yggdrasil account linked to this GitHub identity.",
-    });
   });
 
   return router;

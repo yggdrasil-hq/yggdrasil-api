@@ -4,11 +4,10 @@ CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   username VARCHAR(32) NOT NULL UNIQUE,
   display_name VARCHAR(128) NOT NULL,
-  password_hash TEXT,
   onboarding_state VARCHAR(32) NOT NULL DEFAULT 'active'
     CHECK (onboarding_state IN ('pending_username', 'active')),
-  github_id BIGINT UNIQUE,
-  github_login VARCHAR(255),
+  github_id BIGINT NOT NULL UNIQUE,
+  github_login VARCHAR(255) NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -33,25 +32,9 @@ CREATE TABLE IF NOT EXISTS github_tokens (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE TABLE IF NOT EXISTS login_attempts (
-  id BIGSERIAL PRIMARY KEY,
-  username VARCHAR(32),
-  ip_address INET NOT NULL,
-  attempted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX IF NOT EXISTS idx_login_attempts_username_time
-  ON login_attempts (username, attempted_at);
-CREATE INDEX IF NOT EXISTS idx_login_attempts_ip_time
-  ON login_attempts (ip_address, attempted_at);
-
 CREATE TABLE IF NOT EXISTS oauth_states (
   state VARCHAR(64) PRIMARY KEY,
-  intent VARCHAR(16) NOT NULL
-    CHECK (intent IN ('login', 'signup', 'link', 'upgrade')),
-  user_id UUID REFERENCES users(id) ON DELETE CASCADE,
   return_to TEXT,
-  scopes TEXT[] NOT NULL DEFAULT '{}',
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

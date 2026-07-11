@@ -5,10 +5,9 @@ interface UserRow {
   id: string;
   username: string;
   display_name: string;
-  password_hash: string | null;
   onboarding_state: OnboardingState;
-  github_id: string | null;
-  github_login: string | null;
+  github_id: string;
+  github_login: string;
   created_at: Date;
   updated_at: Date;
 }
@@ -18,7 +17,6 @@ function mapUser(row: UserRow): User {
     id: row.id,
     username: row.username,
     displayName: row.display_name,
-    passwordHash: row.password_hash,
     onboardingState: row.onboarding_state,
     githubId: row.github_id,
     githubLogin: row.github_login,
@@ -28,7 +26,7 @@ function mapUser(row: UserRow): User {
 }
 
 const userColumns = `
-  id, username, display_name, password_hash, onboarding_state,
+  id, username, display_name, onboarding_state,
   github_id, github_login, created_at, updated_at
 `;
 
@@ -65,20 +63,6 @@ export class UserRepository {
       [username],
     );
     return result.rows[0]?.exists ?? false;
-  }
-
-  async createPasswordUser(input: {
-    username: string;
-    displayName: string;
-    passwordHash: string;
-  }): Promise<User> {
-    const result = await this.db.query<UserRow>(
-      `INSERT INTO users (username, display_name, password_hash, onboarding_state)
-       VALUES ($1, $2, $3, 'active')
-       RETURNING ${userColumns}`,
-      [input.username, input.displayName, input.passwordHash],
-    );
-    return mapUser(result.rows[0]);
   }
 
   async createGithubUser(input: {
@@ -119,39 +103,6 @@ export class UserRepository {
       `UPDATE users SET display_name = $2, updated_at = NOW()
        WHERE id = $1 RETURNING ${userColumns}`,
       [userId, displayName],
-    );
-    return result.rows[0] ? mapUser(result.rows[0]) : null;
-  }
-
-  async updatePasswordHash(userId: string, passwordHash: string): Promise<void> {
-    await this.db.query(
-      `UPDATE users SET password_hash = $2, updated_at = NOW() WHERE id = $1`,
-      [userId, passwordHash],
-    );
-  }
-
-  async linkGithub(
-    userId: string,
-    githubId: string,
-    githubLogin: string,
-  ): Promise<User | null> {
-    const result = await this.db.query<UserRow>(
-      `UPDATE users
-       SET github_id = $2, github_login = $3, updated_at = NOW()
-       WHERE id = $1
-       RETURNING ${userColumns}`,
-      [userId, githubId, githubLogin],
-    );
-    return result.rows[0] ? mapUser(result.rows[0]) : null;
-  }
-
-  async unlinkGithub(userId: string): Promise<User | null> {
-    const result = await this.db.query<UserRow>(
-      `UPDATE users
-       SET github_id = NULL, github_login = NULL, updated_at = NOW()
-       WHERE id = $1
-       RETURNING ${userColumns}`,
-      [userId],
     );
     return result.rows[0] ? mapUser(result.rows[0]) : null;
   }
