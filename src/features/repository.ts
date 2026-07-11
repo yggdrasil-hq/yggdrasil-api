@@ -148,15 +148,31 @@ export class FeatureRepository {
   }
 
   /**
+   * Moves a feature queued -> running on the Orchestrator's synthesized
+   * run_started event (ADR 011), once a feature_build (or spec_grill) job's
+   * pod is confirmed up. Guarded by `WHERE status = 'queued'`, unlike
+   * setInReview/updateStatus below: this is what lets run_started fire
+   * uniformly for both job kinds with no job-kind check anywhere in
+   * syncFeatureState — a spec_grill feature sits in 'draft' when this
+   * event arrives, so the guard makes the call a no-op there.
+   */
+  async setRunning(featureId: string): Promise<Feature | null> {
+    const result = await this.db.query<FeatureRow>(
+      `UPDATE features
+       SET status = 'running', updated_at = NOW()
+       WHERE id = $1 AND status = 'queued'
+       RETURNING ${featureColumns}`,
+      [featureId],
+    );
+    return result.rows[0] ? mapFeature(result.rows[0]) : null;
+  }
+
+  /**
    * Moves a feature to in_review on a successful feature_build run (ADR 010
    * item 9) and persists the opened draft PR's URL. Deliberately no
-   * `WHERE status = ...` guard, unlike approveAdr: nothing in this codebase
-   * yet flips a feature to 'running' when its feature_build job actually
-   * starts (a separate, undecided gap — the job goes straight from
-   * 'queued' to whatever this call sets), and run_failed/run_cancelled's
-   * own updateStatus calls below are equally unguarded — this matches that
-   * existing precedent rather than silently no-op'ing on a status this
-   * feature was never actually moved into.
+   * `WHERE status = ...` guard, unlike approveAdr/setRunning: matches the
+   * existing (pre-ADR-011) precedent of run_failed/run_cancelled's own
+   * updateStatus calls below rather than silently no-op'ing here too.
    */
   async setInReview(featureId: string, prUrl: string): Promise<Feature | null> {
     const result = await this.db.query<FeatureRow>(

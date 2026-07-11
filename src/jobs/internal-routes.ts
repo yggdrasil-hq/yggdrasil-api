@@ -15,6 +15,7 @@ const jobEventSchema = z.object({
     "run_failed",
     "run_cancelled",
     "submit_build_result",
+    "run_started",
   ]),
   question: z.string().optional(),
   markdown: z.string().optional(),
@@ -92,6 +93,11 @@ export function createJobsInternalRouter(deps: {
  * `awaiting_user_input` true in the first place (its implement skill has no
  * ask_user tool, ADR 010), so `submit_build_result` doesn't touch it either
  * way, unlike run_failed/run_cancelled which unconditionally clear it.
+ * `run_started` (ADR 011) is synthesized by the Orchestrator the moment a
+ * job's pod is up, for both job kinds uniformly - `setRunning`'s own
+ * `WHERE status = 'queued'` guard is what makes it a no-op for spec_grill
+ * (whose feature sits in `draft`, not `queued`) without any job-kind check
+ * here.
  *
  * Best-effort: a failure here doesn't undo the 201 already sent for the
  * event itself, since the event was persisted successfully regardless.
@@ -106,13 +112,18 @@ async function syncFeatureState(
     event.type !== "run_failed" &&
     event.type !== "run_cancelled" &&
     event.type !== "submit_adr" &&
-    event.type !== "submit_build_result"
+    event.type !== "submit_build_result" &&
+    event.type !== "run_started"
   ) {
     return;
   }
   try {
     const job = await deps.jobs.findById(jobId);
     if (!job?.featureId) {
+      return;
+    }
+    if (event.type === "run_started") {
+      await deps.features.setRunning(job.featureId);
       return;
     }
     if (event.type === "submit_adr") {

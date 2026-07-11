@@ -54,6 +54,7 @@ function buildApp(deps: {
   setSpecReady?: (featureId: string, adrMarkdown: string) => Promise<null>;
   updateStatus?: (featureId: string, status: string) => Promise<null>;
   setInReview?: (featureId: string, prUrl: string) => Promise<null>;
+  setRunning?: (featureId: string) => Promise<null>;
 }) {
   const create: (input: CreateInput) => Promise<JobEvent> =
     deps.create ?? (async (input) => makeEvent({ jobId: input.jobId, type: input.type }));
@@ -62,6 +63,7 @@ function buildApp(deps: {
   const setSpecReady = deps.setSpecReady ?? (async () => null);
   const updateStatus = deps.updateStatus ?? (async () => null);
   const setInReview = deps.setInReview ?? (async () => null);
+  const setRunning = deps.setRunning ?? (async () => null);
 
   const app = express();
   app.use(express.json());
@@ -70,7 +72,7 @@ function buildApp(deps: {
     createJobsInternalRouter({
       jobEvents: { create } as never,
       jobs: { findById } as never,
-      features: { setAwaitingUserInput, setSpecReady, updateStatus, setInReview } as never,
+      features: { setAwaitingUserInput, setSpecReady, updateStatus, setInReview, setRunning } as never,
     }),
   );
   return app;
@@ -384,6 +386,56 @@ describe("POST /internal/jobs/:jobId/events", () => {
 
     expect(res.status).toBe(201);
     expect(setAwaitingUserInput).not.toHaveBeenCalled();
+  });
+
+  it("moves the feature to running when a run_started event arrives", async () => {
+    const setRunning = vi.fn(async () => null);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42", kind: "feature_build" }),
+      setRunning,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "run_started" });
+
+    expect(res.status).toBe(201);
+    expect(setRunning).toHaveBeenCalledWith("feature_42");
+  });
+
+  it("does not touch awaiting_user_input or updateStatus for run_started events", async () => {
+    const setAwaitingUserInput = vi.fn(async () => null);
+    const updateStatus = vi.fn(async () => null);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42", kind: "feature_build" }),
+      setAwaitingUserInput,
+      updateStatus,
+    });
+
+    await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "run_started" });
+
+    expect(setAwaitingUserInput).not.toHaveBeenCalled();
+    expect(updateStatus).not.toHaveBeenCalled();
+  });
+
+  it("skips setRunning for a run_started event on a job with no feature", async () => {
+    const setRunning = vi.fn(async () => null);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: null, kind: "feature_build" }),
+      setRunning,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "run_started" });
+
+    expect(res.status).toBe(201);
+    expect(setRunning).not.toHaveBeenCalled();
   });
 
   it("still returns 201 if the awaiting_user_input sync itself fails", async () => {
