@@ -107,6 +107,7 @@ describe("GET /internal/projects/:projectId/features/:featureId/spec", () => {
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
       title: "Add dark mode",
+      featureType: "normal",
       repos: [
         { cloneUrl: "https://github.com/acme/web.git", isPrimary: true },
         { cloneUrl: "https://github.com/acme/worker.git", isPrimary: false },
@@ -130,6 +131,21 @@ describe("GET /internal/projects/:projectId/features/:featureId/spec", () => {
 
     expect(res.status).toBe(404);
     expect(mintInstallationAccessToken).not.toHaveBeenCalled();
+  });
+
+  it("returns featureType so the Orchestrator can pick project-init vs feature-grill (ADR 008)", async () => {
+    const app = buildApp({
+      features: {
+        findById: async () => makeFeature({ title: "Project initialization", featureType: "project_init" }),
+      },
+    });
+
+    const res = await request(app)
+      .get(`/internal/projects/${PROJECT_ID}/features/${FEATURE_ID}/spec`)
+      .set("Authorization", "Bearer test-internal-api-token");
+
+    expect(res.status).toBe(200);
+    expect(res.body.featureType).toBe("project_init");
   });
 
   it("returns 404 when the project has no GitHub installation", async () => {

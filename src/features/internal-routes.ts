@@ -10,11 +10,14 @@ import type { FeatureRepository } from "./repository.js";
 
 /**
  * Serves a spec_grill job's payload back to the Orchestrator at claim time
- * (ADR 006 item 5): the feature title and the project's linked repos, plus
- * a fresh job-scoped GitHub installation token. The token is minted here
- * rather than read from `project_secrets` — it's short-lived and per-job
- * (ADR 005 §14), the same as the chart-fetch/chart-scaffold token, not a
- * static project secret like the model config (ADR 004).
+ * (ADR 006 item 5): the feature title, its featureType ("normal" |
+ * "project_init" — ADR 008 item 1, lets buildInitialPrompt pick the right
+ * skill instead of the model inferring it from the title), and the
+ * project's linked repos, plus a fresh job-scoped GitHub installation
+ * token. The token is minted here rather than read from `project_secrets`
+ * — it's short-lived and per-job (ADR 005 §14), the same as the
+ * chart-fetch/chart-scaffold token, not a static project secret like the
+ * model config (ADR 004).
  */
 export function createFeaturesInternalRouter(deps: {
   features: FeatureRepository;
@@ -68,6 +71,7 @@ export function createFeaturesInternalRouter(deps: {
 
         res.json({
           title: feature.title,
+          featureType: feature.featureType,
           repos: project.repositories.map((repo) => ({
             cloneUrl: `https://github.com/${repo.githubOwner}/${repo.githubRepo}.git`,
             isPrimary: repo.isPrimary,
