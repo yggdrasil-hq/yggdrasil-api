@@ -8,13 +8,14 @@ interface JobRow {
   feature_id: string | null;
   test_id: string | null;
   status: JobStatus;
+  last_error: string | null;
   created_at: Date;
   started_at: Date | null;
   completed_at: Date | null;
 }
 
 const jobColumns = `
-  id, project_id, kind, feature_id, test_id, status, created_at, started_at, completed_at
+  id, project_id, kind, feature_id, test_id, status, last_error, created_at, started_at, completed_at
 `;
 
 function mapJob(row: JobRow): Job {
@@ -25,6 +26,7 @@ function mapJob(row: JobRow): Job {
     featureId: row.feature_id,
     testId: row.test_id,
     status: row.status,
+    lastError: row.last_error,
     createdAt: row.created_at,
     startedAt: row.started_at,
     completedAt: row.completed_at,

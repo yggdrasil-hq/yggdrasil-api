@@ -114,6 +114,7 @@ function buildApp(opts: BuildAppOptions) {
     hasBlockingStatuses: vi.fn(async () => false),
     updateStatus: vi.fn(async () => opts.feature ?? null),
     setAwaitingUserInput: vi.fn(async () => opts.feature ?? null),
+    resetForRetry: vi.fn(async () => opts.feature ?? null),
     queueBuild: vi.fn(async () => opts.feature ?? null),
   };
   const jobs = {
@@ -378,6 +379,23 @@ describe("model configuration gate (ADR 007)", () => {
       expect(jobs.create).toHaveBeenCalledWith(
         expect.objectContaining({ projectId: project.id, kind: "spec_grill", featureId: feature.id }),
       );
+    });
+
+    it("resets the feature back to draft so the retried run is visible (ADR 012)", async () => {
+      const project = makeProject();
+      const feature = makeFeature({ featureType: "project_init", status: "failed" });
+      const { app, features } = buildApp({
+        project,
+        feature,
+        userSecrets: { MODEL_BASE_URL: "u", MODEL_API_KEY: "k", MODEL_ID: "m" },
+      });
+
+      const res = await authedRequest(app).post(
+        `/projects/${project.id}/features/${feature.id}/retry-grill`,
+      );
+
+      expect(res.status).toBe(201);
+      expect(features.resetForRetry).toHaveBeenCalledWith(feature.id);
     });
   });
 });

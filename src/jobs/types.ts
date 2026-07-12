@@ -8,6 +8,7 @@ export interface Job {
   featureId: string | null;
   testId: string | null;
   status: JobStatus;
+  lastError: string | null;
   createdAt: Date;
   startedAt: Date | null;
   completedAt: Date | null;

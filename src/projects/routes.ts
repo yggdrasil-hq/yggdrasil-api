@@ -796,7 +796,7 @@ export function createProjectsRouter(deps: {
         return;
       }
 
-      await deps.features.setAwaitingUserInput(featureId, false);
+      await deps.features.resetForRetry(featureId);
       await dispatchJob(deps.jobs, {
         projectId: project.id,
         kind: "spec_grill",
@@ -833,12 +833,12 @@ export function createProjectsRouter(deps: {
 
     const job = await deps.jobs.findLatestSpecGrillJob(featureId);
     if (!job) {
-      res.json({ jobStatus: null, events: [] });
+      res.json({ jobStatus: null, lastError: null, events: [] });
       return;
     }
 
     const events = await deps.jobEvents.listByJob(job.id);
-    res.json({ jobStatus: job.status, events });
+    res.json({ jobStatus: job.status, lastError: job.lastError, events });
   });
 
   router.get("/:projectId/tests", requireAuth, async (req, res) => {

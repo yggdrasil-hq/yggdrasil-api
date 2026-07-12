@@ -185,6 +185,24 @@ export class FeatureRepository {
     return result.rows[0] ? mapFeature(result.rows[0]) : null;
   }
 
+  /**
+   * Re-enters a failed feature back into the `draft` state so a retried
+   * spec_grill job drives the same state machine a first attempt does
+   * (ADR 012). Guarded `WHERE status = 'failed'`, mirroring setRunning's
+   * ADR-011 precedent: safe to call from any context, and no-ops under a
+   * race instead of clobbering a state set by something else in between.
+   */
+  async resetForRetry(featureId: string): Promise<Feature | null> {
+    const result = await this.db.query<FeatureRow>(
+      `UPDATE features
+       SET status = 'draft', awaiting_user_input = FALSE, updated_at = NOW()
+       WHERE id = $1 AND status = 'failed'
+       RETURNING ${featureColumns}`,
+      [featureId],
+    );
+    return result.rows[0] ? mapFeature(result.rows[0]) : null;
+  }
+
   async setAwaitingUserInput(
     featureId: string,
     awaiting: boolean,

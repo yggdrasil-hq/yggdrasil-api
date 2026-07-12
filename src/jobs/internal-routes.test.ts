@@ -29,6 +29,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     featureId: "feature_1",
     testId: null,
     status: "running",
+    lastError: null,
     createdAt: new Date(),
     startedAt: new Date(),
     completedAt: null,
