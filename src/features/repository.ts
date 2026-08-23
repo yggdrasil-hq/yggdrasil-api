@@ -203,6 +203,26 @@ export class FeatureRepository {
     return result.rows[0] ? mapFeature(result.rows[0]) : null;
   }
 
+  /**
+   * Re-queues a failed feature_build for another attempt, keeping the
+   * already-approved ADR intact — unlike resetForRetry (spec_grill's own
+   * retry, which re-enters 'draft' to re-run the interview from scratch),
+   * a build failure doesn't invalidate the ADR that was already approved,
+   * so this goes straight back to 'queued' the same way queueBuild does.
+   * Guarded on `adr_approved = TRUE` so this can't fire for a feature whose
+   * failure was actually during spec_grill (adr never approved).
+   */
+  async retryBuild(featureId: string): Promise<Feature | null> {
+    const result = await this.db.query<FeatureRow>(
+      `UPDATE features
+       SET status = 'queued', updated_at = NOW()
+       WHERE id = $1 AND status = 'failed' AND adr_approved = TRUE
+       RETURNING ${featureColumns}`,
+      [featureId],
+    );
+    return result.rows[0] ? mapFeature(result.rows[0]) : null;
+  }
+
   async setAwaitingUserInput(
     featureId: string,
     awaiting: boolean,

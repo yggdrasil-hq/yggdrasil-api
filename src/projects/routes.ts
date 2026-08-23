@@ -807,11 +807,81 @@ export function createProjectsRouter(deps: {
     },
   );
 
-  // Reads a spec_grill job's curated event history for a feature (ADR 006
-  // item 8's read side) — the Web app polls this to render/refresh the
-  // live grill conversation, since WebSocket relay is still not built.
-  // jobStatus lets the Web app tell an in-progress grill apart from one
-  // that finished, failed, or was cancelled, without a second request.
+  // Re-dispatches a feature_build job for a feature whose build failed,
+  // keeping the already-approved ADR intact (features.retryBuild) instead
+  // of re-running the interview like retry-grill does — the counterpart to
+  // that endpoint for the build phase, not scoped to project_init since any
+  // feature's build can fail. adrApproved is what distinguishes "this
+  // feature failed during build" from "this feature failed during
+  // spec_grill" for a feature sitting in 'failed' either way.
+  router.post(
+    "/:projectId/features/:featureId/retry-build",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      if (!featureId) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      const feature = await deps.features.findById(project.id, featureId);
+      if (!feature) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      if (feature.status !== "failed" || !feature.adrApproved) {
+        res.status(409).json({ error: "Feature is not in a retryable build state" });
+        return;
+      }
+
+      const latestJob = await deps.jobs.findLatestJob(featureId);
+      if (latestJob && (latestJob.status === "pending" || latestJob.status === "running")) {
+        res.status(409).json({ error: "A build is already running for this feature" });
+        return;
+      }
+
+      const accessError = assertGitHubAccess(project);
+      if (accessError) {
+        res.status(409).json({ error: accessError });
+        return;
+      }
+
+      const modelConfigError = await assertModelConfigResolvable(project);
+      if (modelConfigError) {
+        res.status(400).json({ error: modelConfigError });
+        return;
+      }
+
+      const updated = await deps.features.retryBuild(featureId);
+      if (!updated) {
+        res.status(409).json({ error: "Unable to retry build" });
+        return;
+      }
+
+      await dispatchJob(deps.jobs, {
+        projectId: project.id,
+        kind: "feature_build",
+        featureId: updated.id,
+      });
+
+      res.status(201).json({});
+    },
+  );
+
+  // Reads a feature's most recent job's curated event history (ADR 006
+  // item 8's read side, widened to feature_build by ADR 010) — the Web app
+  // polls this to render/refresh the live grill conversation and, once a
+  // build is dispatched, build progress/result, since WebSocket relay is
+  // still not built. jobStatus lets the Web app tell an in-progress run
+  // apart from one that finished, failed, or was cancelled, without a
+  // second request.
   router.get("/:projectId/features/:featureId/events", requireAuth, async (req, res) => {
     const project = await getOwnedProject(req, routeParam(req.params.projectId));
     if (!project) {
@@ -831,7 +901,7 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    const job = await deps.jobs.findLatestSpecGrillJob(featureId);
+    const job = await deps.jobs.findLatestJob(featureId);
     if (!job) {
       res.json({ jobStatus: null, lastError: null, events: [] });
       return;

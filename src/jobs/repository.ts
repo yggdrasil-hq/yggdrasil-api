@@ -133,19 +133,20 @@ export class JobRepository {
   }
 
   /**
-   * Finds a feature's most recent spec_grill job regardless of status —
-   * the read-side counterpart to findActiveSpecGrillJob, used by the
-   * user-facing events endpoint (`GET
-   * /:projectId/features/:featureId/events`) so the Web app can still show
-   * the grill conversation and its outcome after the job has finished,
-   * failed, or been cancelled, not just while it's running.
+   * Finds a feature's most recent job of any kind, regardless of status —
+   * used by the user-facing events endpoint (`GET
+   * /:projectId/features/:featureId/events`) so the Web app can show a
+   * feature's current/most recent run and its outcome, whichever phase
+   * dispatched it (spec_grill's grill conversation, or feature_build's
+   * build progress/result) — not just while it's running. A feature only
+   * ever has one phase active at a time, so "latest job of any kind" always
+   * resolves to whichever phase is (or was most recently) current.
    */
-  async findLatestSpecGrillJob(featureId: string): Promise<Job | null> {
+  async findLatestJob(featureId: string): Promise<Job | null> {
     const result = await this.db.query<JobRow>(
       `SELECT ${jobColumns}
        FROM jobs
        WHERE feature_id = $1
-         AND kind = 'spec_grill'
        ORDER BY created_at DESC
        LIMIT 1`,
       [featureId],
