@@ -51,7 +51,8 @@ export function createApp(deps?: AppDependencies): Express {
   const installations = new GithubInstallationRepository(deps.pool);
   const projects = new ProjectRepository(deps.pool);
   const jobs = new JobRepository(deps.pool);
-  app.use("/webhooks", createGitHubWebhookRouter({ installations, projects, jobs }));
+  const features = new FeatureRepository(deps.pool);
+  app.use("/webhooks", createGitHubWebhookRouter({ installations, projects, jobs, features }));
 
   app.use(express.json());
 
@@ -61,7 +62,6 @@ export function createApp(deps?: AppDependencies): Express {
   const userGithubAccess = new UserGithubAccessRepository(deps.pool);
   const oauthStates = new OAuthStateRepository(deps.pool);
   const installStates = new InstallStateRepository(deps.pool);
-  const features = new FeatureRepository(deps.pool);
   const tests = new TestRepository(deps.pool);
   const notifications = new NotificationRepository(deps.pool);
   const secrets = new SecretRepository(deps.pool);

@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
-import { handlePushEvent } from "./webhook-routes.js";
+import {
+  handlePullRequestEvent,
+  handlePullRequestReviewEvent,
+  handlePushEvent,
+} from "./webhook-routes.js";
 
 function makePayload(overrides: Partial<{ ref: string; owner: string; repo: string }> = {}) {
   return {
@@ -62,5 +66,222 @@ describe("handlePushEvent", () => {
     });
 
     expect(dispatch).not.toHaveBeenCalled();
+  });
+});
+
+function makePrPayload(
+  overrides: Partial<{ action: string; htmlUrl: string; merged: boolean }> = {},
+) {
+  return {
+    action: overrides.action ?? "closed",
+    pull_request: {
+      html_url: overrides.htmlUrl ?? "https://github.com/acme/web/pull/42",
+      merged: overrides.merged ?? true,
+    },
+  };
+}
+
+describe("handlePullRequestEvent", () => {
+  it("marks a normal feature merged when its tracked PR is merged, without touching deploy", async () => {
+    const updateStatus = vi.fn().mockResolvedValue(null);
+    const features = {
+      findByPrUrl: vi.fn().mockResolvedValue({
+        id: "feat_1",
+        projectId: "proj_1",
+        featureType: "normal",
+        status: "in_review",
+      }),
+      updateStatus,
+    };
+    const projects = { findById: vi.fn(), markReady: vi.fn() };
+    const jobs = { create: vi.fn() };
+
+    await handlePullRequestEvent(makePrPayload(), {
+      features: features as never,
+      projects: projects as never,
+      jobs: jobs as never,
+    });
+
+    expect(features.findByPrUrl).toHaveBeenCalledWith("https://github.com/acme/web/pull/42");
+    expect(updateStatus).toHaveBeenCalledWith("feat_1", "merged");
+    expect(projects.findById).not.toHaveBeenCalled();
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("marks the project ready and dispatches its first deploy when a project_init feature's PR merges", async () => {
+    const updateStatus = vi.fn().mockResolvedValue(null);
+    const markReady = vi.fn().mockResolvedValue(undefined);
+    const features = {
+      findByPrUrl: vi.fn().mockResolvedValue({
+        id: "feat_1",
+        projectId: "proj_1",
+        featureType: "project_init",
+        status: "in_review",
+      }),
+      updateStatus,
+    };
+    const projects = {
+      findById: vi.fn().mockResolvedValue({ id: "proj_1", status: "initializing" }),
+      markReady,
+    };
+    const jobs = { create: vi.fn().mockResolvedValue({ id: "job_1" }) };
+
+    await handlePullRequestEvent(makePrPayload(), {
+      features: features as never,
+      projects: projects as never,
+      jobs: jobs as never,
+    });
+
+    expect(updateStatus).toHaveBeenCalledWith("feat_1", "merged");
+    expect(markReady).toHaveBeenCalledWith("proj_1");
+    expect(jobs.create).toHaveBeenCalledWith({ projectId: "proj_1", kind: "deploy" });
+  });
+
+  it("does not dispatch deploy for a project_init merge when the project is already ready", async () => {
+    const updateStatus = vi.fn().mockResolvedValue(null);
+    const markReady = vi.fn();
+    const features = {
+      findByPrUrl: vi.fn().mockResolvedValue({
+        id: "feat_1",
+        projectId: "proj_1",
+        featureType: "project_init",
+        status: "in_review",
+      }),
+      updateStatus,
+    };
+    const projects = {
+      findById: vi.fn().mockResolvedValue({ id: "proj_1", status: "ready" }),
+      markReady,
+    };
+    const jobs = { create: vi.fn() };
+
+    await handlePullRequestEvent(makePrPayload(), {
+      features: features as never,
+      projects: projects as never,
+      jobs: jobs as never,
+    });
+
+    expect(markReady).not.toHaveBeenCalled();
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("ignores a PR closed without merging", async () => {
+    const updateStatus = vi.fn();
+    const features = { findByPrUrl: vi.fn(), updateStatus };
+    const projects = { findById: vi.fn(), markReady: vi.fn() };
+    const jobs = { create: vi.fn() };
+
+    await handlePullRequestEvent(makePrPayload({ merged: false }), {
+      features: features as never,
+      projects: projects as never,
+      jobs: jobs as never,
+    });
+
+    expect(features.findByPrUrl).not.toHaveBeenCalled();
+    expect(updateStatus).not.toHaveBeenCalled();
+  });
+
+  it("ignores actions other than closed", async () => {
+    const updateStatus = vi.fn();
+    const features = { findByPrUrl: vi.fn(), updateStatus };
+    const projects = { findById: vi.fn(), markReady: vi.fn() };
+    const jobs = { create: vi.fn() };
+
+    await handlePullRequestEvent(makePrPayload({ action: "opened" }), {
+      features: features as never,
+      projects: projects as never,
+      jobs: jobs as never,
+    });
+
+    expect(features.findByPrUrl).not.toHaveBeenCalled();
+  });
+
+  it("ignores a merge for a PR that doesn't match any tracked feature", async () => {
+    const updateStatus = vi.fn();
+    const features = { findByPrUrl: vi.fn().mockResolvedValue(null), updateStatus };
+    const projects = { findById: vi.fn(), markReady: vi.fn() };
+    const jobs = { create: vi.fn() };
+
+    await handlePullRequestEvent(makePrPayload(), {
+      features: features as never,
+      projects: projects as never,
+      jobs: jobs as never,
+    });
+
+    expect(updateStatus).not.toHaveBeenCalled();
+  });
+
+  it("is idempotent for a feature already marked merged", async () => {
+    const updateStatus = vi.fn();
+    const features = {
+      findByPrUrl: vi.fn().mockResolvedValue({
+        id: "feat_1",
+        projectId: "proj_1",
+        featureType: "normal",
+        status: "merged",
+      }),
+      updateStatus,
+    };
+    const projects = { findById: vi.fn(), markReady: vi.fn() };
+    const jobs = { create: vi.fn() };
+
+    await handlePullRequestEvent(makePrPayload(), {
+      features: features as never,
+      projects: projects as never,
+      jobs: jobs as never,
+    });
+
+    expect(updateStatus).not.toHaveBeenCalled();
+  });
+});
+
+function makeReviewPayload(
+  overrides: Partial<{ action: string; state: string; htmlUrl: string }> = {},
+) {
+  return {
+    action: overrides.action ?? "submitted",
+    review: { state: overrides.state ?? "changes_requested" },
+    pull_request: { html_url: overrides.htmlUrl ?? "https://github.com/acme/web/pull/42" },
+  };
+}
+
+describe("handlePullRequestReviewEvent", () => {
+  it("moves an in_review feature to changes_requested", async () => {
+    const updateStatus = vi.fn().mockResolvedValue(null);
+    const features = {
+      findByPrUrl: vi.fn().mockResolvedValue({ id: "feat_1", status: "in_review" }),
+      updateStatus,
+    };
+
+    await handlePullRequestReviewEvent(makeReviewPayload(), { features: features as never });
+
+    expect(updateStatus).toHaveBeenCalledWith("feat_1", "changes_requested");
+  });
+
+  it("ignores review states other than changes_requested", async () => {
+    const updateStatus = vi.fn();
+    const features = {
+      findByPrUrl: vi.fn().mockResolvedValue({ id: "feat_1", status: "in_review" }),
+      updateStatus,
+    };
+
+    await handlePullRequestReviewEvent(makeReviewPayload({ state: "approved" }), {
+      features: features as never,
+    });
+
+    expect(features.findByPrUrl).not.toHaveBeenCalled();
+    expect(updateStatus).not.toHaveBeenCalled();
+  });
+
+  it("does not clobber a feature that has already moved past in_review", async () => {
+    const updateStatus = vi.fn();
+    const features = {
+      findByPrUrl: vi.fn().mockResolvedValue({ id: "feat_1", status: "merged" }),
+      updateStatus,
+    };
+
+    await handlePullRequestReviewEvent(makeReviewPayload(), { features: features as never });
+
+    expect(updateStatus).not.toHaveBeenCalled();
   });
 });

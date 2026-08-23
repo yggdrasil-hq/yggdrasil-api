@@ -65,6 +65,24 @@ export class FeatureRepository {
     return result.rows[0] ? mapFeature(result.rows[0]) : null;
   }
 
+  /**
+   * Looks up a feature by its stored PR URL, globally (not scoped to a
+   * project) — GitHub PR URLs are unique, and this is what lets the PR
+   * webhook handler (`github/webhook-routes.ts`) match an incoming
+   * `pull_request`/`pull_request_review` event back to the feature it
+   * belongs to without the webhook payload carrying a feature id.
+   */
+  async findByPrUrl(prUrl: string): Promise<Feature | null> {
+    const result = await this.db.query<FeatureRow>(
+      `SELECT ${featureColumns}
+       FROM features
+       WHERE pr_url = $1
+       LIMIT 1`,
+      [prUrl],
+    );
+    return result.rows[0] ? mapFeature(result.rows[0]) : null;
+  }
+
   async findProjectInit(projectId: string): Promise<Feature | null> {
     const result = await this.db.query<FeatureRow>(
       `SELECT ${featureColumns}

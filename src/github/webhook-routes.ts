@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { Router, type Request } from "express";
 import express from "express";
 import { config, isGitHubAppConfigured } from "../config.js";
+import type { FeatureRepository } from "../features/repository.js";
 import { dispatchJob } from "../jobs/dispatch.js";
 import type { JobRepository } from "../jobs/repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
@@ -46,6 +47,24 @@ interface PushWebhookPayload {
   };
 }
 
+interface PullRequestWebhookPayload {
+  action: string;
+  pull_request: {
+    html_url: string;
+    merged: boolean;
+  };
+}
+
+interface PullRequestReviewWebhookPayload {
+  action: string;
+  review: {
+    state: string;
+  };
+  pull_request: {
+    html_url: string;
+  };
+}
+
 const MAIN_BRANCH_REF = "refs/heads/main";
 
 /**
@@ -68,10 +87,72 @@ export async function handlePushEvent(
   }
 }
 
+/**
+ * Advances a feature to `merged` when its tracked draft PR is merged on
+ * GitHub (ADR 013), closing the gap ADR 005 §19 explicitly deferred
+ * ("feature lifecycle advances manually in Yggdrasil"). Matched by PR URL
+ * (`FeatureRepository.findByPrUrl`) since the payload carries no feature
+ * id. A `closed` action with `merged: false` (PR closed without merging)
+ * is left alone — that doesn't necessarily mean the feature was abandoned,
+ * and there's no lifecycle state for it yet.
+ */
+export async function handlePullRequestEvent(
+  payload: PullRequestWebhookPayload,
+  deps: { features: FeatureRepository; projects: ProjectRepository; jobs: JobRepository },
+): Promise<void> {
+  if (payload.action !== "closed" || !payload.pull_request.merged) {
+    return;
+  }
+  const feature = await deps.features.findByPrUrl(payload.pull_request.html_url);
+  if (!feature || feature.status === "merged") {
+    return;
+  }
+  await deps.features.updateStatus(feature.id, "merged");
+
+  // Mirrors POST /:projectId/complete-init (routes.ts) — a project_init
+  // feature merging is what completes project setup, and until now that
+  // only ever happened via the manual "complete-init" button.
+  if (feature.featureType === "project_init") {
+    const project = await deps.projects.findById(feature.projectId);
+    if (project && project.status === "initializing") {
+      await deps.projects.markReady(project.id);
+      // Deliberately dispatched here, not left to the sibling `push`
+      // webhook for this same merge commit: that handler only dispatches
+      // `deploy` when `project.status === "ready"` already, and delivery
+      // order between the two webhooks isn't guaranteed — if `push`
+      // happens to be processed first, it would silently no-op (GitHub
+      // doesn't redeliver), and the project's always-on deployment would
+      // never get its first `deploy` job at all (ADR 013 addendum).
+      await dispatchJob(deps.jobs, { projectId: project.id, kind: "deploy" });
+    }
+  }
+}
+
+/**
+ * Moves a feature `in_review -> changes_requested` when a reviewer
+ * requests changes on its tracked PR (ADR 013). Only fires from
+ * `in_review`: a stale/duplicate review event shouldn't clobber a status
+ * that has already moved on (e.g. `merged`, `queued` from a re-run).
+ */
+export async function handlePullRequestReviewEvent(
+  payload: PullRequestReviewWebhookPayload,
+  deps: { features: FeatureRepository },
+): Promise<void> {
+  if (payload.action !== "submitted" || payload.review.state !== "changes_requested") {
+    return;
+  }
+  const feature = await deps.features.findByPrUrl(payload.pull_request.html_url);
+  if (!feature || feature.status !== "in_review") {
+    return;
+  }
+  await deps.features.updateStatus(feature.id, "changes_requested");
+}
+
 export function createGitHubWebhookRouter(deps: {
   installations: GithubInstallationRepository;
   projects: ProjectRepository;
   jobs: JobRepository;
+  features: FeatureRepository;
 }): Router {
   const router = Router();
 
@@ -121,6 +202,17 @@ export function createGitHubWebhookRouter(deps: {
 
         if (event === "push") {
           await handlePushEvent(data as unknown as PushWebhookPayload, deps);
+        }
+
+        if (event === "pull_request") {
+          await handlePullRequestEvent(data as unknown as PullRequestWebhookPayload, deps);
+        }
+
+        if (event === "pull_request_review") {
+          await handlePullRequestReviewEvent(
+            data as unknown as PullRequestReviewWebhookPayload,
+            deps,
+          );
         }
 
         if (event === "installation_repositories") {

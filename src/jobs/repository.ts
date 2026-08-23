@@ -133,6 +133,26 @@ export class JobRepository {
   }
 
   /**
+   * Finds a project's most recent job of a given kind, regardless of
+   * status — the project-level counterpart to `findLatestJob` (which is
+   * feature-scoped). Used for `deploy` jobs specifically: they carry no
+   * `feature_id` (they're triggered by a push to `main` or a project
+   * going `ready`, not tied to any one feature), so this is the only way
+   * to answer "what's this project's current/most recent deploy status."
+   */
+  async findLatestByProjectAndKind(projectId: string, kind: JobKind): Promise<Job | null> {
+    const result = await this.db.query<JobRow>(
+      `SELECT ${jobColumns}
+       FROM jobs
+       WHERE project_id = $1 AND kind = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [projectId, kind],
+    );
+    return result.rows[0] ? mapJob(result.rows[0]) : null;
+  }
+
+  /**
    * Finds a feature's most recent job of any kind, regardless of status —
    * used by the user-facing events endpoint (`GET
    * /:projectId/features/:featureId/events`) so the Web app can show a

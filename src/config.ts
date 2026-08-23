@@ -14,6 +14,20 @@ export const config = {
   cookieName: "yggdrasil_session",
   appPublicUrl: process.env.APP_PUBLIC_URL ?? "http://localhost:8080/app",
   apiPublicUrl: process.env.API_PUBLIC_URL ?? "http://localhost:8080/api",
+  // Must match the Orchestrator's own APPS_BASE_DOMAIN (orchestrator/cmd/server/main.go)
+  // — both sides independently derive the same <project-slug>.apps.<domain>
+  // primary-deployment URL (ADR 003 §15, docs/conventions/deploy.md): the
+  // Orchestrator to build the real k8s Ingress host, the API to hand the
+  // Web app a link to it. Not sourced from the Orchestrator to avoid a
+  // runtime dependency between two otherwise-decoupled services.
+  appsBaseDomain: process.env.APPS_BASE_DOMAIN ?? "yggdrasil.local",
+  // Set only for local dev, where the bundled k3s cluster's ingress is
+  // published on a non-standard host port (deploy/docker-compose.dev.yml's
+  // DEV_APPS_HTTPS_PORT, default 8443) instead of the real 443 a
+  // self-hosted/managed install's ingress/LB would own. Empty in
+  // prod-shaped envs, so the deploy link is a normal port-less https:// URL
+  // there.
+  appsHttpsPort: process.env.APPS_HTTPS_PORT ?? "",
   github: {
     clientId: process.env.GITHUB_CLIENT_ID ?? "",
     clientSecret: process.env.GITHUB_CLIENT_SECRET ?? "",

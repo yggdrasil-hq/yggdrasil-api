@@ -84,6 +84,7 @@ interface BuildAppOptions {
   projectSecrets?: Record<string, string>;
   userSecrets?: Record<string, string>;
   activeSpecGrillJob?: unknown;
+  latestDeployJob?: unknown;
 }
 
 function buildApp(opts: BuildAppOptions) {
@@ -106,6 +107,7 @@ function buildApp(opts: BuildAppOptions) {
       id === opts.project.id && userId === OWNER_ID ? opts.project : null,
     ),
     create: vi.fn(async () => opts.project),
+    markReady: vi.fn(async () => undefined),
   };
   const features = {
     findById: vi.fn(async () => opts.feature ?? null),
@@ -121,6 +123,7 @@ function buildApp(opts: BuildAppOptions) {
     create: vi.fn(async () => ({ id: "job_1" })),
     hasActiveTestRunsForProject: vi.fn(async () => false),
     findActiveSpecGrillJob: vi.fn(async () => opts.activeSpecGrillJob ?? null),
+    findLatestByProjectAndKind: vi.fn(async () => opts.latestDeployJob ?? null),
   };
   const notifications = { create: vi.fn(async () => undefined) };
   const installations = {
@@ -153,6 +156,7 @@ const SESSION_COOKIE = "yggdrasil_session=sess_1";
 
 function authedRequest(app: express.Express) {
   return {
+    get: (url: string) => request(app).get(url).set("Cookie", SESSION_COOKIE),
     post: (url: string) => request(app).post(url).set("Cookie", SESSION_COOKIE),
     patch: (url: string) => request(app).patch(url).set("Cookie", SESSION_COOKIE),
   };
@@ -397,5 +401,102 @@ describe("model configuration gate (ADR 007)", () => {
       expect(res.status).toBe(201);
       expect(features.resetForRetry).toHaveBeenCalledWith(feature.id);
     });
+  });
+});
+
+describe("POST /:projectId/complete-init (ADR 013 addendum)", () => {
+  it("dispatches the project's first deploy job alongside marking it ready", async () => {
+    const project = makeProject({ status: "initializing" });
+    const feature = makeFeature({ featureType: "project_init", status: "in_review" });
+    const { app, projects, jobs } = buildApp({ project, feature });
+
+    const res = await authedRequest(app).post(`/projects/${project.id}/complete-init`);
+
+    expect(res.status).toBe(200);
+    expect(projects.markReady).toHaveBeenCalledWith(project.id);
+    expect(jobs.create).toHaveBeenCalledWith({ projectId: project.id, kind: "deploy" });
+  });
+
+  it("409s and dispatches nothing when the project is already ready", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, projects, jobs } = buildApp({ project });
+
+    const res = await authedRequest(app).post(`/projects/${project.id}/complete-init`);
+
+    expect(res.status).toBe(409);
+    expect(projects.markReady).not.toHaveBeenCalled();
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET /:projectId/deploy", () => {
+  it("returns null fields when the project has never had a deploy job", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app } = buildApp({ project, latestDeployJob: null });
+
+    const res = await authedRequest(app).get(`/projects/${project.id}/deploy`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      status: null,
+      lastError: null,
+      startedAt: null,
+      completedAt: null,
+      url: `https://${project.slug}.apps.yggdrasil.local`,
+    });
+  });
+
+  it("reflects the latest deploy job's status and error", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app } = buildApp({
+      project,
+      latestDeployJob: {
+        status: "failed",
+        lastError: "helm upgrade failed: timed out waiting for condition",
+        startedAt: new Date("2026-08-23T10:00:00Z"),
+        completedAt: new Date("2026-08-23T10:05:00Z"),
+      },
+    });
+
+    const res = await authedRequest(app).get(`/projects/${project.id}/deploy`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("failed");
+    expect(res.body.lastError).toMatch(/helm upgrade failed/);
+  });
+});
+
+describe("POST /:projectId/deploy", () => {
+  it("dispatches a deploy job for a ready project with no deploy in flight", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs } = buildApp({ project, latestDeployJob: null });
+
+    const res = await authedRequest(app).post(`/projects/${project.id}/deploy`);
+
+    expect(res.status).toBe(201);
+    expect(jobs.create).toHaveBeenCalledWith({ projectId: project.id, kind: "deploy" });
+  });
+
+  it("409s when the project isn't ready yet", async () => {
+    const project = makeProject({ status: "initializing" });
+    const { app, jobs } = buildApp({ project });
+
+    const res = await authedRequest(app).post(`/projects/${project.id}/deploy`);
+
+    expect(res.status).toBe(409);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("409s when a deploy is already pending or running", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs } = buildApp({
+      project,
+      latestDeployJob: { status: "running" },
+    });
+
+    const res = await authedRequest(app).post(`/projects/${project.id}/deploy`);
+
+    expect(res.status).toBe(409);
+    expect(jobs.create).not.toHaveBeenCalled();
   });
 });

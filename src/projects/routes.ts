@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
+import { config } from "../config.js";
 import { createAuthMiddleware } from "../auth/middleware.js";
 import type { SessionService } from "../auth/sessions.js";
 import { dispatchJob } from "../jobs/dispatch.js";
@@ -76,6 +77,18 @@ function toModelConfigBundle(input: z.infer<typeof modelConfigBundleSchema>): Mo
     MODEL_API_KEY: input.modelApiKey,
     MODEL_ID: input.modelId,
   };
+}
+
+/**
+ * A project's always-on primary deployment URL (ADR 003 §15's
+ * `<project-slug>.apps.<domain>` scheme). `config.appsHttpsPort` is only
+ * ever set in local dev, where the bundled k3s cluster's ingress is
+ * published on a non-standard host port instead of real 443 — see
+ * `docs/conventions/deploy.md`.
+ */
+function buildDeployUrl(slug: string): string {
+  const port = config.appsHttpsPort ? `:${config.appsHttpsPort}` : "";
+  return `https://${slug}.apps.${config.appsBaseDomain}${port}`;
 }
 
 const createFeatureSchema = z.object({
@@ -452,6 +465,12 @@ export function createProjectsRouter(deps: {
     }
 
     await deps.projects.markReady(project.id);
+    // A project going 'ready' is exactly the moment its always-on primary
+    // deployment (ADR 003 §9, `deploy` job) should first exist — without
+    // this, nothing ever deploys `main` until some *later* push happens to
+    // land on an already-`ready` project (see ADR 013 addendum: the
+    // pull_request-webhook path has the identical gap and fix).
+    await dispatchJob(deps.jobs, { projectId: project.id, kind: "deploy" });
 
     const updated = await deps.projects.findByIdForUser(project.id, req.currentUser!.id);
     if (!updated) {
@@ -460,6 +479,64 @@ export function createProjectsRouter(deps: {
     }
 
     res.json(await toPublicProjectWithRemovalMeta(updated));
+  });
+
+  // Reads the project's most recent `deploy` job (ADR 013 addendum) so the
+  // Web app can show whether the always-on primary deployment is up to
+  // date, still rolling out, or last failed — there was previously no
+  // frontend feedback for this at all. `deploy` jobs carry no curated
+  // event stream (unlike spec_grill/feature_build): the Orchestrator runs
+  // `runDeploy` synchronously in-process and reports only pending →
+  // running → completed/failed + last_error, so job status/lastError is
+  // the whole picture here, no `events` array needed.
+  router.get("/:projectId/deploy", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const job = await deps.jobs.findLatestByProjectAndKind(project.id, "deploy");
+    res.json({
+      status: job?.status ?? null,
+      lastError: job?.lastError ?? null,
+      startedAt: job?.startedAt ?? null,
+      completedAt: job?.completedAt ?? null,
+      // Deterministic from the project slug (ADR 003 §15,
+      // docs/conventions/deploy.md's URL scheme) — always present
+      // regardless of job status; the Web app only links to it once
+      // `status === "completed"` confirms something is actually running.
+      url: buildDeployUrl(project.slug),
+    });
+  });
+
+  // Manually (re)dispatches a `deploy` job — the "Deploy now" action for a
+  // project that's already `ready` but needs an out-of-band redeploy
+  // (rotated secrets, a chart change with no code change, or recovering a
+  // project whose guaranteed first deploy predates this endpoint). Guarded
+  // the same way retry-build guards against a duplicate build: no-op if a
+  // deploy is already pending/running rather than piling up a second one.
+  router.post("/:projectId/deploy", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    if (project.status !== "ready") {
+      res.status(409).json({ error: "Project is not ready to deploy yet" });
+      return;
+    }
+
+    const latestJob = await deps.jobs.findLatestByProjectAndKind(project.id, "deploy");
+    if (latestJob && (latestJob.status === "pending" || latestJob.status === "running")) {
+      res.status(409).json({ error: "A deploy is already in progress for this project" });
+      return;
+    }
+
+    await dispatchJob(deps.jobs, { projectId: project.id, kind: "deploy" });
+
+    res.status(201).json({});
   });
 
   router.get("/:projectId/overview", requireAuth, async (req, res) => {
