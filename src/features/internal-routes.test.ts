@@ -182,6 +182,7 @@ describe("GET /internal/projects/:projectId/features/:featureId/spec", () => {
     expect(mintInstallationAccessToken).toHaveBeenCalledWith(42, expect.any(String), expect.any(String), {
       contents: "write",
       pull_requests: "write",
+      workflows: "write",
     });
   });
 

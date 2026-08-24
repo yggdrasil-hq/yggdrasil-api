@@ -73,12 +73,18 @@ export function createFeaturesInternalRouter(deps: {
         // solely on the skill's own instructions and tool allowlist.
         // feature_build is the opposite case: it's expected to commit and
         // open a draft PR (job-dispatch.md), so it needs a write-capable
-        // token instead (ADR 010 item 1).
+        // token instead (ADR 010 item 1). `workflows: write` is required in
+        // addition to `contents: write`: GitHub enforces Workflows as a
+        // separate permission for any create/update under
+        // `.github/workflows/`, even with Contents write access — omitting
+        // it makes GitHub reject the push server-side (ADR 005 §3 amendment).
         const { token } = await mintInstallationAccessToken(
           installation.githubInstallationId,
           config.github.appId,
           config.github.appPrivateKey,
-          isFeatureBuild ? { contents: "write", pull_requests: "write" } : { contents: "read" },
+          isFeatureBuild
+            ? { contents: "write", pull_requests: "write", workflows: "write" }
+            : { contents: "read" },
         );
 
         res.json({

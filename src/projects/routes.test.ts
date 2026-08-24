@@ -321,10 +321,10 @@ describe("model configuration gate (ADR 007)", () => {
   });
 
   describe("POST .../features/:featureId/retry-grill", () => {
-    it("409s for a non-project_init feature", async () => {
+    it("re-dispatches spec_grill for a normal feature too (ADR 012 follow-up)", async () => {
       const project = makeProject();
-      const feature = makeFeature({ featureType: "normal", status: "draft" });
-      const { app } = buildApp({
+      const feature = makeFeature({ featureType: "normal", status: "failed" });
+      const { app, jobs } = buildApp({
         project,
         feature,
         userSecrets: { MODEL_BASE_URL: "u", MODEL_API_KEY: "k", MODEL_ID: "m" },
@@ -334,7 +334,10 @@ describe("model configuration gate (ADR 007)", () => {
         `/projects/${project.id}/features/${feature.id}/retry-grill`,
       );
 
-      expect(res.status).toBe(409);
+      expect(res.status).toBe(201);
+      expect(jobs.create).toHaveBeenCalledWith(
+        expect.objectContaining({ projectId: project.id, kind: "spec_grill", featureId: feature.id }),
+      );
     });
 
     it("409s when a grill session is already active", async () => {

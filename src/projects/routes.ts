@@ -825,10 +825,12 @@ export function createProjectsRouter(deps: {
     res.status(200).json({});
   });
 
-  // Recovers a project stuck in `initializing` whose project_init spec_grill
-  // never had a resolvable model config to run against (ADR 007). Scoped to
-  // project_init only — general re-grilling of normal features is a
-  // separate, still-open question (ADR 002 follow-ups).
+  // Re-runs a failed feature's spec_grill session (originally added to
+  // recover a project stuck in `initializing` whose project_init spec_grill
+  // never had a resolvable model config to run against, ADR 007; widened to
+  // any feature type per ADR 012's "generalize retry" follow-up —
+  // resetForRetry and dispatchJob were already feature-type-agnostic, only
+  // this guard was project_init-only).
   router.post(
     "/:projectId/features/:featureId/retry-grill",
     requireAuth,
@@ -848,11 +850,6 @@ export function createProjectsRouter(deps: {
       const feature = await deps.features.findById(project.id, featureId);
       if (!feature) {
         res.status(404).json({ error: "Feature not found" });
-        return;
-      }
-
-      if (feature.featureType !== "project_init") {
-        res.status(409).json({ error: "Retry is only available for project initialization" });
         return;
       }
 

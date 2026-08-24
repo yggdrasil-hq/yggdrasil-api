@@ -306,12 +306,15 @@ export async function refreshUserOAuthToken(
 /**
  * `permissions`, when passed, requests a token scoped to strictly less than
  * the GitHub App's own installation permissions (Contents read/write, Pull
- * requests read/write, Metadata read — ADR 005 §7) — e.g. `{ contents:
- * "read" }` for a job kind that must never be able to push, regardless of
- * what tools happen to be reachable inside its container. Omitted entirely
- * (not just empty), the GitHub API mints a token with every permission the
- * installation has, matching every caller's behavior before this param
- * existed.
+ * requests read/write, Workflows read/write, Metadata read — ADR 005 §3) —
+ * e.g. `{ contents: "read" }` for a job kind that must never be able to
+ * push, regardless of what tools happen to be reachable inside its
+ * container. Omitted entirely (not just empty), the GitHub API mints a
+ * token with every permission the installation has, matching every
+ * caller's behavior before this param existed. Requesting a permission the
+ * installation itself doesn't have (e.g. `workflows` before the App
+ * registration was upgraded) fails the mint call — the App's own
+ * permissions are a hard ceiling, not just this param's default.
  */
 export async function mintInstallationAccessToken(
   installationId: number,
