@@ -55,9 +55,20 @@ interface MemberRow {
   role: OrgRole;
 }
 
-const organizationColumns = `
-  id, name, slug, description, is_personal, status, created_at, updated_at
-`;
+const organizationColumnNames = [
+  "id",
+  "name",
+  "slug",
+  "description",
+  "is_personal",
+  "status",
+  "created_at",
+  "updated_at",
+];
+
+function organizationColumns(alias?: string): string {
+  return organizationColumnNames.map((c) => (alias ? `${alias}.${c}` : c)).join(", ");
+}
 
 const membershipColumns = `
   id, organization_id, user_id, role, created_at, updated_at
@@ -103,7 +114,7 @@ export class OrganizationRepository {
 
   async findById(organizationId: string): Promise<Organization | null> {
     const result = await this.db.query<OrganizationRow>(
-      `SELECT ${organizationColumns} FROM organizations WHERE id = $1`,
+      `SELECT ${organizationColumns()} FROM organizations WHERE id = $1`,
       [organizationId],
     );
     return result.rows[0] ? mapOrganization(result.rows[0]) : null;
@@ -111,7 +122,7 @@ export class OrganizationRepository {
 
   async findBySlug(slug: string): Promise<Organization | null> {
     const result = await this.db.query<OrganizationRow>(
-      `SELECT ${organizationColumns} FROM organizations WHERE slug = $1`,
+      `SELECT ${organizationColumns()} FROM organizations WHERE slug = $1`,
       [slug],
     );
     return result.rows[0] ? mapOrganization(result.rows[0]) : null;
@@ -119,7 +130,7 @@ export class OrganizationRepository {
 
   async findPersonalByUser(userId: string): Promise<Organization | null> {
     const result = await this.db.query<OrganizationRow>(
-      `SELECT o.${organizationColumns}
+      `SELECT ${organizationColumns("o")}
        FROM organizations o
        JOIN organization_memberships m ON m.organization_id = o.id
        WHERE m.user_id = $1 AND o.is_personal = TRUE
@@ -131,7 +142,7 @@ export class OrganizationRepository {
 
   async listForUser(userId: string): Promise<Organization[]> {
     const result = await this.db.query<OrganizationRow>(
-      `SELECT o.${organizationColumns}
+      `SELECT ${organizationColumns("o")}
        FROM organizations o
        JOIN organization_memberships m ON m.organization_id = o.id
        WHERE m.user_id = $1
@@ -171,7 +182,7 @@ export class OrganizationRepository {
       const orgResult = await client.query<OrganizationRow>(
         `INSERT INTO organizations (name, slug, description, is_personal)
          VALUES ($1, $2, $3, $4)
-         RETURNING ${organizationColumns}`,
+         RETURNING ${organizationColumns()}`,
         [input.name, slug, input.description, input.isPersonal],
       );
       const org = mapOrganization(orgResult.rows[0]);
@@ -202,7 +213,7 @@ export class OrganizationRepository {
            description = COALESCE($3, description),
            updated_at = NOW()
        WHERE id = $1
-       RETURNING ${organizationColumns}`,
+       RETURNING ${organizationColumns()}`,
       [organizationId, input.name ?? null, input.description ?? null],
     );
     return result.rows[0] ? mapOrganization(result.rows[0]) : null;
@@ -216,7 +227,7 @@ export class OrganizationRepository {
       `UPDATE organizations
        SET status = $2, updated_at = NOW()
        WHERE id = $1
-       RETURNING ${organizationColumns}`,
+       RETURNING ${organizationColumns()}`,
       [organizationId, status],
     );
     return result.rows[0] ? mapOrganization(result.rows[0]) : null;

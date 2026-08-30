@@ -29,11 +29,27 @@ interface RepositoryRow {
   sort_order: number;
 }
 
-const projectColumns = `
-  id, organization_id, owner_user_id, name, slug, description, status, settings,
-  installation_id, github_access_warning, model_config_warning,
-  agentic_review_enabled, has_design_surface, created_at, updated_at
-`;
+const projectColumnNames = [
+  "id",
+  "organization_id",
+  "owner_user_id",
+  "name",
+  "slug",
+  "description",
+  "status",
+  "settings",
+  "installation_id",
+  "github_access_warning",
+  "model_config_warning",
+  "agentic_review_enabled",
+  "has_design_surface",
+  "created_at",
+  "updated_at",
+];
+
+function projectColumns(alias?: string): string {
+  return projectColumnNames.map((c) => (alias ? `${alias}.${c}` : c)).join(", ");
+}
 
 function mapRepository(row: RepositoryRow): ProjectRepositoryRecord {
   return {
@@ -83,7 +99,7 @@ export class ProjectRepository {
   /** No owner scoping — internal (non-session) callers only, e.g. the Orchestrator's chart fetch. */
   async findById(projectId: string): Promise<Project | null> {
     const result = await this.db.query<ProjectRow>(
-      `SELECT ${projectColumns}
+      `SELECT ${projectColumns()}
        FROM projects
        WHERE id = $1`,
       [projectId],
@@ -112,7 +128,7 @@ export class ProjectRepository {
    */
   async findByIdForUser(projectId: string, userId: string): Promise<Project | null> {
     const result = await this.db.query<ProjectRow>(
-      `SELECT p.${projectColumns}
+      `SELECT ${projectColumns("p")}
        FROM projects p
        JOIN organization_memberships m ON m.organization_id = p.organization_id
        WHERE p.id = $1 AND m.user_id = $2`,
@@ -129,7 +145,7 @@ export class ProjectRepository {
   /** Lists every project across all orgs the user belongs to (org-scoped, ADR 016). */
   async listForUser(userId: string): Promise<Project[]> {
     const result = await this.db.query<ProjectRow>(
-      `SELECT DISTINCT p.${projectColumns}
+      `SELECT DISTINCT ${projectColumns("p")}
        FROM projects p
        JOIN organization_memberships m ON m.organization_id = p.organization_id
        WHERE m.user_id = $1
@@ -148,7 +164,7 @@ export class ProjectRepository {
   /** Lists projects owned by a single org (used to gate project creation on org readiness). */
   async listForOrganization(organizationId: string): Promise<Project[]> {
     const result = await this.db.query<ProjectRow>(
-      `SELECT ${projectColumns}
+      `SELECT ${projectColumns()}
        FROM projects
        WHERE organization_id = $1
        ORDER BY updated_at DESC`,
@@ -191,7 +207,7 @@ export class ProjectRepository {
       const projectResult = await client.query<ProjectRow>(
         `INSERT INTO projects (organization_id, owner_user_id, name, slug, description, status, installation_id)
          VALUES ($1, $2, $3, $4, $5, 'initializing', $6)
-         RETURNING ${projectColumns}`,
+         RETURNING ${projectColumns()}`,
         [
           input.organizationId,
           input.ownerUserId,
