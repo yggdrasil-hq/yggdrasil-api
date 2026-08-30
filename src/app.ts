@@ -6,6 +6,7 @@ import { SessionService } from "./auth/sessions.js";
 import { FeatureRepository } from "./features/repository.js";
 import { FeatureActionItemRepository } from "./features/action-items-repository.js";
 import { createFeaturesInternalRouter } from "./features/internal-routes.js";
+import { createDesignsInternalRouter } from "./designs/internal-routes.js";
 import { createGitHubRouter } from "./github/routes.js";
 import { createGitHubAppRouter } from "./github/install-routes.js";
 import { GithubInstallationRepository } from "./github/installation-repository.js";
@@ -49,7 +50,7 @@ export function createApp(deps?: AppDependencies): Express {
   });
 
   if (!deps?.pool) {
-    app.use(express.json());
+    app.use(express.json({ limit: "2mb" }));
     return app;
   }
 
@@ -69,7 +70,7 @@ export function createApp(deps?: AppDependencies): Express {
     }),
   );
 
-  app.use(express.json());
+  app.use(express.json({ limit: "2mb" }));
 
   const users = new UserRepository(deps.pool);
   const sessions = new SessionService(deps.pool);
@@ -137,6 +138,10 @@ export function createApp(deps?: AppDependencies): Express {
     createSecretsRouter({ users, sessions, projects, secrets, orgSecrets }),
   );
   app.use("/internal", createSecretsInternalRouter({ secrets, orgSecrets, projects }));
+  app.use(
+    "/internal",
+    createDesignsInternalRouter({ jobs, projects, installations }),
+  );
   app.use(
     "/internal",
     createOrganizationsInternalRouter({ projects, clusters: orgClusters }),

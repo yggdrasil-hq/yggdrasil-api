@@ -29,6 +29,7 @@ import { toPublicProject } from "./types.js";
 import type { Project } from "./types.js";
 import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
+import { slugify } from "../shared/slug.js";
 import type { GithubInstallationRepository } from "../github/installation-repository.js";
 import { MODEL_CONFIG_KEYS, resolveModelConfig } from "../secrets/model-config.js";
 import type { ModelConfigBundle } from "../secrets/model-config.js";
@@ -112,6 +113,12 @@ const updateFeatureSchema = z.object({
 
 const createFeatureMessageSchema = z.object({
   content: z.string().trim().min(1).max(8000),
+});
+
+const createDesignSchema = z.object({
+  name: z.string().trim().min(1).max(128),
+  description: z.string().trim().min(1).max(4000),
+  slug: z.string().trim().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(96).optional(),
 });
 
 const createTestSchema = z.object({
@@ -953,6 +960,155 @@ export function createProjectsRouter(deps: {
     await deps.jobEvents.create({ jobId: job.id, type: "user_message", message: parsed.data.content });
     await deps.features.setAwaitingUserInput(featureId, false);
     res.status(201).json({});
+  });
+
+  // ADR 014: design_grill is a project-scoped, single-phase session rather
+  // than a Feature. Its identity lives on the job row until the unresolved
+  // Design-persistence decision is made.
+  router.post("/:projectId/designs", requireAuth, async (req, res) => {
+    const parsed = parseBody(createDesignSchema, req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    if (project.status !== "ready") {
+      res.status(409).json({ error: "Project initialization must complete before starting a design session" });
+      return;
+    }
+    if (!project.hasDesignSurface) {
+      res.status(409).json({ error: "Design sessions are not enabled for this project" });
+      return;
+    }
+    const capabilityError = await assertCapabilityForProject(req, project, "design_sessions");
+    if (capabilityError) {
+      res.status(403).json({ error: capabilityError });
+      return;
+    }
+    const accessError = assertGitHubAccess(project);
+    if (accessError) {
+      res.status(409).json({ error: accessError });
+      return;
+    }
+    const modelConfigError = await assertModelConfigResolvable(project);
+    if (modelConfigError) {
+      res.status(400).json({ error: modelConfigError });
+      return;
+    }
+
+    const designSlug = parsed.data.slug ?? slugify(parsed.data.name);
+    if (!designSlug) {
+      res.status(400).json({ error: "Design name must contain a letter or number" });
+      return;
+    }
+    const job = await dispatchJob(deps.jobs, {
+      projectId: project.id,
+      kind: "design_grill",
+      designName: parsed.data.name,
+      designSlug,
+      designDescription: parsed.data.description,
+    });
+    res.status(201).json({
+      id: job.id,
+      name: parsed.data.name,
+      slug: designSlug,
+      description: parsed.data.description,
+      status: job.status,
+      createdAt: job.createdAt?.toISOString?.() ?? new Date().toISOString(),
+    });
+  });
+
+  router.get("/:projectId/designs/:sessionId/events", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const sessionId = routeParam(req.params.sessionId);
+    if (!isUuid(sessionId)) {
+      res.status(404).json({ error: "Design session not found" });
+      return;
+    }
+    const job = await deps.jobs.findByIdForProject(project.id, sessionId);
+    if (!job || job.kind !== "design_grill") {
+      res.status(404).json({ error: "Design session not found" });
+      return;
+    }
+    const events = await deps.jobEvents.listByJob(job.id);
+    res.json({
+      session: {
+        id: job.id,
+        name: job.designName,
+        slug: job.designSlug,
+        description: job.designDescription,
+        status: job.status,
+        createdAt: job.createdAt.toISOString(),
+      },
+      jobStatus: job.status,
+      lastError: job.lastError,
+      events,
+    });
+  });
+
+  router.post("/:projectId/designs/:sessionId/messages", requireAuth, async (req, res) => {
+    const parsed = parseBody(createFeatureMessageSchema, req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const sessionId = routeParam(req.params.sessionId);
+    if (!isUuid(sessionId)) {
+      res.status(404).json({ error: "Design session not found" });
+      return;
+    }
+    const job = await deps.jobs.findByIdForProject(project.id, sessionId);
+    if (!job || job.kind !== "design_grill" || job.status !== "running") {
+      res.status(409).json({ error: "No active design session is waiting for a reply" });
+      return;
+    }
+    const events = await deps.jobEvents.listByJob(job.id);
+    const lastAsk = events.map((event) => event.type === "ask_user").lastIndexOf(true);
+    const lastReply = events.map((event) => event.type === "user_message").lastIndexOf(true);
+    if (lastAsk < 0 || lastReply >= lastAsk) {
+      res.status(409).json({ error: "The design agent is not waiting for a reply" });
+      return;
+    }
+    await deps.jobMessages.create({ jobId: job.id, content: parsed.data.content });
+    await deps.jobEvents.create({ jobId: job.id, type: "user_message", message: parsed.data.content });
+    res.status(201).json({});
+  });
+
+  router.post("/:projectId/designs/:sessionId/cancel", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const sessionId = routeParam(req.params.sessionId);
+    if (!isUuid(sessionId)) {
+      res.status(404).json({ error: "Design session not found" });
+      return;
+    }
+    const job = await deps.jobs.findByIdForProject(project.id, sessionId);
+    if (!job || job.kind !== "design_grill") {
+      res.status(404).json({ error: "Design session not found" });
+      return;
+    }
+    if (!(await deps.jobs.cancel(job.id))) {
+      res.status(409).json({ error: "No active design session to cancel" });
+      return;
+    }
+    res.status(200).json({});
   });
 
   // Cancels a running spec_grill job (ADR 006's cancel/abort follow-up).

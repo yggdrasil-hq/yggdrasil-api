@@ -12,7 +12,9 @@ export type JobEventType =
   | "request_action_item"
   | "submit_review"
   | "report_test_step"
-  | "submit_test_report";
+  | "submit_test_report"
+  | "update_design_preview"
+  | "submit_design";
 
 export interface JobEvent {
   id: string;
@@ -24,6 +26,7 @@ export interface JobEvent {
   status: string | null;
   prUrl: string | null;
   summary: string | null;
+  snapshot: Record<string, string> | null;
   createdAt: Date;
 }
 
@@ -37,6 +40,7 @@ interface JobEventRow {
   status: string | null;
   pr_url: string | null;
   summary: string | null;
+  design_snapshot: Record<string, string> | null;
   created_at: Date;
 }
 
@@ -51,6 +55,7 @@ function mapJobEvent(row: JobEventRow): JobEvent {
     status: row.status,
     prUrl: row.pr_url,
     summary: row.summary,
+    snapshot: row.design_snapshot,
     createdAt: row.created_at,
   };
 }
@@ -75,11 +80,14 @@ export class JobEventRepository {
     status?: string;
     prUrl?: string;
     summary?: string;
+    snapshot?: Record<string, string>;
   }): Promise<JobEvent> {
     const result = await this.db.query<JobEventRow>(
-      `INSERT INTO job_events (job_id, type, question, markdown, message, status, pr_url, summary)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       RETURNING id, job_id, type, question, markdown, message, status, pr_url, summary, created_at`,
+      `INSERT INTO job_events
+         (job_id, type, question, markdown, message, status, pr_url, summary, design_snapshot)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       RETURNING id, job_id, type, question, markdown, message, status, pr_url,
+         summary, design_snapshot, created_at`,
       [
         input.jobId,
         input.type,
@@ -89,6 +97,7 @@ export class JobEventRepository {
         input.status ?? null,
         input.prUrl ?? null,
         input.summary ?? null,
+        input.snapshot ?? null,
       ],
     );
     return mapJobEvent(result.rows[0]);
@@ -97,7 +106,8 @@ export class JobEventRepository {
   /** Lists a job's events in chronological order. */
   async listByJob(jobId: string): Promise<JobEvent[]> {
     const result = await this.db.query<JobEventRow>(
-      `SELECT id, job_id, type, question, markdown, message, status, pr_url, summary, created_at
+      `SELECT id, job_id, type, question, markdown, message, status, pr_url,
+         summary, design_snapshot, created_at
        FROM job_events
        WHERE job_id = $1
        ORDER BY created_at ASC`,

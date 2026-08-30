@@ -9,6 +9,9 @@ interface JobRow {
   test_id: string | null;
   ref: string | null;
   trigger_source: "feature" | "schedule" | null;
+  design_name: string | null;
+  design_slug: string | null;
+  design_description: string | null;
   status: JobStatus;
   last_error: string | null;
   created_at: Date;
@@ -17,7 +20,9 @@ interface JobRow {
 }
 
 const jobColumns = `
-  id, project_id, kind, feature_id, test_id, ref, trigger_source, status, last_error, created_at, started_at, completed_at
+    id, project_id, kind, feature_id, test_id, ref, trigger_source,
+    design_name, design_slug, design_description,
+    status, last_error, created_at, started_at, completed_at
 `;
 
 function mapJob(row: JobRow): Job {
@@ -29,6 +34,9 @@ function mapJob(row: JobRow): Job {
     testId: row.test_id,
     ref: row.ref,
     trigger: row.trigger_source,
+    designName: row.design_name,
+    designSlug: row.design_slug,
+    designDescription: row.design_description,
     status: row.status,
     lastError: row.last_error,
     createdAt: row.created_at,
@@ -47,10 +55,15 @@ export class JobRepository {
     testId?: string;
     ref?: string;
     trigger?: "feature" | "schedule";
+    designName?: string;
+    designSlug?: string;
+    designDescription?: string;
   }): Promise<Job> {
     const result = await this.db.query<JobRow>(
-      `INSERT INTO jobs (project_id, kind, feature_id, test_id, ref, trigger_source, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending')
+      `INSERT INTO jobs
+         (project_id, kind, feature_id, test_id, ref, trigger_source,
+          design_name, design_slug, design_description, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
        RETURNING ${jobColumns}`,
       [
         input.projectId,
@@ -59,6 +72,9 @@ export class JobRepository {
         input.testId ?? null,
         input.ref ?? (input.kind === "test_run" ? "main" : null),
         input.trigger ?? (input.kind === "test_run" ? "schedule" : null),
+        input.designName ?? null,
+        input.designSlug ?? null,
+        input.designDescription ?? null,
       ],
     );
     return mapJob(result.rows[0]);
@@ -75,6 +91,16 @@ export class JobRepository {
        FROM jobs
        WHERE id = $1`,
       [jobId],
+    );
+    return result.rows[0] ? mapJob(result.rows[0]) : null;
+  }
+
+  async findByIdForProject(projectId: string, jobId: string): Promise<Job | null> {
+    const result = await this.db.query<JobRow>(
+      `SELECT ${jobColumns}
+       FROM jobs
+       WHERE project_id = $1 AND id = $2`,
+      [projectId, jobId],
     );
     return result.rows[0] ? mapJob(result.rows[0]) : null;
   }

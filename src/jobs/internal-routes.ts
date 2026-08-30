@@ -18,6 +18,27 @@ const actionItemSchema = z.object({
   draftTestMarkdown: z.string().optional(),
 });
 
+const designSnapshotSchema = z
+  .record(z.string().trim().min(1).max(256), z.string().max(500_000))
+  .superRefine((snapshot, ctx) => {
+    if (Object.keys(snapshot).length === 0) {
+      ctx.addIssue({ code: "custom", message: "Design snapshots cannot be empty" });
+    }
+    if (Object.keys(snapshot).length > 100) {
+      ctx.addIssue({ code: "custom", message: "Design snapshots may contain at most 100 files" });
+    }
+    for (const path of Object.keys(snapshot)) {
+      if (
+        path.startsWith("/") ||
+        path.includes("\\") ||
+        path.split("/").some((part) => part === ".." || part === ".")
+      ) {
+        ctx.addIssue({ code: "custom", message: "Design snapshot paths must be safe relative paths" });
+        break;
+      }
+    }
+  });
+
 const jobEventSchema = z.object({
   type: z.enum([
     "agent_text",
@@ -31,6 +52,8 @@ const jobEventSchema = z.object({
     "submit_review",
     "report_test_step",
     "submit_test_report",
+    "update_design_preview",
+    "submit_design",
   ]),
   question: z.string().optional(),
   markdown: z.string().optional(),
@@ -54,6 +77,8 @@ const jobEventSchema = z.object({
   coveragePercent: z.number().min(0).max(100).optional(),
   failingTests: z.array(z.string()).optional(),
   recordingPath: z.string().optional(),
+  snapshot: designSnapshotSchema.optional(),
+  hasDesignSurface: z.boolean().optional(),
 }).superRefine((event, ctx) => {
   if (event.type === "report_test_step" && (!event.testName || !event.testStatus)) {
     ctx.addIssue({
@@ -80,6 +105,15 @@ const jobEventSchema = z.object({
     ctx.addIssue({
       code: "custom",
       message: "Test report total cannot be less than its result counts",
+    });
+  }
+  if (
+    (event.type === "update_design_preview" || event.type === "submit_design") &&
+    !event.snapshot
+  ) {
+    ctx.addIssue({
+      code: "custom",
+      message: "Design events require a full path-to-content snapshot",
     });
   }
 });
@@ -121,6 +155,18 @@ export function createJobsInternalRouter(deps: {
         res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid event" });
         return;
       }
+      if (parsed.data.type === "update_design_preview" || parsed.data.type === "submit_design") {
+        const job = await deps.jobs.findById(jobId);
+        if (job?.kind !== "design_grill") {
+          res.status(400).json({ error: "Design events require a design_grill job" });
+          return;
+        }
+        const prefix = job.designSlug ? `designs/${job.designSlug}/` : null;
+        if (prefix && parsed.data.snapshot && Object.keys(parsed.data.snapshot).some((path) => !path.startsWith(prefix))) {
+          res.status(400).json({ error: "Design snapshot contains a path outside its design folder" });
+          return;
+        }
+      }
 
       let event;
       try {
@@ -135,6 +181,7 @@ export function createJobsInternalRouter(deps: {
             parsed.data.type === "submit_test_report"
               ? parsed.data.summary ?? ""
               : parsed.data.summary,
+          snapshot: parsed.data.snapshot,
         });
       } catch (error) {
         console.error(`failed to record event for job ${jobId}:`, error);
@@ -204,12 +251,20 @@ async function syncFeatureState(
     event.type !== "request_action_item" &&
     event.type !== "submit_review" &&
     event.type !== "report_test_step" &&
-    event.type !== "submit_test_report"
+    event.type !== "submit_test_report" &&
+    event.type !== "update_design_preview" &&
+    event.type !== "submit_design"
   ) {
     return;
   }
   try {
     const job = await deps.jobs.findById(jobId);
+    if (
+      (event.type === "update_design_preview" || event.type === "submit_design") &&
+      job?.kind !== "design_grill"
+    ) {
+      return;
+    }
     if (!job?.featureId) {
       return;
     }
@@ -219,6 +274,12 @@ async function syncFeatureState(
     }
     if (event.type === "submit_adr") {
       await deps.features.setSpecReady(job.featureId, event.markdown ?? "");
+      if (event.hasDesignSurface !== undefined && deps.projects.setHasDesignSurface) {
+        const feature = await deps.features.findById(job.projectId, job.featureId);
+        if (feature?.featureType === "project_init") {
+          await deps.projects.setHasDesignSurface(job.projectId, event.hasDesignSurface);
+        }
+      }
       // ADR 015 item 4: persist this spec_grill run's Action Items batch,
       // generated once at the draft -> spec_ready transition.
       if (event.actionItems && event.actionItems.length > 0) {

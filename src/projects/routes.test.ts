@@ -24,6 +24,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     githubAccessWarning: false,
     modelConfigWarning: false,
     agenticReviewEnabled: true,
+    hasDesignSurface: true,
     repositories: [
       { id: "repo_1", githubOwner: "acme", githubRepo: "web", isPrimary: true, sortOrder: 0 },
     ],
@@ -150,6 +151,7 @@ function buildApp(opts: BuildAppOptions) {
     listRoleCapabilities: vi.fn(async () => [
       { role: "admin", capability: "manage_features", level: "full" },
       { role: "admin", capability: "manage_projects", level: "full" },
+      { role: "admin", capability: "design_sessions", level: "full" },
       { role: "developer", capability: "manage_features", level: "full" },
     ]),
   };
@@ -471,6 +473,40 @@ describe("model configuration gate (ADR 007)", () => {
       expect(res.status).toBe(201);
       expect(features.resetForRetry).toHaveBeenCalledWith(feature.id);
     });
+  });
+});
+
+describe("POST /:projectId/designs (ADR 014)", () => {
+  it("creates a gated, project-scoped design_grill job", async () => {
+    const { app, jobs } = buildApp({
+      project: makeProject(),
+      orgSecrets: {
+        MODEL_BASE_URL: "https://models.example",
+        MODEL_API_KEY: "key",
+        MODEL_ID: "model",
+      },
+    });
+
+    const response = await authedRequest(app).post(
+      `/projects/${makeProject().id}/designs`,
+    ).send({ name: "Checkout flow", description: "Design checkout" });
+
+    expect(response.status).toBe(201);
+    expect(jobs.create).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: makeProject().id,
+      kind: "design_grill",
+      designName: "Checkout flow",
+      designSlug: "checkout-flow",
+      designDescription: "Design checkout",
+    }));
+  });
+
+  it("rejects design sessions when the project has no design surface", async () => {
+    const { app } = buildApp({ project: makeProject({ hasDesignSurface: false }) });
+    const response = await authedRequest(app).post(
+      `/projects/${makeProject().id}/designs`,
+    ).send({ name: "Checkout", description: "Design checkout" });
+    expect(response.status).toBe(409);
   });
 });
 

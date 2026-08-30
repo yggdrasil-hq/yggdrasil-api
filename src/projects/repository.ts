@@ -15,6 +15,7 @@ interface ProjectRow {
   github_access_warning: boolean;
   model_config_warning: boolean;
   agentic_review_enabled: boolean;
+  has_design_surface: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -31,7 +32,7 @@ interface RepositoryRow {
 const projectColumns = `
   id, organization_id, owner_user_id, name, slug, description, status, settings,
   installation_id, github_access_warning, model_config_warning,
-  agentic_review_enabled, created_at, updated_at
+  agentic_review_enabled, has_design_surface, created_at, updated_at
 `;
 
 function mapRepository(row: RepositoryRow): ProjectRepositoryRecord {
@@ -58,6 +59,7 @@ function mapProject(row: ProjectRow, repositories: ProjectRepositoryRecord[]): P
     githubAccessWarning: row.github_access_warning,
     modelConfigWarning: row.model_config_warning,
     agenticReviewEnabled: row.agentic_review_enabled,
+    hasDesignSurface: row.has_design_surface,
     repositories,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -257,6 +259,14 @@ export class ProjectRepository {
     await this.db.query(
       `UPDATE projects SET agentic_review_enabled = $2, updated_at = NOW() WHERE id = $1`,
       [projectId, enabled],
+    );
+  }
+
+  /** ADR 014: records the project-init interview's UI/design-surface answer. */
+  async setHasDesignSurface(projectId: string, hasDesignSurface: boolean): Promise<void> {
+    await this.db.query(
+      `UPDATE projects SET has_design_surface = $2, updated_at = NOW() WHERE id = $1`,
+      [projectId, hasDesignSurface],
     );
   }
 

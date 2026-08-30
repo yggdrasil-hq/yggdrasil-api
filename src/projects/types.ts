@@ -24,6 +24,8 @@ export interface Project {
   modelConfigWarning: boolean;
   /** ADR 015 item 12: Agentic Review gate per-project, default on. */
   agenticReviewEnabled: boolean;
+  /** ADR 014: whether this project has a user-facing design surface. */
+  hasDesignSurface: boolean;
   repositories: ProjectRepositoryRecord[];
   createdAt: Date;
   updatedAt: Date;
@@ -46,6 +48,7 @@ export interface PublicProject {
   githubAccessWarning: boolean;
   modelConfigWarning: boolean;
   agenticReviewEnabled: boolean;
+  hasDesignSurface: boolean;
   repositories: PublicProjectRepository[];
   repositoryRemovalBlockedReason: string | null;
 }
@@ -95,6 +98,7 @@ export function toPublicProject(
     githubAccessWarning: project.githubAccessWarning,
     modelConfigWarning: project.modelConfigWarning,
     agenticReviewEnabled: project.agenticReviewEnabled,
+    hasDesignSurface: project.hasDesignSurface,
     repositories: project.repositories.map((repo) => ({
       id: repo.id,
       githubOwner: repo.githubOwner,

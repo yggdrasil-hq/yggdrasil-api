@@ -16,6 +16,7 @@ function makeEvent(overrides: Partial<JobEvent> = {}): JobEvent {
     status: null,
     prUrl: null,
     summary: null,
+    snapshot: null,
     createdAt: new Date(),
     ...overrides,
   };
@@ -35,6 +36,9 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     createdAt: new Date(),
     startedAt: new Date(),
     completedAt: null,
+    designName: null,
+    designSlug: null,
+    designDescription: null,
     ...overrides,
   };
 }
@@ -48,6 +52,7 @@ type CreateInput = {
   status?: string;
   prUrl?: string;
   summary?: string;
+  snapshot?: Record<string, string>;
 };
 
 function buildApp(deps: {
@@ -165,6 +170,56 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .send({ type: "submit_adr", markdown: "# ADR 1" });
 
     expect(res.status).toBe(201);
+  });
+
+  it("persists a full design snapshot event without treating it as a feature event", async () => {
+    let gotInput: CreateInput | undefined;
+    const app = buildApp({
+      findById: async () => makeJob({
+        featureId: null,
+        kind: "design_grill",
+      }),
+      create: async (input) => {
+        gotInput = input;
+        return makeEvent({ jobId: input.jobId, type: input.type });
+      },
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "update_design_preview",
+        snapshot: { "designs/checkout/page.html": "<h1>Hello</h1>" },
+      });
+
+    expect(res.status).toBe(201);
+    expect(gotInput).toEqual({
+      jobId: JOB_ID,
+      type: "update_design_preview",
+      snapshot: { "designs/checkout/page.html": "<h1>Hello</h1>" },
+    });
+  });
+
+  it("requires a snapshot for design events", async () => {
+    const res = await request(buildApp({}))
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_design", summary: "done" });
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects snapshot paths outside the session design folder", async () => {
+    const res = await request(buildApp({
+      findById: async () => makeJob({ featureId: null, kind: "design_grill", designSlug: "checkout" }),
+    }))
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "update_design_preview",
+        snapshot: { "designs/other/page.html": "<h1>nope</h1>" },
+      });
+    expect(res.status).toBe(400);
   });
 
   it("creates Action Items when submit_adr carries an actionItems batch (ADR 015 item 4)", async () => {

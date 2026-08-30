@@ -13,6 +13,9 @@ export async function dispatchJob(
     testId?: string;
     ref?: string;
     trigger?: "feature" | "schedule";
+    designName?: string;
+    designSlug?: string;
+    designDescription?: string;
   },
 ) {
   return jobs.create(input);
