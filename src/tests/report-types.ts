@@ -26,6 +26,7 @@ export interface TestRunReport {
 export interface TestRunExecution {
   jobId: string;
   testId: string | null;
+  testGroup: "unit" | "integration" | null;
   status: "pending" | "running" | "completed" | "failed" | "cancelled";
   report: TestRunReport | null;
   steps: TestRunStep[];
@@ -79,6 +80,7 @@ export function toPublicTestRunExecution(execution: TestRunExecution) {
   return {
     jobId: execution.jobId,
     testId: execution.testId,
+    testGroup: execution.testGroup,
     status: execution.status,
     report: execution.report
       ? toPublicTestRunReport(execution.report)

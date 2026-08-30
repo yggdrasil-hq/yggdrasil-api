@@ -29,6 +29,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     kind: "spec_grill",
     featureId: "feature_1",
     testId: null,
+    testGroup: null,
     ref: null,
     trigger: null,
     status: "running",
@@ -525,7 +526,7 @@ describe("POST /internal/jobs/:jobId/events", () => {
     expect(setInReview).not.toHaveBeenCalled();
   });
 
-  it("dispatches one feature-ref test run per enabled test", async () => {
+  it("dispatches feature-ref agentic and script test runs", async () => {
     const setTesting = vi.fn(async () => ({ id: "feature_42" }));
     const jobsCreate = vi.fn(async () => ({ id: "test_job_1" }));
     const listEnabledTests = vi.fn(async () => [{ id: "test_1" }, { id: "test_2" }]);
@@ -542,10 +543,20 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .send({ type: "submit_build_result", status: "success", prUrl: "https://example.test/pr/1" });
 
     expect(res.status).toBe(201);
-    expect(jobsCreate).toHaveBeenCalledTimes(2);
+    expect(jobsCreate).toHaveBeenCalledTimes(4);
     expect(jobsCreate).toHaveBeenNthCalledWith(1, expect.objectContaining({
       kind: "test_run",
       testId: "test_1",
+      ref: "yggdrasil/feature-feature_42",
+    }));
+    expect(jobsCreate).toHaveBeenNthCalledWith(3, expect.objectContaining({
+      kind: "script_test_run",
+      testGroup: "unit",
+      ref: "yggdrasil/feature-feature_42",
+    }));
+    expect(jobsCreate).toHaveBeenNthCalledWith(4, expect.objectContaining({
+      kind: "script_test_run",
+      testGroup: "integration",
       ref: "yggdrasil/feature-feature_42",
     }));
   });
@@ -577,6 +588,39 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .set("Authorization", "Bearer test-internal-api-token")
       .send({ type: "submit_test_report", passed: 1, failed: 0 });
     expect(invalid.status).toBe(400);
+  });
+
+  it("accepts a canonical report from a script test job", async () => {
+    const upsertReport = vi.fn(async () => undefined);
+    const app = buildApp({
+      upsertReport,
+      findById: async () => makeJob({
+        kind: "script_test_run",
+        featureId: "feature_42",
+        testGroup: "unit",
+      }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "submit_test_report",
+        passed: 3,
+        failed: 1,
+        skipped: 0,
+        total: 4,
+        summary: "One unit test failed.",
+        failingTests: ["auth rejects expired token"],
+      });
+
+    expect(res.status).toBe(201);
+    expect(upsertReport).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: JOB_ID,
+      passed: 3,
+      failed: 1,
+      total: 4,
+    }));
   });
 
   it("does not touch awaiting_user_input for submit_build_result events", async () => {

@@ -207,7 +207,8 @@ export function createJobsInternalRouter(deps: {
  * `awaiting_user_input` itself). `submit_build_result` is feature_build's
  * single terminal event, carrying its own outcome in `status`: `"success"`
  * moves the feature to `testing`, persists the opened PR's URL, and dispatches
- * one agentic `test_run` per enabled test
+ * one agentic `test_run` per enabled test and one script job per
+ * structure-standard test script
  * (`FeatureRepository.setTesting`); `"failure"` is handled exactly like
  * `run_failed` below. `run_failed`/`run_cancelled` are the run's
  * unsuccessful terminal events: each clears `awaiting_user_input` (so a job
@@ -307,10 +308,6 @@ async function syncFeatureState(
 
         try {
           const enabledTests = await deps.tests.listEnabledByProject(job.projectId);
-          if (enabledTests.length === 0) {
-            await advanceAfterTesting(deps, job.projectId, job.featureId);
-            return;
-          }
           if (await deps.jobs.hasActiveFeatureTestRuns(job.featureId)) return;
           const ref = feature.branchName ?? `yggdrasil/${feature.slug}-${feature.id}`;
           for (const test of enabledTests) {
@@ -319,6 +316,21 @@ async function syncFeatureState(
               kind: "test_run",
               featureId: job.featureId,
               testId: test.id,
+              ref,
+              trigger: "feature",
+            });
+          }
+          // The presence of test-unit.sh/test-integration.sh in the checked
+          // out feature branch is the group's toggle (ADR 015 item 10).
+          // Dispatch both probes here; the runner reports a missing script as
+          // an empty, skipped group, so the API never needs to parse a repo or
+          // maintain a second project-level setting.
+          for (const testGroup of ["unit", "integration"] as const) {
+            await deps.jobs.create({
+              projectId: job.projectId,
+              kind: "script_test_run",
+              featureId: job.featureId,
+              testGroup,
               ref,
               trigger: "feature",
             });
@@ -345,7 +357,7 @@ async function syncFeatureState(
       return;
     }
     if (event.type === "submit_test_report") {
-      if (job.kind !== "test_run") return;
+      if (job.kind !== "test_run" && job.kind !== "script_test_run") return;
       if (
         event.passed === undefined ||
         event.failed === undefined ||

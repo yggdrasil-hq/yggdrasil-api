@@ -14,6 +14,7 @@ export interface Job {
   kind: JobKind;
   featureId: string | null;
   testId: string | null;
+  testGroup: "unit" | "integration" | null;
   ref: string | null;
   trigger: "feature" | "schedule" | null;
   designName: string | null;

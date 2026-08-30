@@ -142,12 +142,13 @@ export class TestRunReportRepository {
     const jobs = await this.db.query<{
       id: string;
       test_id: string | null;
+      test_group: "unit" | "integration" | null;
       status: TestRunExecution["status"];
     }>(
-      `SELECT id, test_id, status
+      `SELECT id, test_id, test_group, status
        FROM jobs j
        WHERE j.feature_id = $1
-         AND j.kind = 'test_run'
+         AND j.kind IN ('test_run', 'script_test_run')
          AND j.created_at >= COALESCE(
            (SELECT created_at FROM jobs
             WHERE feature_id = $1 AND kind = 'feature_build'
@@ -163,6 +164,7 @@ export class TestRunReportRepository {
       return {
         jobId: job.id,
         testId: job.test_id,
+        testGroup: job.test_group,
         status: job.status,
         report,
         steps,

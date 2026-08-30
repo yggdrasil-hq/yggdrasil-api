@@ -43,6 +43,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     kind: "design_grill",
     featureId: null,
     testId: null,
+    testGroup: null,
     ref: null,
     trigger: null,
     designName: "Checkout",

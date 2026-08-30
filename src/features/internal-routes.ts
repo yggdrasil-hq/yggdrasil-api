@@ -48,6 +48,7 @@ export function createFeaturesInternalRouter(deps: {
       }
       const isFeatureBuild = req.query.kind === "feature_build";
       const isTestRun = req.query.kind === "test_run";
+      const isScriptTestRun = req.query.kind === "script_test_run";
       const isAgenticReview = req.query.kind === "agentic_review";
 
       const feature = await deps.features.findById(projectId, featureId);
@@ -63,6 +64,14 @@ export function createFeaturesInternalRouter(deps: {
       }
 
       const testId = typeof req.query.testId === "string" ? req.query.testId : null;
+      const scriptName =
+        req.query.scriptName === "unit" || req.query.scriptName === "integration"
+          ? req.query.scriptName
+          : null;
+      if (isScriptTestRun && !scriptName) {
+        res.status(400).json({ error: "scriptName is required for script_test_run" });
+        return;
+      }
       const test =
         isTestRun && testId ? await deps.tests.findById(projectId, testId) : null;
       if (isTestRun && !test) {
@@ -114,11 +123,11 @@ export function createFeaturesInternalRouter(deps: {
           // entrypoint.sh checks out before Pi starts. Both omitted for
           // spec_grill, which has no ADR yet and clones each repo's default
           // branch.
-          ...(isFeatureBuild || isTestRun || isAgenticReview
+          ...(isFeatureBuild || isTestRun || isScriptTestRun || isAgenticReview
             ? {
                 adrMarkdown: feature.adrMarkdown ?? "",
                 branch: `yggdrasil/${feature.slug}-${feature.id}`,
-                ...(isTestRun || isAgenticReview
+                ...(isTestRun || isScriptTestRun || isAgenticReview
                   ? { ref: `yggdrasil/${feature.slug}-${feature.id}` }
                   : {}),
               }
@@ -130,6 +139,7 @@ export function createFeaturesInternalRouter(deps: {
                 ref: `yggdrasil/${feature.slug}-${feature.id}`,
               }
             : {}),
+          ...(isScriptTestRun ? { scriptName } : {}),
         });
       } catch (error) {
         console.error(`feature spec fetch failed for feature ${featureId}:`, error);

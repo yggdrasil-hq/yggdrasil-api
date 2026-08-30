@@ -236,6 +236,23 @@ describe("GET /internal/projects/:projectId/features/:featureId/spec", () => {
     );
   });
 
+  it("returns a feature-ref script payload for script_test_run", async () => {
+    const app = buildApp({
+      features: {
+        findById: async () =>
+          makeFeature({ slug: "add-dark-mode", id: FEATURE_ID }),
+      },
+    });
+
+    const res = await request(app)
+      .get(`/internal/projects/${PROJECT_ID}/features/${FEATURE_ID}/spec?kind=script_test_run&scriptName=unit`)
+      .set("Authorization", "Bearer test-internal-api-token");
+
+    expect(res.status).toBe(200);
+    expect(res.body.scriptName).toBe("unit");
+    expect(res.body.ref).toBe(`yggdrasil/add-dark-mode-${FEATURE_ID}`);
+  });
+
   it("omits adrMarkdown/branch for spec_grill (kind omitted or explicit)", async () => {
     const app = buildApp({});
 

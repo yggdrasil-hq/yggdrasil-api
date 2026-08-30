@@ -7,6 +7,7 @@ interface JobRow {
   kind: JobKind;
   feature_id: string | null;
   test_id: string | null;
+  test_group: "unit" | "integration" | null;
   ref: string | null;
   trigger_source: "feature" | "schedule" | null;
   design_name: string | null;
@@ -20,7 +21,7 @@ interface JobRow {
 }
 
 const jobColumns = `
-    id, project_id, kind, feature_id, test_id, ref, trigger_source,
+    id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
     design_name, design_slug, design_description,
     status, last_error, created_at, started_at, completed_at
 `;
@@ -32,6 +33,7 @@ function mapJob(row: JobRow): Job {
     kind: row.kind,
     featureId: row.feature_id,
     testId: row.test_id,
+    testGroup: row.test_group,
     ref: row.ref,
     trigger: row.trigger_source,
     designName: row.design_name,
@@ -53,6 +55,7 @@ export class JobRepository {
     kind: JobKind;
     featureId?: string;
     testId?: string;
+    testGroup?: "unit" | "integration";
     ref?: string;
     trigger?: "feature" | "schedule";
     designName?: string;
@@ -61,15 +64,16 @@ export class JobRepository {
   }): Promise<Job> {
     const result = await this.db.query<JobRow>(
       `INSERT INTO jobs
-         (project_id, kind, feature_id, test_id, ref, trigger_source,
+         (project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
           design_name, design_slug, design_description, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending')
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
        RETURNING ${jobColumns}`,
       [
         input.projectId,
         input.kind,
         input.featureId ?? null,
         input.testId ?? null,
+        input.testGroup ?? null,
         input.ref ?? (input.kind === "test_run" ? "main" : null),
         input.trigger ?? (input.kind === "test_run" ? "schedule" : null),
         input.designName ?? null,
@@ -110,7 +114,7 @@ export class JobRepository {
       `SELECT EXISTS(
          SELECT 1 FROM jobs
          WHERE project_id = $1
-           AND kind = 'test_run'
+           AND kind IN ('test_run', 'script_test_run')
            AND status IN ('pending', 'running')
        ) AS exists`,
       [projectId],
@@ -123,7 +127,7 @@ export class JobRepository {
       `SELECT EXISTS(
          SELECT 1 FROM jobs
          WHERE test_id = $1
-           AND kind = 'test_run'
+           AND kind IN ('test_run', 'script_test_run')
            AND status IN ('pending', 'running')
        ) AS exists`,
       [testId],
@@ -136,7 +140,7 @@ export class JobRepository {
       `SELECT EXISTS(
          SELECT 1 FROM jobs
          WHERE feature_id = $1
-           AND kind = 'test_run'
+           AND kind IN ('test_run', 'script_test_run')
            AND status IN ('pending', 'running')
        ) AS exists`,
       [featureId],
@@ -149,7 +153,7 @@ export class JobRepository {
       `SELECT ${jobColumns}
        FROM jobs j
        WHERE j.feature_id = $1
-         AND j.kind = 'test_run'
+         AND j.kind IN ('test_run', 'script_test_run')
          AND j.created_at >= COALESCE(
            (SELECT created_at FROM jobs
             WHERE feature_id = $1 AND kind = 'feature_build'

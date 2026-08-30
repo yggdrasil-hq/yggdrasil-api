@@ -11,6 +11,7 @@ export async function dispatchJob(
     kind: JobKind;
     featureId?: string;
     testId?: string;
+    testGroup?: "unit" | "integration";
     ref?: string;
     trigger?: "feature" | "schedule";
     designName?: string;
