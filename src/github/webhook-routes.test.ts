@@ -137,6 +137,34 @@ describe("handlePullRequestEvent", () => {
     expect(jobs.create).toHaveBeenCalledWith({ projectId: "proj_1", kind: "deploy" });
   });
 
+  it("resolves a parent's subtask Action Item when a subtask feature merges (ADR 015 item 5)", async () => {
+    const updateStatus = vi.fn().mockResolvedValue(null);
+    const resolveSubtaskItem = vi.fn().mockResolvedValue(undefined);
+    const features = {
+      findByPrUrl: vi.fn().mockResolvedValue({
+        id: "feat_2",
+        projectId: "proj_1",
+        featureType: "normal",
+        status: "in_review",
+        parentFeatureId: "feat_1",
+      }),
+      updateStatus,
+    };
+    const projects = { findById: vi.fn() };
+    const jobs = { create: vi.fn() };
+    const actionItems = { resolveSubtaskItem };
+
+    await handlePullRequestEvent(makePrPayload(), {
+      features: features as never,
+      projects: projects as never,
+      jobs: jobs as never,
+      actionItems: actionItems as never,
+    });
+
+    expect(updateStatus).toHaveBeenCalledWith("feat_2", "merged");
+    expect(resolveSubtaskItem).toHaveBeenCalledWith("feat_2");
+  });
+
   it("does not dispatch deploy for a project_init merge when the project is already ready", async () => {
     const updateStatus = vi.fn().mockResolvedValue(null);
     const markReady = vi.fn();
@@ -246,42 +274,41 @@ function makeReviewPayload(
 }
 
 describe("handlePullRequestReviewEvent", () => {
-  it("moves an in_review feature to changes_requested", async () => {
-    const updateStatus = vi.fn().mockResolvedValue(null);
+  it("moves an in_review feature to returned (human_review) on changes_requested", async () => {
+    const setReturned = vi.fn().mockResolvedValue(null);
     const features = {
       findByPrUrl: vi.fn().mockResolvedValue({ id: "feat_1", status: "in_review" }),
-      updateStatus,
+      setReturned,
     };
 
     await handlePullRequestReviewEvent(makeReviewPayload(), { features: features as never });
 
-    expect(updateStatus).toHaveBeenCalledWith("feat_1", "changes_requested");
+    expect(setReturned).toHaveBeenCalledWith("feat_1", "human_review", expect.any(String));
   });
 
-  it("ignores review states other than changes_requested", async () => {
-    const updateStatus = vi.fn();
+  it("returns early when the review state is not changes_requested", async () => {
+    const setReturned = vi.fn();
     const features = {
       findByPrUrl: vi.fn().mockResolvedValue({ id: "feat_1", status: "in_review" }),
-      updateStatus,
+      setReturned,
     };
 
     await handlePullRequestReviewEvent(makeReviewPayload({ state: "approved" }), {
       features: features as never,
     });
 
-    expect(features.findByPrUrl).not.toHaveBeenCalled();
-    expect(updateStatus).not.toHaveBeenCalled();
+    expect(setReturned).not.toHaveBeenCalled();
   });
 
   it("does not clobber a feature that has already moved past in_review", async () => {
-    const updateStatus = vi.fn();
+    const setReturned = vi.fn();
     const features = {
       findByPrUrl: vi.fn().mockResolvedValue({ id: "feat_1", status: "merged" }),
-      updateStatus,
+      setReturned,
     };
 
     await handlePullRequestReviewEvent(makeReviewPayload(), { features: features as never });
 
-    expect(updateStatus).not.toHaveBeenCalled();
+    expect(setReturned).not.toHaveBeenCalled();
   });
 });

@@ -3,11 +3,21 @@ export type FeatureStatus =
   | "spec_ready"
   | "queued"
   | "running"
+  | "testing"
+  | "agentic_review"
   | "in_review"
-  | "changes_requested"
+  | "returned"
   | "merged"
   | "failed"
   | "cancelled";
+
+export type FeatureReturnReason = "test_failure" | "agentic_review" | "human_review";
+
+export type FeatureActionItemType =
+  | "secret_request"
+  | "design_grill"
+  | "subtask_feature"
+  | "test_request";
 
 export type FeatureType = "normal" | "project_init";
 
@@ -23,6 +33,9 @@ export interface Feature {
   adrApproved: boolean;
   branchName: string | null;
   prUrl: string | null;
+  parentFeatureId: string | null;
+  returnReason: FeatureReturnReason | null;
+  returnComment: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -40,6 +53,9 @@ export interface PublicFeature {
   adrApproved: boolean;
   branchName: string | null;
   prUrl: string | null;
+  parentFeatureId: string | null;
+  returnReason: FeatureReturnReason | null;
+  returnComment: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -93,6 +109,9 @@ export function toPublicFeature(feature: Feature): PublicFeature {
     adrApproved: feature.adrApproved,
     branchName: feature.branchName,
     prUrl: feature.prUrl,
+    parentFeatureId: feature.parentFeatureId,
+    returnReason: feature.returnReason,
+    returnComment: feature.returnComment,
     createdAt: feature.createdAt.toISOString(),
     updatedAt: feature.updatedAt.toISOString(),
   };

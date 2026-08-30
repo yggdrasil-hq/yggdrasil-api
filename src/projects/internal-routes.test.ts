@@ -7,6 +7,7 @@ import type { Project } from "./types.js";
 function makeProject(overrides: Partial<Project> = {}): Project {
   return {
     id: "proj_1",
+    organizationId: "org_1",
     ownerUserId: "user_1",
     name: "Test",
     slug: "test-slug",
@@ -16,6 +17,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     installationId: null,
     githubAccessWarning: false,
     modelConfigWarning: false,
+    agenticReviewEnabled: true,
     repositories: [],
     createdAt: new Date(),
     updatedAt: new Date(),

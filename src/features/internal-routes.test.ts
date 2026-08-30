@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Feature } from "./types.js";
 import type { Project } from "../projects/types.js";
 import type { GithubInstallation } from "../github/installation-repository.js";
+import type { Test } from "../tests/types.js";
 
 vi.mock("../github/github-api.js", () => ({
   mintInstallationAccessToken: vi.fn(),
@@ -24,6 +25,9 @@ function makeFeature(overrides: Partial<Feature> = {}): Feature {
     adrApproved: false,
     branchName: null,
     prUrl: null,
+    parentFeatureId: null,
+    returnReason: null,
+    returnComment: null,
     createdAt: new Date(),
     updatedAt: new Date(),
     ...overrides,
@@ -33,6 +37,7 @@ function makeFeature(overrides: Partial<Feature> = {}): Feature {
 function makeProject(overrides: Partial<Project> = {}): Project {
   return {
     id: "proj_1",
+    organizationId: "org_1",
     ownerUserId: "user_1",
     name: "Test",
     slug: "test-slug",
@@ -42,6 +47,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     installationId: "install_1",
     githubAccessWarning: false,
     modelConfigWarning: false,
+    agenticReviewEnabled: true,
     repositories: [
       { id: "repo_1", githubOwner: "acme", githubRepo: "web", isPrimary: true, sortOrder: 0 },
       { id: "repo_2", githubOwner: "acme", githubRepo: "worker", isPrimary: false, sortOrder: 1 },
@@ -67,6 +73,21 @@ function makeInstallation(overrides: Partial<GithubInstallation> = {}): GithubIn
   };
 }
 
+function makeTest(overrides: Partial<Test> = {}): Test {
+  return {
+    id: "test_1",
+    projectId: "proj_1",
+    name: "Checkout flow",
+    specMarkdown: "## Checkout\n\nSubmit an order.",
+    scheduleCron: "0 * * * *",
+    enabled: true,
+    lastRunAt: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    ...overrides,
+  };
+}
+
 const PROJECT_ID = "2d88c75e-7ad0-458c-8da5-ce8684ce6fa6";
 const FEATURE_ID = "9f1b6b0e-7a3f-4a3a-8b8e-2e1a6f0c9a11";
 
@@ -74,6 +95,7 @@ function buildApp(deps: {
   features?: { findById: (projectId: string, featureId: string) => Promise<Feature | null> };
   projects?: { findById: (id: string) => Promise<Project | null> };
   installations?: { findById: (id: string) => Promise<GithubInstallation | null> };
+  tests?: { findById: (projectId: string, testId: string) => Promise<Test | null> };
 }) {
   const app = express();
   app.use(express.json());
@@ -83,6 +105,7 @@ function buildApp(deps: {
       features: (deps.features ?? { findById: async () => makeFeature() }) as never,
       projects: (deps.projects ?? { findById: async () => makeProject() }) as never,
       installations: (deps.installations ?? { findById: async () => makeInstallation() }) as never,
+      tests: (deps.tests ?? { findById: async () => makeTest() }) as never,
     }),
   );
   return app;
@@ -184,6 +207,32 @@ describe("GET /internal/projects/:projectId/features/:featureId/spec", () => {
       pull_requests: "write",
       workflows: "write",
     });
+  });
+
+  it("returns a read-scoped feature-ref test payload for test_run", async () => {
+    const testId = "3f4f5e91-8b6f-4d15-a7b2-54ef4b7f1c21";
+    const app = buildApp({
+      tests: { findById: async () => makeTest({ id: testId }) },
+      features: {
+        findById: async () =>
+          makeFeature({ slug: "add-dark-mode", id: FEATURE_ID }),
+      },
+    });
+
+    const res = await request(app)
+      .get(`/internal/projects/${PROJECT_ID}/features/${FEATURE_ID}/spec?kind=test_run&testId=${testId}`)
+      .set("Authorization", "Bearer test-internal-api-token");
+
+    expect(res.status).toBe(200);
+    expect(res.body.testId).toBe(testId);
+    expect(res.body.testMarkdown).toContain("## Checkout");
+    expect(res.body.ref).toBe(`yggdrasil/add-dark-mode-${FEATURE_ID}`);
+    expect(mintInstallationAccessToken).toHaveBeenCalledWith(
+      42,
+      expect.any(String),
+      expect.any(String),
+      { contents: "read" },
+    );
   });
 
   it("omits adrMarkdown/branch for spec_grill (kind omitted or explicit)", async () => {

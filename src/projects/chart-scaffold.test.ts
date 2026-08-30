@@ -14,6 +14,7 @@ const { CHART_TEMPLATE_FILES } = await import("./chart-template.js");
 function makeProject(overrides: Partial<Project> = {}): Project {
   return {
     id: "proj_1",
+    organizationId: "org_1",
     ownerUserId: "user_1",
     name: "Test",
     slug: "test",
@@ -23,6 +24,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     installationId: "inst_1",
     githubAccessWarning: false,
     modelConfigWarning: false,
+    agenticReviewEnabled: true,
     repositories: [
       { id: "repo_1", githubOwner: "acme", githubRepo: "web", isPrimary: true, sortOrder: 0 },
     ],

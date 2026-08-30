@@ -1,15 +1,15 @@
 import { describe, expect, it, vi } from "vitest";
 import { extractModelConfigBundle, resolveModelConfig } from "./model-config.js";
 
-function fakeDeps(projectSecrets: Record<string, string>, userSecrets: Record<string, string>) {
+function fakeDeps(projectSecrets: Record<string, string>, orgSecrets: Record<string, string>) {
   return {
     secrets: {
       decryptAllForProject: vi.fn(async () => ({ ...projectSecrets })),
     },
-    userSecrets: {
-      decryptAllForUser: vi.fn(async () => ({ ...userSecrets })),
+    orgSecrets: {
+      decryptAllForOrganization: vi.fn(async () => ({ ...orgSecrets })),
     },
-  } as never;
+  };
 }
 
 const FULL_BUNDLE = {
@@ -38,15 +38,15 @@ describe("resolveModelConfig", () => {
     const projectBundle = { ...FULL_BUNDLE, MODEL_ID: "project-model" };
     const deps = fakeDeps(projectBundle, FULL_BUNDLE);
 
-    const resolved = await resolveModelConfig(deps, "proj_1", "user_1");
+    const resolved = await resolveModelConfig(deps as never, "proj_1", "org_1");
 
     expect(resolved).toEqual(projectBundle);
   });
 
-  it("falls back to the user's default when the project has none set", async () => {
+  it("falls back to the org's config when the project has none set (ADR 016 item 9)", async () => {
     const deps = fakeDeps({}, FULL_BUNDLE);
 
-    const resolved = await resolveModelConfig(deps, "proj_1", "user_1");
+    const resolved = await resolveModelConfig(deps as never, "proj_1", "org_1");
 
     expect(resolved).toEqual(FULL_BUNDLE);
   });
@@ -54,15 +54,15 @@ describe("resolveModelConfig", () => {
   it("treats a partial project override as unresolvable, not a fallback trigger", async () => {
     const deps = fakeDeps({ MODEL_API_KEY: "sk-partial" }, FULL_BUNDLE);
 
-    const resolved = await resolveModelConfig(deps, "proj_1", "user_1");
+    const resolved = await resolveModelConfig(deps as never, "proj_1", "org_1");
 
     expect(resolved).toBeNull();
   });
 
-  it("returns null when neither the project nor the user default resolves", async () => {
+  it("returns null when neither the project nor the org config resolves", async () => {
     const deps = fakeDeps({}, {});
 
-    const resolved = await resolveModelConfig(deps, "proj_1", "user_1");
+    const resolved = await resolveModelConfig(deps as never, "proj_1", "org_1");
 
     expect(resolved).toBeNull();
   });

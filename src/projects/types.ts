@@ -10,6 +10,9 @@ export interface ProjectRepositoryRecord {
 
 export interface Project {
   id: string;
+  /** The Organization that owns this project (ADR 016 item 4). */
+  organizationId: string;
+  /** The user who created the project — retained as a reference, not an ownership key. */
   ownerUserId: string;
   name: string;
   slug: string;
@@ -19,6 +22,8 @@ export interface Project {
   installationId: string | null;
   githubAccessWarning: boolean;
   modelConfigWarning: boolean;
+  /** ADR 015 item 12: Agentic Review gate per-project, default on. */
+  agenticReviewEnabled: boolean;
   repositories: ProjectRepositoryRecord[];
   createdAt: Date;
   updatedAt: Date;
@@ -40,6 +45,7 @@ export interface PublicProject {
   installationId: string | null;
   githubAccessWarning: boolean;
   modelConfigWarning: boolean;
+  agenticReviewEnabled: boolean;
   repositories: PublicProjectRepository[];
   repositoryRemovalBlockedReason: string | null;
 }
@@ -88,6 +94,7 @@ export function toPublicProject(
     installationId: project.installationId,
     githubAccessWarning: project.githubAccessWarning,
     modelConfigWarning: project.modelConfigWarning,
+    agenticReviewEnabled: project.agenticReviewEnabled,
     repositories: project.repositories.map((repo) => ({
       id: repo.id,
       githubOwner: repo.githubOwner,
@@ -107,8 +114,10 @@ export function getFeatureBucket(
   if (
     status === "queued" ||
     status === "running" ||
+    status === "testing" ||
+    status === "agentic_review" ||
     status === "in_review" ||
-    status === "changes_requested" ||
+    status === "returned" ||
     status === "failed"
   ) {
     return "inProgress";

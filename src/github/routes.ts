@@ -10,12 +10,14 @@ import {
   OAuthStateRepository,
 } from "./oauth.js";
 import { UserRepository } from "../users/repository.js";
+import type { OrganizationRepository } from "../organizations/repository.js";
 
 export function createGitHubRouter(deps: {
   users: UserRepository;
   sessions: SessionService;
   oauthStates: OAuthStateRepository;
   githubTokens: GithubTokenRepository;
+  organizations: OrganizationRepository;
 }): Router {
   const router = Router();
 
@@ -88,6 +90,18 @@ export function createGitHubRouter(deps: {
           displayName: githubUser.name ?? githubUser.login,
           githubId,
           githubLogin: githubUser.login,
+        });
+
+        // ADR 016 item 2: every user gets a personal Organization auto-created
+        // at signup, so a solo/2-10 person user can create a project without
+        // an explicit "create an org" step. Personal orgs are otherwise
+        // unrestricted (others can be invited into them later); the flag only
+        // governs auto-creation and default routing.
+        await deps.organizations.create({
+          name: `${githubUser.name ?? githubUser.login}'s workspace`,
+          description: "",
+          isPersonal: true,
+          creatorUserId: user.id,
         });
       }
 

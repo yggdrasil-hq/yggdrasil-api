@@ -4,6 +4,7 @@ import type { Project, ProjectRepositoryRecord, ProjectStatus } from "./types.js
 
 interface ProjectRow {
   id: string;
+  organization_id: string;
   owner_user_id: string;
   name: string;
   slug: string;
@@ -13,6 +14,7 @@ interface ProjectRow {
   installation_id: string | null;
   github_access_warning: boolean;
   model_config_warning: boolean;
+  agentic_review_enabled: boolean;
   created_at: Date;
   updated_at: Date;
 }
@@ -27,8 +29,9 @@ interface RepositoryRow {
 }
 
 const projectColumns = `
-  id, owner_user_id, name, slug, description, status, settings,
-  installation_id, github_access_warning, model_config_warning, created_at, updated_at
+  id, organization_id, owner_user_id, name, slug, description, status, settings,
+  installation_id, github_access_warning, model_config_warning,
+  agentic_review_enabled, created_at, updated_at
 `;
 
 function mapRepository(row: RepositoryRow): ProjectRepositoryRecord {
@@ -44,6 +47,7 @@ function mapRepository(row: RepositoryRow): ProjectRepositoryRecord {
 function mapProject(row: ProjectRow, repositories: ProjectRepositoryRecord[]): Project {
   return {
     id: row.id,
+    organizationId: row.organization_id,
     ownerUserId: row.owner_user_id,
     name: row.name,
     slug: row.slug,
@@ -53,6 +57,7 @@ function mapProject(row: ProjectRow, repositories: ProjectRepositoryRecord[]): P
     installationId: row.installation_id,
     githubAccessWarning: row.github_access_warning,
     modelConfigWarning: row.model_config_warning,
+    agenticReviewEnabled: row.agentic_review_enabled,
     repositories,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -89,11 +94,26 @@ export class ProjectRepository {
     return mapProject(row, repositories);
   }
 
+  /** The organization that owns a project — used to route per-org config/cluster resolution. */
+  async findOrganizationId(projectId: string): Promise<string | null> {
+    const result = await this.db.query<{ organization_id: string }>(
+      `SELECT organization_id FROM projects WHERE id = $1`,
+      [projectId],
+    );
+    return result.rows[0]?.organization_id ?? null;
+  }
+
+  /**
+   * Finds a project the given user can access, resolved through their org
+   * membership (org-scoped ownership, ADR 016 items 4 & 6). Returns null if
+   * the user belongs to the project's org but isn't a member of it.
+   */
   async findByIdForUser(projectId: string, userId: string): Promise<Project | null> {
     const result = await this.db.query<ProjectRow>(
-      `SELECT ${projectColumns}
-       FROM projects
-       WHERE id = $1 AND owner_user_id = $2`,
+      `SELECT p.${projectColumns}
+       FROM projects p
+       JOIN organization_memberships m ON m.organization_id = p.organization_id
+       WHERE p.id = $1 AND m.user_id = $2`,
       [projectId, userId],
     );
     const row = result.rows[0];
@@ -104,12 +124,14 @@ export class ProjectRepository {
     return mapProject(row, repositories);
   }
 
+  /** Lists every project across all orgs the user belongs to (org-scoped, ADR 016). */
   async listForUser(userId: string): Promise<Project[]> {
     const result = await this.db.query<ProjectRow>(
-      `SELECT ${projectColumns}
-       FROM projects
-       WHERE owner_user_id = $1
-       ORDER BY updated_at DESC`,
+      `SELECT DISTINCT p.${projectColumns}
+       FROM projects p
+       JOIN organization_memberships m ON m.organization_id = p.organization_id
+       WHERE m.user_id = $1
+       ORDER BY p.updated_at DESC`,
       [userId],
     );
 
@@ -121,7 +143,25 @@ export class ProjectRepository {
     return projects;
   }
 
+  /** Lists projects owned by a single org (used to gate project creation on org readiness). */
+  async listForOrganization(organizationId: string): Promise<Project[]> {
+    const result = await this.db.query<ProjectRow>(
+      `SELECT ${projectColumns}
+       FROM projects
+       WHERE organization_id = $1
+       ORDER BY updated_at DESC`,
+      [organizationId],
+    );
+    const projects: Project[] = [];
+    for (const row of result.rows) {
+      const repositories = await this.loadRepositories(row.id);
+      projects.push(mapProject(row, repositories));
+    }
+    return projects;
+  }
+
   async create(input: {
+    organizationId: string;
     ownerUserId: string;
     name: string;
     description: string;
@@ -139,18 +179,25 @@ export class ProjectRepository {
       const slug = await uniqueSlug(input.name, async (candidate) => {
         const existing = await client.query<{ exists: boolean }>(
           `SELECT EXISTS(
-             SELECT 1 FROM projects WHERE owner_user_id = $1 AND slug = $2
+             SELECT 1 FROM projects WHERE organization_id = $1 AND slug = $2
            ) AS exists`,
-          [input.ownerUserId, candidate],
+          [input.organizationId, candidate],
         );
         return existing.rows[0]?.exists ?? false;
       });
 
       const projectResult = await client.query<ProjectRow>(
-        `INSERT INTO projects (owner_user_id, name, slug, description, status, installation_id)
-         VALUES ($1, $2, $3, $4, 'initializing', $5)
+        `INSERT INTO projects (organization_id, owner_user_id, name, slug, description, status, installation_id)
+         VALUES ($1, $2, $3, $4, $5, 'initializing', $6)
          RETURNING ${projectColumns}`,
-        [input.ownerUserId, input.name, slug, input.description, input.installationId],
+        [
+          input.organizationId,
+          input.ownerUserId,
+          input.name,
+          slug,
+          input.description,
+          input.installationId,
+        ],
       );
       const projectRow = projectResult.rows[0];
 
@@ -197,11 +244,19 @@ export class ProjectRepository {
     );
   }
 
-  /** Cleared the next time resolution succeeds for this project (ADR 007). */
+  /** Clear a project's model-config warning the next time resolution succeeds (ADR 016). */
   async clearModelConfigWarning(projectId: string): Promise<void> {
     await this.db.query(
       `UPDATE projects SET model_config_warning = FALSE, updated_at = NOW() WHERE id = $1`,
       [projectId],
+    );
+  }
+
+  /** ADR 015 item 12: per-project Agentic Review gate. */
+  async setAgenticReviewEnabled(projectId: string, enabled: boolean): Promise<void> {
+    await this.db.query(
+      `UPDATE projects SET agentic_review_enabled = $2, updated_at = NOW() WHERE id = $1`,
+      [projectId, enabled],
     );
   }
 
@@ -323,12 +378,12 @@ export class ProjectRepository {
     );
   }
 
-  async isSlugTaken(ownerUserId: string, slug: string): Promise<boolean> {
+  async isSlugTaken(organizationId: string, slug: string): Promise<boolean> {
     const result = await this.db.query<{ exists: boolean }>(
       `SELECT EXISTS(
-         SELECT 1 FROM projects WHERE owner_user_id = $1 AND slug = $2
+         SELECT 1 FROM projects WHERE organization_id = $1 AND slug = $2
        ) AS exists`,
-      [ownerUserId, slug],
+      [organizationId, slug],
     );
     return result.rows[0]?.exists ?? false;
   }

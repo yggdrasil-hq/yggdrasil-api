@@ -115,9 +115,20 @@ function buildActionQueue(
       continue;
     }
 
-    if (feature.status === "changes_requested") {
+    if (feature.status === "returned") {
       items.push({
         type: "changes_requested",
+        featureId: feature.id,
+        title: feature.title,
+        waitingSince: feature.updatedAt.toISOString(),
+        linkPath: basePath,
+      });
+      continue;
+    }
+
+    if (feature.status === "testing") {
+      items.push({
+        type: "test_failure",
         featureId: feature.id,
         title: feature.title,
         waitingSince: feature.updatedAt.toISOString(),

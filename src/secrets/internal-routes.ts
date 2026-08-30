@@ -4,7 +4,7 @@ import { routeParam } from "../shared/route-param.js";
 import { requireInternalApiToken } from "./internal-auth.js";
 import { MODEL_CONFIG_KEYS, resolveModelConfig } from "./model-config.js";
 import type { SecretRepository } from "./repository.js";
-import type { UserSecretRepository } from "./user-repository.js";
+import type { OrgSecretRepository } from "../organizations/org-secrets-repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
 
 /**
@@ -14,7 +14,7 @@ import type { ProjectRepository } from "../projects/repository.js";
  */
 export function createSecretsInternalRouter(deps: {
   secrets: SecretRepository;
-  userSecrets: UserSecretRepository;
+  orgSecrets: OrgSecretRepository;
   projects: ProjectRepository;
 }): Router {
   const router = Router();
@@ -37,9 +37,10 @@ export function createSecretsInternalRouter(deps: {
 
       const secrets = await deps.secrets.decryptAllForProject(projectId);
 
-      // Model config resolves live (project bundle, else the owning user's
-      // default — ADR 007), merged over any other arbitrary project secret.
-      const modelConfig = await resolveModelConfig(deps, projectId, project.ownerUserId);
+      // Model config resolves live (project bundle, else the owning
+      // Organization's config — ADR 016 items 8-9), merged over any other
+      // arbitrary project secret.
+      const modelConfig = await resolveModelConfig(deps, projectId, project.organizationId);
       if (modelConfig) {
         for (const key of MODEL_CONFIG_KEYS) {
           secrets[key] = modelConfig[key];

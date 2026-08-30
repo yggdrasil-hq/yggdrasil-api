@@ -8,7 +8,11 @@ export type JobEventType =
   | "run_cancelled"
   | "user_message"
   | "submit_build_result"
-  | "run_started";
+  | "run_started"
+  | "request_action_item"
+  | "submit_review"
+  | "report_test_step"
+  | "submit_test_report";
 
 export interface JobEvent {
   id: string;

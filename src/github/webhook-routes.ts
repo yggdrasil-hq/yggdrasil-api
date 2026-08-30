@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { Router, type Request } from "express";
 import express from "express";
 import { config, isGitHubAppConfigured } from "../config.js";
+import type { FeatureActionItemRepository } from "../features/action-items-repository.js";
 import type { FeatureRepository } from "../features/repository.js";
 import { dispatchJob } from "../jobs/dispatch.js";
 import type { JobRepository } from "../jobs/repository.js";
@@ -98,7 +99,12 @@ export async function handlePushEvent(
  */
 export async function handlePullRequestEvent(
   payload: PullRequestWebhookPayload,
-  deps: { features: FeatureRepository; projects: ProjectRepository; jobs: JobRepository },
+  deps: {
+    features: FeatureRepository;
+    projects: ProjectRepository;
+    jobs: JobRepository;
+    actionItems?: FeatureActionItemRepository;
+  },
 ): Promise<void> {
   if (payload.action !== "closed" || !payload.pull_request.merged) {
     return;
@@ -108,6 +114,12 @@ export async function handlePullRequestEvent(
     return;
   }
   await deps.features.updateStatus(feature.id, "merged");
+
+  // ADR 015 item 5: a blocking subtask feature's parent Action Item resolves
+  // the moment the subtask reaches `merged` (not merely approved).
+  if (feature.parentFeatureId && deps.actionItems) {
+    await deps.actionItems.resolveSubtaskItem(feature.id);
+  }
 
   // Mirrors POST /:projectId/complete-init (routes.ts) — a project_init
   // feature merging is what completes project setup, and until now that
@@ -129,10 +141,12 @@ export async function handlePullRequestEvent(
 }
 
 /**
- * Moves a feature `in_review -> changes_requested` when a reviewer
- * requests changes on its tracked PR (ADR 013). Only fires from
- * `in_review`: a stale/duplicate review event shouldn't clobber a status
- * that has already moved on (e.g. `merged`, `queued` from a re-run).
+ * Moves a feature `in_review -> returned` when a human reviewer requests
+ * changes on its tracked PR (ADR 015 item 17 — `changes_requested` became the
+ * unified `returned` state with reason `human_review`, superseding ADR 013).
+ * Only fires from `in_review`: a stale/duplicate review event shouldn't
+ * clobber a status that has already moved on (e.g. `merged`, `queued` from a
+ * re-run).
  */
 export async function handlePullRequestReviewEvent(
   payload: PullRequestReviewWebhookPayload,
@@ -145,7 +159,7 @@ export async function handlePullRequestReviewEvent(
   if (!feature || feature.status !== "in_review") {
     return;
   }
-  await deps.features.updateStatus(feature.id, "changes_requested");
+  await deps.features.setReturned(feature.id, "human_review", "Changes requested on the PR");
 }
 
 export function createGitHubWebhookRouter(deps: {
@@ -153,6 +167,7 @@ export function createGitHubWebhookRouter(deps: {
   projects: ProjectRepository;
   jobs: JobRepository;
   features: FeatureRepository;
+  actionItems: FeatureActionItemRepository;
 }): Router {
   const router = Router();
 

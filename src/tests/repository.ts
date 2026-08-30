@@ -46,6 +46,17 @@ export class TestRepository {
     return result.rows.map(mapTest);
   }
 
+  async listEnabledByProject(projectId: string): Promise<Test[]> {
+    const result = await this.db.query<TestRow>(
+      `SELECT ${testColumns}
+       FROM tests
+       WHERE project_id = $1 AND enabled = TRUE
+       ORDER BY name ASC`,
+      [projectId],
+    );
+    return result.rows.map(mapTest);
+  }
+
   async findById(projectId: string, testId: string): Promise<Test | null> {
     const result = await this.db.query<TestRow>(
       `SELECT ${testColumns}

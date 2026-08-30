@@ -10,8 +10,12 @@ import type { JobMessageRepository } from "../jobs/messages-repository.js";
 import type { NotificationRepository } from "../notifications/repository.js";
 import { UserRepository } from "../users/repository.js";
 import type { FeatureRepository } from "../features/repository.js";
+import type { FeatureActionItemRepository } from "../features/action-items-repository.js";
+import { toPublicActionItem } from "../features/action-items-types.js";
 import { toPublicFeature } from "../features/types.js";
 import type { TestRepository } from "../tests/repository.js";
+import type { TestRunReportRepository } from "../tests/reports-repository.js";
+import { toPublicTestRunExecution } from "../tests/report-types.js";
 import {
   isValidCronExpression,
   meetsMinimumInterval,
@@ -29,7 +33,8 @@ import type { GithubInstallationRepository } from "../github/installation-reposi
 import { MODEL_CONFIG_KEYS, resolveModelConfig } from "../secrets/model-config.js";
 import type { ModelConfigBundle } from "../secrets/model-config.js";
 import type { SecretRepository } from "../secrets/repository.js";
-import type { UserSecretRepository } from "../secrets/user-repository.js";
+import type { OrgSecretRepository } from "../organizations/org-secrets-repository.js";
+import type { OrganizationRepository } from "../organizations/repository.js";
 
 function parseBody<T>(schema: z.ZodType<T>, body: unknown):
   | { success: true; data: T }
@@ -57,6 +62,10 @@ const createProjectSchema = z.object({
   name: z.string().trim().min(1).max(128),
   description: z.string().max(2000).optional().default(""),
   installationId: z.string().uuid(),
+  // The org to create the project under (ADR 016 items 4 & 6). Optional in
+  // the API so existing clients work; defaults to the caller's personal org.
+  // A5's org switcher will pass the active org explicitly.
+  organizationId: z.string().uuid().optional(),
   repositories: z.array(repositorySchema).min(1),
   modelConfig: modelConfigBundleSchema.optional(),
   saveModelConfigAsDefault: z.boolean().optional().default(false),
@@ -129,14 +138,17 @@ export function createProjectsRouter(deps: {
   sessions: SessionService;
   projects: ProjectRepository;
   features: FeatureRepository;
+  actionItems: FeatureActionItemRepository;
   tests: TestRepository;
+  testRunReports: TestRunReportRepository;
   jobs: JobRepository;
   jobEvents: JobEventRepository;
   jobMessages: JobMessageRepository;
   notifications: NotificationRepository;
   installations: GithubInstallationRepository;
   secrets: SecretRepository;
-  userSecrets: UserSecretRepository;
+  orgSecrets: OrgSecretRepository;
+  organizations: OrganizationRepository;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -203,12 +215,83 @@ export function createProjectsRouter(deps: {
    * prerequisites.
    */
   async function assertModelConfigResolvable(project: Project): Promise<string | null> {
-    const resolved = await resolveModelConfig(deps, project.id, project.ownerUserId);
+    const resolved = await resolveModelConfig(deps, project.id, project.organizationId);
     if (resolved) {
       return null;
     }
-    return "No model configuration is set for this project or your account default. " +
-      "Set one in Account settings, or configure this project directly on its settings page.";
+    return "No model configuration is set for this project or its organization. " +
+      "Set one in Organization settings, or configure this project directly on its settings page.";
+  }
+
+  /**
+   * Resolves which Organization a new project belongs to (ADR 016 items 2, 4
+   * & 6): the caller's chosen org if provided and they're a member, else
+   * their personal org. Returns an error message on failure.
+   */
+  async function resolveOrgForProject(
+    userId: string,
+    requestedOrgId?: string,
+  ): Promise<{ org: { id: string; status: string; role: string } } | { error: string }> {
+    let orgId = requestedOrgId;
+    let org = orgId ? await deps.organizations.findById(orgId) : null;
+
+    if (!org) {
+      const personal = await deps.organizations.findPersonalByUser(userId);
+      if (personal) {
+        org = personal;
+        orgId = personal.id;
+      }
+    }
+    if (!org) {
+      return { error: "No organization found for project creation." };
+    }
+
+    const role = await deps.organizations.roleForUser(org.id, userId);
+    if (!role) {
+      return { error: "You are not a member of this organization." };
+    }
+    return { org: { id: org.id, status: org.status, role } };
+  }
+
+  /**
+   * Hard gate on project creation (ADR 016 items 11-13): every Organization
+   * must explicitly configure its own Kubernetes cluster before it can do
+   * anything else — there is no platform-default cluster. Blocks on the
+   * owning org's readiness, not a personal-org assumption.
+   */
+  function assertClusterGate(orgStatus: string): string | null {
+    if (orgStatus !== "ready") {
+      return "Configure a Kubernetes cluster in your organization settings before creating a project.";
+    }
+    return null;
+  }
+
+  /**
+   * Role-based authorization (ADR 016 item 6-7): checks the caller's role in
+   * the project's owning org against the adjustable capability matrix. A
+   * role with `full` or `partial` for a capability may perform the action;
+   * `none` (or a non-member) is denied. The matrix is seed data, so this is
+   * data-driven — no per-role branches in application logic.
+   */
+  async function assertCapabilityForProject(
+    req: Parameters<typeof requireAuth>[0],
+    project: Project,
+    capability: string,
+  ): Promise<string | null> {
+    const user = req.currentUser;
+    if (!user) {
+      return "Unauthorized";
+    }
+    const role = await deps.organizations.roleForUser(project.organizationId, user.id);
+    if (!role) {
+      return "You are not a member of this project's organization";
+    }
+    const matrix = await deps.organizations.listRoleCapabilities();
+    const grant = matrix.find((c) => c.role === role && c.capability === capability);
+    if (!grant || grant.level === "none") {
+      return "Your role does not have permission to do this";
+    }
+    return null;
   }
 
   router.get("/", requireAuth, async (req, res) => {
@@ -229,6 +312,19 @@ export function createProjectsRouter(deps: {
 
     const user = req.currentUser!;
 
+    const orgResolution = await resolveOrgForProject(user.id, parsed.data.organizationId);
+    if ("error" in orgResolution) {
+      res.status(400).json({ error: orgResolution.error });
+      return;
+    }
+    const { org } = orgResolution;
+
+    const clusterGateError = assertClusterGate(org.status);
+    if (clusterGateError) {
+      res.status(400).json({ error: clusterGateError });
+      return;
+    }
+
     const installationError = await assertInstallationReady(parsed.data.installationId);
     if (installationError) {
       res.status(400).json({ error: installationError });
@@ -244,29 +340,31 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    // Resolve model config before creating anything (ADR 007): a request
-    // bundle wins, else fall back to the user's account default.
+    // Resolve model config before creating anything (ADR 016 items 8-9): a
+    // request bundle wins, else the project inherits its org's config. There
+    // is no per-user default anymore (ADR 007 retired).
     const requestedModelConfig = parsed.data.modelConfig
       ? toModelConfigBundle(parsed.data.modelConfig)
       : null;
     let effectiveModelConfig = requestedModelConfig;
     if (!effectiveModelConfig) {
-      const userSecrets = await deps.userSecrets.decryptAllForUser(user.id);
-      effectiveModelConfig = MODEL_CONFIG_KEYS.every((key) => userSecrets[key])
+      const orgSecrets = await deps.orgSecrets.decryptAllForOrganization(org.id);
+      effectiveModelConfig = MODEL_CONFIG_KEYS.every((key) => orgSecrets[key])
         ? (Object.fromEntries(
-            MODEL_CONFIG_KEYS.map((key) => [key, userSecrets[key]]),
+            MODEL_CONFIG_KEYS.map((key) => [key, orgSecrets[key]]),
           ) as ModelConfigBundle)
         : null;
     }
     if (!effectiveModelConfig) {
       res.status(400).json({
         error:
-          "Set a default model configuration in Account settings, or provide one for this project.",
+          "Set a default model configuration in Organization settings, or provide one for this project.",
       });
       return;
     }
 
     const project = await deps.projects.create({
+      organizationId: org.id,
       ownerUserId: user.id,
       name: parsed.data.name,
       description: parsed.data.description,
@@ -277,11 +375,6 @@ export function createProjectsRouter(deps: {
     if (requestedModelConfig) {
       for (const key of MODEL_CONFIG_KEYS) {
         await deps.secrets.upsert(project.id, key, requestedModelConfig[key]);
-      }
-      if (parsed.data.saveModelConfigAsDefault) {
-        for (const key of MODEL_CONFIG_KEYS) {
-          await deps.userSecrets.upsert(user.id, key, requestedModelConfig[key]);
-        }
       }
     }
 
@@ -539,6 +632,42 @@ export function createProjectsRouter(deps: {
     res.status(201).json({});
   });
 
+  // ADR 015 item 12 / Track B6: per-project Agentic Review gate, default on.
+  // Exposes the `projects.agentic_review_enabled` column that the model and
+  // repository already plumbed but no route surfaced — without this the
+  // toggle is dead data. Only the boolean flips; the workspace PR/capsule is
+  // untouched.
+  router.patch("/:projectId", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const parsed = parseBody(
+      z.object({
+        agenticReviewEnabled: z.boolean(),
+      }),
+      req.body,
+    );
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    await deps.projects.setAgenticReviewEnabled(
+      project.id,
+      parsed.data.agenticReviewEnabled,
+    );
+
+    const updated = await deps.projects.findByIdForUser(project.id, req.currentUser!.id);
+    if (!updated) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    res.json(await toPublicProjectWithRemovalMeta(updated));
+  });
+
   router.get("/:projectId/overview", requireAuth, async (req, res) => {
     const project = await getOwnedProject(req, routeParam(req.params.projectId));
     if (!project) {
@@ -602,6 +731,12 @@ export function createProjectsRouter(deps: {
       return;
     }
 
+    const capabilityError = await assertCapabilityForProject(req, project, "manage_features");
+    if (capabilityError) {
+      res.status(403).json({ error: capabilityError });
+      return;
+    }
+
     const feature = await deps.features.create({
       projectId: project.id,
       title: parsed.data.title,
@@ -645,6 +780,30 @@ export function createProjectsRouter(deps: {
     }
 
     res.json(toPublicFeature(feature));
+  });
+
+  router.get("/:projectId/features/:featureId/testing", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const featureId = parseFeatureId(routeParam(req.params.featureId));
+    if (!featureId) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+    const feature = await deps.features.findById(project.id, featureId);
+    if (!feature) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+    const reports = await deps.testRunReports.listByFeature(feature.id);
+    res.json({
+      featureId: feature.id,
+      status: feature.status,
+      runs: reports.map(toPublicTestRunExecution),
+    });
   });
 
   router.patch("/:projectId/features/:featureId", requireAuth, async (req, res) => {
@@ -703,6 +862,16 @@ export function createProjectsRouter(deps: {
     if (parsed.data.startBuild) {
       if (feature.status !== "spec_ready" || !feature.adrApproved) {
         res.status(409).json({ error: "Approve the ADR before starting build" });
+        return;
+      }
+
+      // ADR 015 item 2: "Start build" stays disabled until every Action Item
+      // on the current batch is resolved.
+      const openItems = await deps.actionItems.countOpenForFeature(feature.id);
+      if (openItems > 0) {
+        res.status(409).json({
+          error: `${openItems} Action Item${openItems === 1 ? "" : "s"} must be resolved before starting build`,
+        });
         return;
       }
 
@@ -948,6 +1117,163 @@ export function createProjectsRouter(deps: {
       res.status(201).json({});
     },
   );
+
+  // --- Feature Action Items (ADR 015 items 4-6) ---
+
+  router.get("/:projectId/features/:featureId/action-items", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const featureId = parseFeatureId(routeParam(req.params.featureId));
+    if (!featureId) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+    const items = await deps.actionItems.listForFeature(featureId);
+    res.json(items.map(toPublicActionItem));
+  });
+
+  // Human-supervised resolution (ADR 015 item 5): the caller confirms a
+  // target is met (e.g. a blocking subtask reached merged, a test was
+  // created) — the mechanical auto-resolution paths (secret polling etc.)
+  // happen server-side alongside job dispatch.
+  router.post(
+    "/:projectId/features/:featureId/action-items/:itemId/resolve",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      const itemId = routeParam(req.params.itemId);
+      if (!featureId || !isUuid(itemId)) {
+        res.status(404).json({ error: "Action item not found" });
+        return;
+      }
+      const item = await deps.actionItems.findById(featureId, itemId);
+      if (!item) {
+        res.status(404).json({ error: "Action item not found" });
+        return;
+      }
+      await deps.actionItems.resolve(itemId);
+      res.status(200).json({ ok: true });
+    },
+  );
+
+  // ADR 015 item 5: env-var/secret requests auto-resolve by polling whether
+  // the named key now exists in project_secrets — no manual "mark resolved"
+  // step. The Web page calls this (or a server-side job-site hook does) to
+  // sweep the feature's open secret_request items.
+  router.post(
+    "/:projectId/features/:featureId/action-items/auto-resolve",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      if (!featureId) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+      const items = await deps.actionItems.listForFeature(featureId);
+      const projectSecrets = await deps.secrets.decryptAllForProject(project.id);
+      let resolved = 0;
+      for (const item of items) {
+        if (item.status === "open" && item.type === "secret_request" && item.secretKey) {
+          if (Object.prototype.hasOwnProperty.call(projectSecrets, item.secretKey)) {
+            await deps.actionItems.resolve(item.id);
+            resolved += 1;
+          }
+        }
+      }
+      res.status(200).json({ resolved, remainingOpen: await deps.actionItems.countOpenForFeature(featureId) });
+    },
+  );
+
+  // ADR 015 item 5: "new blocking subtask feature" — auto-creates a real,
+  // parented Feature that runs the normal full lifecycle. The parent's
+  // Action Item resolves only when the subtask reaches `merged` (handled in
+  // the PR-merge webhook path, github/webhook-routes.ts).
+  router.post(
+    "/:projectId/features/:featureId/action-items/:itemId/subtask",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      const itemId = routeParam(req.params.itemId);
+      if (!featureId || !isUuid(itemId)) {
+        res.status(404).json({ error: "Action item not found" });
+        return;
+      }
+      const item = await deps.actionItems.findById(featureId, itemId);
+      if (!item || item.type !== "subtask_feature") {
+        res.status(400).json({ error: "Item is not a subtask-feature action item" });
+        return;
+      }
+      const parsed = z.object({ title: z.string().trim().min(1).max(256) }).safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
+        return;
+      }
+      const subtask = await deps.features.createSubtask({
+        projectId: project.id,
+        parentFeatureId: featureId,
+        title: parsed.data.title,
+      });
+      res.status(201).json(toPublicFeature(subtask));
+    },
+  );
+
+  // ADR 015 item 18: `returned` requires an explicit human "Resume
+  // implementation" click to redispatch feature_build (landing back in
+  // `queued`). No unattended auto-retry.
+  router.post("/:projectId/features/:featureId/resume", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const featureId = parseFeatureId(routeParam(req.params.featureId));
+    if (!featureId) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+
+    const accessError = assertGitHubAccess(project);
+    if (accessError) {
+      res.status(409).json({ error: accessError });
+      return;
+    }
+    const modelConfigError = await assertModelConfigResolvable(project);
+    if (modelConfigError) {
+      res.status(400).json({ error: modelConfigError });
+      return;
+    }
+
+    const updated = await deps.features.resumeImplementation(featureId);
+    if (!updated) {
+      res.status(409).json({ error: "Feature is not in a resumable state" });
+      return;
+    }
+
+    await dispatchJob(deps.jobs, {
+      projectId: project.id,
+      kind: "feature_build",
+      featureId: updated.id,
+    });
+    res.status(201).json(toPublicFeature(updated));
+  });
 
   // Reads a feature's most recent job's curated event history (ADR 006
   // item 8's read side, widened to feature_build by ADR 010) — the Web app

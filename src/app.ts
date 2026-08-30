@@ -4,6 +4,7 @@ import type pg from "pg";
 import { createAuthRouter, createSettingsRouter } from "./auth/routes.js";
 import { SessionService } from "./auth/sessions.js";
 import { FeatureRepository } from "./features/repository.js";
+import { FeatureActionItemRepository } from "./features/action-items-repository.js";
 import { createFeaturesInternalRouter } from "./features/internal-routes.js";
 import { createGitHubRouter } from "./github/routes.js";
 import { createGitHubAppRouter } from "./github/install-routes.js";
@@ -25,9 +26,13 @@ import { createProjectsInternalRouter } from "./projects/internal-routes.js";
 import { SecretRepository } from "./secrets/repository.js";
 import { createSecretsRouter } from "./secrets/routes.js";
 import { createSecretsInternalRouter } from "./secrets/internal-routes.js";
-import { UserSecretRepository } from "./secrets/user-repository.js";
-import { createUserSecretsRouter } from "./secrets/user-routes.js";
+import { OrgSecretRepository } from "./organizations/org-secrets-repository.js";
+import { OrganizationRepository } from "./organizations/repository.js";
+import { OrganizationClusterRepository } from "./organizations/cluster-repository.js";
+import { createOrganizationsRouter } from "./organizations/routes.js";
+import { createOrganizationsInternalRouter } from "./organizations/internal-routes.js";
 import { TestRepository } from "./tests/repository.js";
+import { TestRunReportRepository } from "./tests/reports-repository.js";
 import { UserRepository } from "./users/repository.js";
 
 export interface AppDependencies {
@@ -52,7 +57,17 @@ export function createApp(deps?: AppDependencies): Express {
   const projects = new ProjectRepository(deps.pool);
   const jobs = new JobRepository(deps.pool);
   const features = new FeatureRepository(deps.pool);
-  app.use("/webhooks", createGitHubWebhookRouter({ installations, projects, jobs, features }));
+  const featureActionItems = new FeatureActionItemRepository(deps.pool);
+  app.use(
+    "/webhooks",
+    createGitHubWebhookRouter({
+      installations,
+      projects,
+      jobs,
+      features,
+      actionItems: featureActionItems,
+    }),
+  );
 
   app.use(express.json());
 
@@ -63,16 +78,25 @@ export function createApp(deps?: AppDependencies): Express {
   const oauthStates = new OAuthStateRepository(deps.pool);
   const installStates = new InstallStateRepository(deps.pool);
   const tests = new TestRepository(deps.pool);
+  const testRunReports = new TestRunReportRepository(deps.pool);
   const notifications = new NotificationRepository(deps.pool);
   const secrets = new SecretRepository(deps.pool);
-  const userSecrets = new UserSecretRepository(deps.pool);
+  const orgSecrets = new OrgSecretRepository(deps.pool);
   const jobEvents = new JobEventRepository(deps.pool);
   const jobMessages = new JobMessageRepository(deps.pool);
+  const organizations = new OrganizationRepository(deps.pool);
+  const orgClusters = new OrganizationClusterRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions }));
-  app.use("/auth", createGitHubRouter({ users, sessions, oauthStates, githubTokens }));
+  app.use(
+    "/auth",
+    createGitHubRouter({ users, sessions, oauthStates, githubTokens, organizations }),
+  );
   app.use("/settings", createSettingsRouter({ users, sessions }));
-  app.use("/settings", createUserSecretsRouter({ users, sessions, userSecrets }));
+  app.use(
+    "/organizations",
+    createOrganizationsRouter({ users, sessions, organizations, clusters: orgClusters, orgSecrets }),
+  );
   app.use(
     "/github",
     createGitHubAppRouter({
@@ -91,14 +115,17 @@ export function createApp(deps?: AppDependencies): Express {
       sessions,
       projects,
       features,
+      actionItems: featureActionItems,
       tests,
+      testRunReports,
       jobs,
       jobEvents,
       jobMessages,
       notifications,
       installations,
       secrets,
-      userSecrets,
+      orgSecrets,
+      organizations,
     }),
   );
   app.use(
@@ -107,12 +134,30 @@ export function createApp(deps?: AppDependencies): Express {
   );
   app.use(
     "/projects",
-    createSecretsRouter({ users, sessions, projects, secrets, userSecrets }),
+    createSecretsRouter({ users, sessions, projects, secrets, orgSecrets }),
   );
-  app.use("/internal", createSecretsInternalRouter({ secrets, userSecrets, projects }));
+  app.use("/internal", createSecretsInternalRouter({ secrets, orgSecrets, projects }));
+  app.use(
+    "/internal",
+    createOrganizationsInternalRouter({ projects, clusters: orgClusters }),
+  );
   app.use("/internal", createProjectsInternalRouter({ projects, installations }));
-  app.use("/internal", createFeaturesInternalRouter({ features, projects, installations }));
-  app.use("/internal", createJobsInternalRouter({ jobEvents, jobs, features }));
+  app.use(
+    "/internal",
+    createFeaturesInternalRouter({ features, projects, installations, tests }),
+  );
+  app.use(
+    "/internal",
+    createJobsInternalRouter({
+      jobEvents,
+      jobs,
+      features,
+      actionItems: featureActionItems,
+      tests,
+      testRunReports,
+      projects,
+    }),
+  );
 
   app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     console.error(err);

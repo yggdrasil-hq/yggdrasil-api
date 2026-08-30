@@ -11,6 +11,8 @@ export async function dispatchJob(
     kind: JobKind;
     featureId?: string;
     testId?: string;
+    ref?: string;
+    trigger?: "feature" | "schedule";
   },
 ) {
   return jobs.create(input);

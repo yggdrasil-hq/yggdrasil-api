@@ -28,6 +28,8 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     kind: "spec_grill",
     featureId: "feature_1",
     testId: null,
+    ref: null,
+    trigger: null,
     status: "running",
     lastError: null,
     createdAt: new Date(),
@@ -51,20 +53,69 @@ type CreateInput = {
 function buildApp(deps: {
   create?: (input: CreateInput) => Promise<JobEvent>;
   findById?: (jobId: string) => Promise<Job | null>;
+  jobsCreate?: ReturnType<typeof vi.fn>;
   setAwaitingUserInput?: (featureId: string, awaiting: boolean) => Promise<null>;
   setSpecReady?: (featureId: string, adrMarkdown: string) => Promise<null>;
   updateStatus?: (featureId: string, status: string) => Promise<null>;
   setInReview?: (featureId: string, prUrl: string) => Promise<null>;
   setRunning?: (featureId: string) => Promise<null>;
+  setTesting?: (featureId: string) => Promise<null>;
+  createManyActionItems?: ReturnType<typeof vi.fn>;
+  createActionItemRow?: ReturnType<typeof vi.fn>;
+  clearForFeatureActionItems?: ReturnType<typeof vi.fn>;
+  approveReview?: (featureId: string) => Promise<null>;
+  setReturned?: (featureId: string, reason: string, comment: string) => Promise<null>;
+  listEnabledTests?: ReturnType<typeof vi.fn>;
+  hasActiveFeatureTestRuns?: ReturnType<typeof vi.fn>;
+  listFeatureTestRuns?: ReturnType<typeof vi.fn>;
+  upsertStep?: ReturnType<typeof vi.fn>;
+  upsertReport?: ReturnType<typeof vi.fn>;
+  findReport?: ReturnType<typeof vi.fn>;
+  projectFindById?: ReturnType<typeof vi.fn>;
 }) {
   const create: (input: CreateInput) => Promise<JobEvent> =
     deps.create ?? (async (input) => makeEvent({ jobId: input.jobId, type: input.type }));
   const findById = deps.findById ?? (async (jobId: string) => makeJob({ id: jobId }));
   const setAwaitingUserInput = deps.setAwaitingUserInput ?? (async () => null);
   const setSpecReady = deps.setSpecReady ?? (async () => null);
+  const findFeature = async () => ({
+    id: "feature_42",
+    projectId: "project_1",
+    slug: "feature",
+    title: "Feature",
+    featureType: "normal",
+    status: "running",
+    branchName: null,
+    adrMarkdown: null,
+    awaitingUserInput: false,
+    adrApproved: true,
+    prUrl: null,
+    parentFeatureId: null,
+    returnReason: null,
+    returnComment: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
   const updateStatus = deps.updateStatus ?? (async () => null);
   const setInReview = deps.setInReview ?? (async () => null);
   const setRunning = deps.setRunning ?? (async () => null);
+  const setTesting = deps.setTesting ?? (async () => null);
+  const approveReview = deps.approveReview ?? (async () => null);
+  const setReturned = deps.setReturned ?? (async () => null);
+  const listEnabledTests = deps.listEnabledTests ?? vi.fn(async () => []);
+  const hasActiveFeatureTestRuns = deps.hasActiveFeatureTestRuns ?? vi.fn(async () => false);
+  const listFeatureTestRuns = deps.listFeatureTestRuns ?? vi.fn(async () => []);
+  const upsertStep = deps.upsertStep ?? vi.fn(async () => undefined);
+  const upsertReport = deps.upsertReport ?? vi.fn(async () => undefined);
+  const findReport = deps.findReport ?? vi.fn(async () => null);
+  const projectFindById =
+    deps.projectFindById ?? vi.fn(async () => ({ agenticReviewEnabled: false }));
+  const createManyActionItems =
+    deps.createManyActionItems ?? (async () => []);
+  const createActionItemRow =
+    deps.createActionItemRow ?? (async (featureId: string, item: unknown) => item);
+  const clearForFeatureActionItems =
+    deps.clearForFeatureActionItems ?? (async () => undefined);
 
   const app = express();
   app.use(express.json());
@@ -72,8 +123,12 @@ function buildApp(deps: {
     "/internal",
     createJobsInternalRouter({
       jobEvents: { create } as never,
-      jobs: { findById } as never,
-      features: { setAwaitingUserInput, setSpecReady, updateStatus, setInReview, setRunning } as never,
+      jobs: { findById, create: deps.jobsCreate ?? (async () => ({ id: "kick_grill" })), hasActiveFeatureTestRuns, listFeatureTestRuns } as never,
+      features: { findById: findFeature, setAwaitingUserInput, setSpecReady, updateStatus, setInReview, setRunning, setTesting, setAgenticReview: async () => null, approveReview, setReturned } as never,
+      actionItems: { createMany: createManyActionItems, create: createActionItemRow, clearForFeature: clearForFeatureActionItems } as never,
+      tests: { listEnabledByProject: listEnabledTests } as never,
+      testRunReports: { upsertStep, upsertReport, findByJob: findReport } as never,
+      projects: { findById: projectFindById } as never,
     }),
   );
   return app;
@@ -110,6 +165,92 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .send({ type: "submit_adr", markdown: "# ADR 1" });
 
     expect(res.status).toBe(201);
+  });
+
+  it("creates Action Items when submit_adr carries an actionItems batch (ADR 015 item 4)", async () => {
+    const createMany = vi.fn(async () => []);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42", kind: "spec_grill" }),
+      createManyActionItems: createMany,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "submit_adr",
+        markdown: "# ADR 1",
+        actionItems: [
+          { type: "secret_request", description: "Need an API key", secretKey: "STRIPE_API_KEY" },
+          { type: "test_request", description: "Add unit tests", draftTestMarkdown: "# Test plan" },
+        ],
+      });
+
+    expect(res.status).toBe(201);
+    expect(createMany).toHaveBeenCalledWith(
+      "feature_42",
+      expect.arrayContaining([
+        expect.objectContaining({ type: "secret_request", secretKey: "STRIPE_API_KEY" }),
+        expect.objectContaining({ type: "test_request", draftTestMarkdown: "# Test plan" }),
+      ]),
+    );
+  });
+
+  it("kicks a blocked build back to draft and dispatches a fresh spec_grill (ADR 015 item 8)", async () => {
+    const updateStatus = vi.fn(async () => null);
+    const clearForFeature = vi.fn(async () => undefined);
+    const jobsCreate = vi.fn(async () => ({ id: "kick_grill" }));
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42", projectId: "proj_1", kind: "feature_build" }),
+      updateStatus,
+      clearForFeatureActionItems: clearForFeature,
+      jobsCreate,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "request_action_item",
+        actionItems: [{ type: "secret_request", description: "Need an API key", secretKey: "FOO" }],
+      });
+
+    expect(res.status).toBe(201);
+    expect(updateStatus).toHaveBeenCalledWith("feature_42", "draft");
+    expect(clearForFeature).toHaveBeenCalledWith("feature_42");
+    expect(jobsCreate).toHaveBeenCalledWith({ projectId: "proj_1", kind: "spec_grill", featureId: "feature_42" });
+  });
+
+  it("moves a testing feature to in_review on an approved submit_review verdict (ADR 015 item 16)", async () => {
+    const approveReview = vi.fn(async () => null);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42", kind: "agentic_review" }),
+      approveReview,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_review", verdict: "approved", summary: "LGTM" });
+
+    expect(res.status).toBe(201);
+    expect(approveReview).toHaveBeenCalledWith("feature_42");
+  });
+
+  it("moves a testing feature to returned (agentic_review) on a changes_requested verdict", async () => {
+    const setReturned = vi.fn(async () => null);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42", kind: "agentic_review" }),
+      setReturned,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_review", verdict: "changes_requested", summary: "Fix the auth flow" });
+
+    expect(res.status).toBe(201);
+    expect(setReturned).toHaveBeenCalledWith("feature_42", "agentic_review", "Fix the auth flow");
   });
 
   it("returns 400 for an unknown event type", async () => {
@@ -282,11 +423,11 @@ describe("POST /internal/jobs/:jobId/events", () => {
     expect(setSpecReady).toHaveBeenCalledWith("feature_42", "# ADR 1");
   });
 
-  it("moves the feature to in_review with the PR URL when submit_build_result reports success", async () => {
-    const setInReview = vi.fn(async () => null);
+  it("moves the feature to testing when submit_build_result reports success (ADR 015 item 3)", async () => {
+    const setTesting = vi.fn(async () => null);
     const app = buildApp({
       findById: async () => makeJob({ featureId: "feature_42", kind: "feature_build" }),
-      setInReview,
+      setTesting,
     });
 
     const res = await request(app)
@@ -300,7 +441,10 @@ describe("POST /internal/jobs/:jobId/events", () => {
       });
 
     expect(res.status).toBe(201);
-    expect(setInReview).toHaveBeenCalledWith("feature_42", "https://github.com/acme/web/pull/42");
+    expect(setTesting).toHaveBeenCalledWith(
+      "feature_42",
+      "https://github.com/acme/web/pull/42",
+    );
   });
 
   it("moves the feature to failed when submit_build_result reports failure", async () => {
@@ -326,6 +470,60 @@ describe("POST /internal/jobs/:jobId/events", () => {
     expect(setInReview).not.toHaveBeenCalled();
   });
 
+  it("dispatches one feature-ref test run per enabled test", async () => {
+    const setTesting = vi.fn(async () => ({ id: "feature_42" }));
+    const jobsCreate = vi.fn(async () => ({ id: "test_job_1" }));
+    const listEnabledTests = vi.fn(async () => [{ id: "test_1" }, { id: "test_2" }]);
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42", kind: "feature_build" }),
+      setTesting: setTesting as never,
+      jobsCreate,
+      listEnabledTests,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_build_result", status: "success", prUrl: "https://example.test/pr/1" });
+
+    expect(res.status).toBe(201);
+    expect(jobsCreate).toHaveBeenCalledTimes(2);
+    expect(jobsCreate).toHaveBeenNthCalledWith(1, expect.objectContaining({
+      kind: "test_run",
+      testId: "test_1",
+      ref: "yggdrasil/feature-feature_42",
+    }));
+  });
+
+  it("persists test steps and rejects incomplete final reports", async () => {
+    const upsertStep = vi.fn(async () => undefined);
+    const app = buildApp({
+      upsertStep,
+      findById: async () => makeJob({ kind: "test_run", featureId: "feature_42" }),
+    });
+    const step = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "report_test_step",
+        testName: "opens checkout",
+        testStatus: "pass",
+        testDetails: "done",
+      });
+    expect(step.status).toBe(201);
+    expect(upsertStep).toHaveBeenCalledWith(expect.objectContaining({
+      jobId: JOB_ID,
+      name: "opens checkout",
+      status: "pass",
+    }));
+
+    const invalid = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_test_report", passed: 1, failed: 0 });
+    expect(invalid.status).toBe(400);
+  });
+
   it("does not touch awaiting_user_input for submit_build_result events", async () => {
     const setAwaitingUserInput = vi.fn(async () => null);
     const app = buildApp({
@@ -341,11 +539,11 @@ describe("POST /internal/jobs/:jobId/events", () => {
     expect(setAwaitingUserInput).not.toHaveBeenCalled();
   });
 
-  it("skips setInReview for a submit_build_result event on a job with no feature", async () => {
-    const setInReview = vi.fn(async () => null);
+  it("skips setTesting for a submit_build_result event on a job with no feature", async () => {
+    const setTesting = vi.fn(async () => null);
     const app = buildApp({
       findById: async () => makeJob({ featureId: null, kind: "feature_build" }),
-      setInReview,
+      setTesting,
     });
 
     const res = await request(app)
@@ -354,7 +552,7 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .send({ type: "submit_build_result", status: "success", prUrl: "https://github.com/acme/web/pull/42" });
 
     expect(res.status).toBe(201);
-    expect(setInReview).not.toHaveBeenCalled();
+    expect(setTesting).not.toHaveBeenCalled();
   });
 
   it("skips setSpecReady for a submit_adr event on a job with no feature", async () => {

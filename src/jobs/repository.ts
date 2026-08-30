@@ -7,6 +7,8 @@ interface JobRow {
   kind: JobKind;
   feature_id: string | null;
   test_id: string | null;
+  ref: string | null;
+  trigger_source: "feature" | "schedule" | null;
   status: JobStatus;
   last_error: string | null;
   created_at: Date;
@@ -15,7 +17,7 @@ interface JobRow {
 }
 
 const jobColumns = `
-  id, project_id, kind, feature_id, test_id, status, last_error, created_at, started_at, completed_at
+  id, project_id, kind, feature_id, test_id, ref, trigger_source, status, last_error, created_at, started_at, completed_at
 `;
 
 function mapJob(row: JobRow): Job {
@@ -25,6 +27,8 @@ function mapJob(row: JobRow): Job {
     kind: row.kind,
     featureId: row.feature_id,
     testId: row.test_id,
+    ref: row.ref,
+    trigger: row.trigger_source,
     status: row.status,
     lastError: row.last_error,
     createdAt: row.created_at,
@@ -41,16 +45,20 @@ export class JobRepository {
     kind: JobKind;
     featureId?: string;
     testId?: string;
+    ref?: string;
+    trigger?: "feature" | "schedule";
   }): Promise<Job> {
     const result = await this.db.query<JobRow>(
-      `INSERT INTO jobs (project_id, kind, feature_id, test_id, status)
-       VALUES ($1, $2, $3, $4, 'pending')
+      `INSERT INTO jobs (project_id, kind, feature_id, test_id, ref, trigger_source, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'pending')
        RETURNING ${jobColumns}`,
       [
         input.projectId,
         input.kind,
         input.featureId ?? null,
         input.testId ?? null,
+        input.ref ?? (input.kind === "test_run" ? "main" : null),
+        input.trigger ?? (input.kind === "test_run" ? "schedule" : null),
       ],
     );
     return mapJob(result.rows[0]);
@@ -95,6 +103,37 @@ export class JobRepository {
       [testId],
     );
     return result.rows[0]?.exists ?? false;
+  }
+
+  async hasActiveFeatureTestRuns(featureId: string): Promise<boolean> {
+    const result = await this.db.query<{ exists: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM jobs
+         WHERE feature_id = $1
+           AND kind = 'test_run'
+           AND status IN ('pending', 'running')
+       ) AS exists`,
+      [featureId],
+    );
+    return result.rows[0]?.exists ?? false;
+  }
+
+  async listFeatureTestRuns(featureId: string): Promise<Job[]> {
+    const result = await this.db.query<JobRow>(
+      `SELECT ${jobColumns}
+       FROM jobs j
+       WHERE j.feature_id = $1
+         AND j.kind = 'test_run'
+         AND j.created_at >= COALESCE(
+           (SELECT created_at FROM jobs
+            WHERE feature_id = $1 AND kind = 'feature_build'
+            ORDER BY created_at DESC LIMIT 1),
+           j.created_at
+         )
+       ORDER BY created_at ASC`,
+      [featureId],
+    );
+    return result.rows.map(mapJob);
   }
 
   async listRecentFailedTestRuns(projectId: string): Promise<Job[]> {
