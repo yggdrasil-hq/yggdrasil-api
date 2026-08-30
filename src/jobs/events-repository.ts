@@ -16,6 +16,13 @@ export type JobEventType =
   | "update_design_preview"
   | "submit_design";
 
+export interface JobEventActionItem {
+  type: string;
+  description: string;
+  secretKey?: string;
+  draftTestMarkdown?: string;
+}
+
 export interface JobEvent {
   id: string;
   jobId: string;
@@ -26,6 +33,7 @@ export interface JobEvent {
   status: string | null;
   prUrl: string | null;
   summary: string | null;
+  actionItems: JobEventActionItem[] | null;
   snapshot: Record<string, string> | null;
   createdAt: Date;
 }
@@ -40,6 +48,7 @@ interface JobEventRow {
   status: string | null;
   pr_url: string | null;
   summary: string | null;
+  action_items: JobEventActionItem[] | null;
   design_snapshot: Record<string, string> | null;
   created_at: Date;
 }
@@ -55,6 +64,7 @@ function mapJobEvent(row: JobEventRow): JobEvent {
     status: row.status,
     prUrl: row.pr_url,
     summary: row.summary,
+    actionItems: row.action_items,
     snapshot: row.design_snapshot,
     createdAt: row.created_at,
   };
@@ -80,14 +90,15 @@ export class JobEventRepository {
     status?: string;
     prUrl?: string;
     summary?: string;
+    actionItems?: JobEventActionItem[];
     snapshot?: Record<string, string>;
   }): Promise<JobEvent> {
     const result = await this.db.query<JobEventRow>(
       `INSERT INTO job_events
-         (job_id, type, question, markdown, message, status, pr_url, summary, design_snapshot)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         (job_id, type, question, markdown, message, status, pr_url, summary, action_items, design_snapshot)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id, job_id, type, question, markdown, message, status, pr_url,
-         summary, design_snapshot, created_at`,
+         summary, action_items, design_snapshot, created_at`,
       [
         input.jobId,
         input.type,
@@ -97,6 +108,7 @@ export class JobEventRepository {
         input.status ?? null,
         input.prUrl ?? null,
         input.summary ?? null,
+        input.actionItems ?? null,
         input.snapshot ?? null,
       ],
     );
@@ -107,11 +119,26 @@ export class JobEventRepository {
   async listByJob(jobId: string): Promise<JobEvent[]> {
     const result = await this.db.query<JobEventRow>(
       `SELECT id, job_id, type, question, markdown, message, status, pr_url,
-         summary, design_snapshot, created_at
+         summary, action_items, design_snapshot, created_at
        FROM job_events
        WHERE job_id = $1
        ORDER BY created_at ASC`,
       [jobId],
+    );
+    return result.rows.map(mapJobEvent);
+  }
+
+  /** Lists events from a feature's spec_grill runs for kickback context. */
+  async listSpecGrillByFeature(featureId: string): Promise<JobEvent[]> {
+    const result = await this.db.query<JobEventRow>(
+      `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
+         e.status, e.pr_url, e.summary, e.action_items, e.design_snapshot,
+         e.created_at
+       FROM job_events e
+       INNER JOIN jobs j ON j.id = e.job_id
+       WHERE j.feature_id = $1 AND j.kind = 'spec_grill'
+       ORDER BY e.created_at ASC`,
+      [featureId],
     );
     return result.rows.map(mapJobEvent);
   }

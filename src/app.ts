@@ -149,7 +149,7 @@ export function createApp(deps?: AppDependencies): Express {
   app.use("/internal", createProjectsInternalRouter({ projects, installations }));
   app.use(
     "/internal",
-    createFeaturesInternalRouter({ features, projects, installations, tests }),
+    createFeaturesInternalRouter({ features, projects, installations, tests, jobs }),
   );
   app.use(
     "/internal",

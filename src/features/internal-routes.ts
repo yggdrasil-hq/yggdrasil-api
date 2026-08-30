@@ -8,6 +8,7 @@ import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
 import type { TestRepository } from "../tests/repository.js";
 import type { FeatureRepository } from "./repository.js";
+import type { JobRepository } from "../jobs/repository.js";
 
 /**
  * Serves a job's feature payload back to the Orchestrator at claim time
@@ -33,6 +34,7 @@ export function createFeaturesInternalRouter(deps: {
   projects: ProjectRepository;
   installations: GithubInstallationRepository;
   tests: TestRepository;
+  jobs?: JobRepository;
 }): Router {
   const router = Router();
 
@@ -50,6 +52,10 @@ export function createFeaturesInternalRouter(deps: {
       const isTestRun = req.query.kind === "test_run";
       const isScriptTestRun = req.query.kind === "script_test_run";
       const isAgenticReview = req.query.kind === "agentic_review";
+      const requestedJobId =
+        typeof req.query.jobId === "string" && isUuid(req.query.jobId)
+          ? req.query.jobId
+          : null;
 
       const feature = await deps.features.findById(projectId, featureId);
       if (!feature) {
@@ -84,6 +90,11 @@ export function createFeaturesInternalRouter(deps: {
         res.status(404).json({ error: "Feature not found" });
         return;
       }
+
+      const currentJob =
+        requestedJobId && deps.jobs
+          ? await deps.jobs.findByIdForProject(projectId, requestedJobId)
+          : null;
 
       try {
         // spec_grill only ever reads (explores the repo, conducts the grill
@@ -140,6 +151,9 @@ export function createFeaturesInternalRouter(deps: {
               }
             : {}),
           ...(isScriptTestRun ? { scriptName } : {}),
+          ...(currentJob?.kind === "spec_grill" && currentJob.specContext
+            ? { specContext: currentJob.specContext }
+            : {}),
         });
       } catch (error) {
         console.error(`feature spec fetch failed for feature ${featureId}:`, error);

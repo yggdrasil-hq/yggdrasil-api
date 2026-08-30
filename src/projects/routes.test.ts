@@ -167,6 +167,22 @@ function buildApp(opts: BuildAppOptions) {
   const testRunReports = {
     listByFeature: vi.fn(async () => []),
   };
+  const tests = {
+    create: vi.fn(async (input: {
+      projectId: string;
+      name: string;
+      specMarkdown: string;
+      scheduleCron: string;
+      enabled?: boolean;
+    }) => ({
+      id: "test_1",
+      ...input,
+      enabled: input.enabled ?? true,
+      lastRunAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })),
+  };
 
   app.use(
     "/projects",
@@ -175,7 +191,7 @@ function buildApp(opts: BuildAppOptions) {
       sessions: sessions as never,
       projects: projects as never,
       features: features as never,
-      tests: {} as never,
+      tests: tests as never,
       testRunReports: testRunReports as never,
       jobs: jobs as never,
       jobEvents: {} as never,
@@ -189,7 +205,7 @@ function buildApp(opts: BuildAppOptions) {
     }),
   );
 
-  return { app, secrets, orgSecrets, features, jobs, projects, actionItems, testRunReports };
+  return { app, secrets, orgSecrets, features, jobs, projects, actionItems, testRunReports, tests };
 }
 
 const SESSION_COOKIE = "yggdrasil_session=sess_1";
@@ -718,6 +734,35 @@ describe("Action Items + Resume Implementation (ADR 015)", () => {
     );
     expect(res.status).toBe(200);
     expect(actionItems.resolve).toHaveBeenCalledWith("ai_1");
+  });
+
+  it("creates and resolves a supervised test_request action item", async () => {
+    const { app, actionItems, tests } = buildApp({ project, feature });
+    actionItems.findById.mockResolvedValue({
+      id: "ai_3",
+      featureId: feature.id,
+      type: "test_request",
+      description: "Verify checkout",
+      status: "open",
+      draftTestMarkdown: "## Checkout\nOpen checkout.",
+    } as never);
+
+    const res = await authedRequest(app)
+      .post(`/projects/${project.id}/features/${feature.id}/action-items/11111111-1111-4111-8111-111111111111/test`)
+      .send({
+        name: "Checkout smoke test",
+        scheduleCron: "0 * * * *",
+      });
+
+    expect(res.status).toBe(201);
+    expect(tests.create).toHaveBeenCalledWith({
+      projectId: project.id,
+      name: "Checkout smoke test",
+      specMarkdown: "## Checkout\nOpen checkout.",
+      scheduleCron: "0 * * * *",
+      enabled: true,
+    });
+    expect(actionItems.resolve).toHaveBeenCalledWith("ai_3");
   });
 
   it("creates a blocking subtask feature and parents it (ADR 015 item 5)", async () => {

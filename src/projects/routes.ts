@@ -119,6 +119,8 @@ const createDesignSchema = z.object({
   name: z.string().trim().min(1).max(128),
   description: z.string().trim().min(1).max(4000),
   slug: z.string().trim().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).max(96).optional(),
+  featureId: z.string().uuid().optional(),
+  actionItemId: z.string().uuid().optional(),
 });
 
 const createTestSchema = z.object({
@@ -985,6 +987,20 @@ export function createProjectsRouter(deps: {
       res.status(409).json({ error: "Design sessions are not enabled for this project" });
       return;
     }
+    if (parsed.data.actionItemId && !parsed.data.featureId) {
+      res.status(400).json({ error: "featureId is required when linking a design Action Item" });
+      return;
+    }
+    if (parsed.data.featureId && parsed.data.actionItemId) {
+      const feature = await deps.features.findById(project.id, parsed.data.featureId);
+      const item = feature
+        ? await deps.actionItems.findById(feature.id, parsed.data.actionItemId)
+        : null;
+      if (!feature || !item || item.type !== "design_grill" || item.status !== "open") {
+        res.status(400).json({ error: "Design Action Item is not available" });
+        return;
+      }
+    }
     const capabilityError = await assertCapabilityForProject(req, project, "design_sessions");
     if (capabilityError) {
       res.status(403).json({ error: capabilityError });
@@ -1013,6 +1029,13 @@ export function createProjectsRouter(deps: {
       designSlug,
       designDescription: parsed.data.description,
     });
+    if (parsed.data.featureId && parsed.data.actionItemId) {
+      await deps.actionItems.linkDesignSession(
+        parsed.data.featureId,
+        parsed.data.actionItemId,
+        job.id,
+      );
+    }
     res.status(201).json({
       id: job.id,
       name: parsed.data.name,
@@ -1288,6 +1311,18 @@ export function createProjectsRouter(deps: {
       return;
     }
     const items = await deps.actionItems.listForFeature(featureId);
+    const projectSecrets = await deps.secrets.decryptAllForProject(project.id);
+    for (const item of items) {
+      if (
+        item.status === "open" &&
+        item.type === "secret_request" &&
+        item.secretKey &&
+        Object.prototype.hasOwnProperty.call(projectSecrets, item.secretKey)
+      ) {
+        await deps.actionItems.resolve(item.id);
+        item.status = "resolved";
+      }
+    }
     res.json(items.map(toPublicActionItem));
   });
 
@@ -1315,8 +1350,64 @@ export function createProjectsRouter(deps: {
         res.status(404).json({ error: "Action item not found" });
         return;
       }
+      if (item.type === "design_grill") {
+        res.status(409).json({ error: "Design Action Items resolve when the design is submitted" });
+        return;
+      }
       await deps.actionItems.resolve(itemId);
       res.status(200).json({ ok: true });
+    },
+  );
+
+  // Test requests are the one synchronous Action Item mechanic: the human
+  // edits the proposed markdown and chooses its schedule, then the real Test
+  // entity is created immediately (ADR 015 item 5).
+  router.post(
+    "/:projectId/features/:featureId/action-items/:itemId/test",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      const itemId = routeParam(req.params.itemId);
+      if (!featureId || !isUuid(itemId)) {
+        res.status(404).json({ error: "Action item not found" });
+        return;
+      }
+      const item = await deps.actionItems.findById(featureId, itemId);
+      if (!item || item.type !== "test_request" || item.status !== "open") {
+        res.status(400).json({ error: "Test Action Item is not available" });
+        return;
+      }
+      const parsed = parseBody(
+        z.object({
+          name: z.string().trim().min(1).max(256),
+          specMarkdown: z.string().trim().min(1).optional(),
+          scheduleCron: z.string().trim().min(1),
+        }),
+        req.body,
+      );
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error });
+        return;
+      }
+      if (!isValidCronExpression(parsed.data.scheduleCron) ||
+          !meetsMinimumInterval(parsed.data.scheduleCron)) {
+        res.status(400).json({ error: "Schedule must be a valid expression with an interval of at least one hour" });
+        return;
+      }
+      const test = await deps.tests.create({
+        projectId: project.id,
+        name: parsed.data.name,
+        specMarkdown: parsed.data.specMarkdown ?? item.draftTestMarkdown ?? item.description,
+        scheduleCron: parsed.data.scheduleCron,
+        enabled: true,
+      });
+      await deps.actionItems.resolve(item.id);
+      res.status(201).json(toPublicTest(test));
     },
   );
 
@@ -1376,6 +1467,13 @@ export function createProjectsRouter(deps: {
       if (!item || item.type !== "subtask_feature") {
         res.status(400).json({ error: "Item is not a subtask-feature action item" });
         return;
+      }
+      if (item.subtaskFeatureId) {
+        const existing = await deps.features.findById(project.id, item.subtaskFeatureId);
+        if (existing) {
+          res.status(200).json(toPublicFeature(existing));
+          return;
+        }
       }
       const parsed = z.object({ title: z.string().trim().min(1).max(256) }).safeParse(req.body);
       if (!parsed.success) {

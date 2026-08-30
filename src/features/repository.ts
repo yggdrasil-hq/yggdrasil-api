@@ -346,7 +346,12 @@ export class FeatureRepository {
   async resetForRetry(featureId: string): Promise<Feature | null> {
     const result = await this.db.query<FeatureRow>(
       `UPDATE features
-       SET status = 'draft', awaiting_user_input = FALSE, updated_at = NOW()
+       SET status = 'draft',
+           adr_approved = FALSE,
+           awaiting_user_input = FALSE,
+           return_reason = NULL,
+           return_comment = NULL,
+           updated_at = NOW()
        WHERE id = $1 AND status = 'failed'
        RETURNING ${featureColumns}`,
       [featureId],
@@ -406,7 +411,11 @@ export class FeatureRepository {
   ): Promise<Feature | null> {
     const result = await this.db.query<FeatureRow>(
       `UPDATE features
-       SET status = $2, updated_at = NOW()
+       SET status = $2,
+           adr_approved = CASE WHEN $2 = 'draft' THEN FALSE ELSE adr_approved END,
+           return_reason = CASE WHEN $2 = 'draft' THEN NULL ELSE return_reason END,
+           return_comment = CASE WHEN $2 = 'draft' THEN NULL ELSE return_comment END,
+           updated_at = NOW()
        WHERE id = $1
        RETURNING ${featureColumns}`,
       [featureId, status],

@@ -49,6 +49,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     designName: "Checkout",
     designSlug: "checkout",
     designDescription: "A checkout flow",
+    specContext: null,
     status: "pending",
     lastError: null,
     createdAt: new Date(),

@@ -13,6 +13,7 @@ interface JobRow {
   design_name: string | null;
   design_slug: string | null;
   design_description: string | null;
+  spec_context: Record<string, unknown> | null;
   status: JobStatus;
   last_error: string | null;
   created_at: Date;
@@ -22,7 +23,7 @@ interface JobRow {
 
 const jobColumns = `
     id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
-    design_name, design_slug, design_description,
+    design_name, design_slug, design_description, spec_context,
     status, last_error, created_at, started_at, completed_at
 `;
 
@@ -39,6 +40,7 @@ function mapJob(row: JobRow): Job {
     designName: row.design_name,
     designSlug: row.design_slug,
     designDescription: row.design_description,
+    specContext: row.spec_context,
     status: row.status,
     lastError: row.last_error,
     createdAt: row.created_at,
@@ -61,12 +63,13 @@ export class JobRepository {
     designName?: string;
     designSlug?: string;
     designDescription?: string;
+    specContext?: Record<string, unknown>;
   }): Promise<Job> {
     const result = await this.db.query<JobRow>(
       `INSERT INTO jobs
          (project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
-          design_name, design_slug, design_description, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'pending')
+          design_name, design_slug, design_description, spec_context, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
        RETURNING ${jobColumns}`,
       [
         input.projectId,
@@ -79,6 +82,7 @@ export class JobRepository {
         input.designName ?? null,
         input.designSlug ?? null,
         input.designDescription ?? null,
+        input.specContext ?? null,
       ],
     );
     return mapJob(result.rows[0]);

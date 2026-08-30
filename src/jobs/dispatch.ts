@@ -17,6 +17,7 @@ export async function dispatchJob(
     designName?: string;
     designSlug?: string;
     designDescription?: string;
+    specContext?: Record<string, unknown>;
   },
 ) {
   return jobs.create(input);

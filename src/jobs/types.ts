@@ -20,6 +20,7 @@ export interface Job {
   designName: string | null;
   designSlug: string | null;
   designDescription: string | null;
+  specContext: Record<string, unknown> | null;
   status: JobStatus;
   lastError: string | null;
   createdAt: Date;

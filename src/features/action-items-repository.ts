@@ -13,6 +13,7 @@ interface ActionItemRow {
   design_session_id: string | null;
   subtask_feature_id: string | null;
   draft_test_markdown: string | null;
+  design_snapshot: Record<string, string> | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -20,6 +21,7 @@ interface ActionItemRow {
 const columns = `
   id, feature_id, type, description, status, resolved_at,
   secret_key, design_session_id, subtask_feature_id, draft_test_markdown,
+  design_snapshot,
   created_at, updated_at
 `;
 
@@ -35,6 +37,7 @@ function map(row: ActionItemRow): FeatureActionItem {
     designSessionId: row.design_session_id,
     subtaskFeatureId: row.subtask_feature_id,
     draftTestMarkdown: row.draft_test_markdown,
+    designSnapshot: row.design_snapshot,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -63,14 +66,15 @@ export class FeatureActionItemRepository {
     designSessionId?: string | null;
     subtaskFeatureId?: string | null;
     draftTestMarkdown?: string | null;
+    designSnapshot?: Record<string, string> | null;
   }>): Promise<FeatureActionItem[]> {
     const created: FeatureActionItem[] = [];
     for (const item of items) {
       const result = await this.db.query<ActionItemRow>(
         `INSERT INTO feature_action_items
            (feature_id, type, description, secret_key, design_session_id,
-            subtask_feature_id, draft_test_markdown)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
+            subtask_feature_id, draft_test_markdown, design_snapshot)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
          RETURNING ${columns}`,
         [
           featureId,
@@ -80,6 +84,7 @@ export class FeatureActionItemRepository {
           item.designSessionId ?? null,
           item.subtaskFeatureId ?? null,
           item.draftTestMarkdown ?? null,
+          item.designSnapshot ?? null,
         ],
       );
       created.push(map(result.rows[0]));
@@ -151,5 +156,64 @@ export class FeatureActionItemRepository {
          AND status = 'open'`,
       [subtaskFeatureId],
     );
+  }
+
+  async linkDesignSession(
+    featureId: string,
+    itemId: string,
+    designSessionId: string,
+  ): Promise<boolean> {
+    const result = await this.db.query(
+      `UPDATE feature_action_items
+       SET design_session_id = $3, updated_at = NOW()
+       WHERE feature_id = $1 AND id = $2 AND type = 'design_grill'
+       RETURNING id`,
+      [featureId, itemId, designSessionId],
+    );
+    return result.rowCount !== 0;
+  }
+
+  /**
+   * A design item is resolved by the terminal submit_design event, not by a
+   * generic human resolve click. Keeping the finalized snapshot on the item
+   * makes it available to a later spec_grill even though Design is not yet a
+   * first-class persisted entity (ADR 014 item 13).
+   */
+  async resolveDesignSession(
+    designSessionId: string,
+    snapshot: Record<string, string>,
+  ): Promise<void> {
+    await this.db.query(
+      `UPDATE feature_action_items
+       SET status = 'resolved',
+           resolved_at = NOW(),
+           design_snapshot = $2,
+           updated_at = NOW()
+       WHERE design_session_id = $1 AND type = 'design_grill' AND status = 'open'`,
+      [designSessionId, snapshot],
+    );
+  }
+
+  async listResolvedDesignSnapshots(
+    featureId: string,
+  ): Promise<Array<{ sessionId: string; snapshot: Record<string, string> }>> {
+    const result = await this.db.query<{
+      design_session_id: string;
+      design_snapshot: Record<string, string> | null;
+    }>(
+      `SELECT design_session_id, design_snapshot
+       FROM feature_action_items
+       WHERE feature_id = $1
+         AND type = 'design_grill'
+         AND status = 'resolved'
+         AND design_session_id IS NOT NULL
+         AND design_snapshot IS NOT NULL
+       ORDER BY resolved_at ASC`,
+      [featureId],
+    );
+    return result.rows.map((row) => ({
+      sessionId: row.design_session_id,
+      snapshot: row.design_snapshot ?? {},
+    }));
   }
 }

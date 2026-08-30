@@ -16,6 +16,7 @@ function makeEvent(overrides: Partial<JobEvent> = {}): JobEvent {
     status: null,
     prUrl: null,
     summary: null,
+    actionItems: null,
     snapshot: null,
     createdAt: new Date(),
     ...overrides,
@@ -40,6 +41,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     designName: null,
     designSlug: null,
     designDescription: null,
+    specContext: null,
     ...overrides,
   };
 }
@@ -53,6 +55,12 @@ type CreateInput = {
   status?: string;
   prUrl?: string;
   summary?: string;
+  actionItems?: Array<{
+    type: string;
+    description: string;
+    secretKey?: string;
+    draftTestMarkdown?: string;
+  }>;
   snapshot?: Record<string, string>;
 };
 
@@ -69,6 +77,7 @@ function buildApp(deps: {
   createManyActionItems?: ReturnType<typeof vi.fn>;
   createActionItemRow?: ReturnType<typeof vi.fn>;
   clearForFeatureActionItems?: ReturnType<typeof vi.fn>;
+  resolveDesignSession?: ReturnType<typeof vi.fn>;
   approveReview?: (featureId: string) => Promise<null>;
   setReturned?: (featureId: string, reason: string, comment: string) => Promise<null>;
   listEnabledTests?: ReturnType<typeof vi.fn>;
@@ -122,6 +131,8 @@ function buildApp(deps: {
     deps.createActionItemRow ?? (async (featureId: string, item: unknown) => item);
   const clearForFeatureActionItems =
     deps.clearForFeatureActionItems ?? (async () => undefined);
+  const resolveDesignSession =
+    deps.resolveDesignSession ?? (async () => undefined);
 
   const app = express();
   app.use(express.json());
@@ -131,7 +142,12 @@ function buildApp(deps: {
       jobEvents: { create } as never,
       jobs: { findById, create: deps.jobsCreate ?? (async () => ({ id: "kick_grill" })), hasActiveFeatureTestRuns, listFeatureTestRuns } as never,
       features: { findById: findFeature, setAwaitingUserInput, setSpecReady, updateStatus, setInReview, setRunning, setTesting, setAgenticReview: async () => null, approveReview, setReturned } as never,
-      actionItems: { createMany: createManyActionItems, create: createActionItemRow, clearForFeature: clearForFeatureActionItems } as never,
+      actionItems: {
+        createMany: createManyActionItems,
+        create: createActionItemRow,
+        clearForFeature: clearForFeatureActionItems,
+        resolveDesignSession,
+      } as never,
       tests: { listEnabledByProject: listEnabledTests } as never,
       testRunReports: { upsertStep, upsertReport, findByJob: findReport } as never,
       projects: { findById: projectFindById } as never,
@@ -171,6 +187,68 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .send({ type: "submit_adr", markdown: "# ADR 1" });
 
     expect(res.status).toBe(201);
+  });
+
+  it("stores kickback context on the fresh spec_grill job", async () => {
+    const jobsCreate = vi.fn(async () => ({ id: "kick_grill" }));
+    const listSpecGrillByFeature = vi.fn(async () => [
+      makeEvent({ type: "agent_text", message: "User chose OAuth." }),
+      makeEvent({ type: "user_message", message: "Use OAuth." }),
+    ]);
+    const listResolvedDesignSnapshots = vi.fn(async () => [
+      {
+        sessionId: "design-1",
+        snapshot: { "designs/auth/page.html": "<h1>Sign in</h1>" },
+      },
+    ]);
+    // The default test harness intentionally keeps dependencies small. This
+    // integration-shaped assertion uses a second router with the two
+    // context-producing repository methods supplied.
+    const contextApp = express();
+    contextApp.use(express.json());
+    contextApp.use(
+      "/internal",
+      createJobsInternalRouter({
+        jobEvents: {
+          create: async (input: CreateInput) => makeEvent({ jobId: input.jobId, type: input.type }),
+          listSpecGrillByFeature,
+        } as never,
+        jobs: { findById: async () => makeJob({ featureId: "feature_42", projectId: "proj_1", kind: "feature_build" }), create: jobsCreate } as never,
+        features: {
+          findById: async () => ({
+            ...makeEvent(),
+            id: "feature_42",
+            projectId: "proj_1",
+            adrMarkdown: "# Previous ADR",
+          }),
+          updateStatus: vi.fn(async () => null),
+        } as never,
+        actionItems: {
+          clearForFeature: vi.fn(async () => undefined),
+          listResolvedDesignSnapshots,
+        } as never,
+        tests: { listEnabledByProject: vi.fn(async () => []) } as never,
+        testRunReports: {} as never,
+        projects: {} as never,
+      }),
+    );
+
+    const res = await request(contextApp)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "request_action_item",
+        actionItems: [{ type: "design_grill", description: "Design sign-in" }],
+      });
+
+    expect(res.status).toBe(201);
+    expect(jobsCreate).toHaveBeenCalledWith(expect.objectContaining({
+      specContext: expect.objectContaining({
+        previousAdrMarkdown: "# Previous ADR",
+        kickbackReason: "design_grill: Design sign-in",
+        requestedActionItems: [{ type: "design_grill", description: "Design sign-in" }],
+      }),
+    }));
   });
 
   it("persists a full design snapshot event without treating it as a feature event", async () => {
@@ -221,6 +299,29 @@ describe("POST /internal/jobs/:jobId/events", () => {
         snapshot: { "designs/other/page.html": "<h1>nope</h1>" },
       });
     expect(res.status).toBe(400);
+  });
+
+  it("resolves a linked design Action Item when the design is submitted", async () => {
+    const resolveDesignSession = vi.fn(async () => undefined);
+    const app = buildApp({
+      resolveDesignSession,
+      findById: async () => makeJob({ featureId: null, kind: "design_grill" }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "submit_design",
+        summary: "Finalized sign-in states",
+        snapshot: { "designs/auth/page.html": "<h1>Sign in</h1>" },
+      });
+
+    expect(res.status).toBe(201);
+    expect(resolveDesignSession).toHaveBeenCalledWith(
+      JOB_ID,
+      { "designs/auth/page.html": "<h1>Sign in</h1>" },
+    );
   });
 
   it("creates Action Items when submit_adr carries an actionItems batch (ADR 015 item 4)", async () => {
@@ -274,7 +375,14 @@ describe("POST /internal/jobs/:jobId/events", () => {
     expect(res.status).toBe(201);
     expect(updateStatus).toHaveBeenCalledWith("feature_42", "draft");
     expect(clearForFeature).toHaveBeenCalledWith("feature_42");
-    expect(jobsCreate).toHaveBeenCalledWith({ projectId: "proj_1", kind: "spec_grill", featureId: "feature_42" });
+    expect(jobsCreate).toHaveBeenCalledWith(expect.objectContaining({
+      projectId: "proj_1",
+      kind: "spec_grill",
+      featureId: "feature_42",
+      specContext: expect.objectContaining({
+        kickbackReason: "secret_request: Need an API key",
+      }),
+    }));
   });
 
   it("moves a testing feature to in_review on an approved submit_review verdict (ADR 015 item 16)", async () => {
