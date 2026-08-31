@@ -1,6 +1,8 @@
 import cookieParser from "cookie-parser";
+import cors from "cors";
 import express, { type Express } from "express";
 import type pg from "pg";
+import { config } from "./config.js";
 import { createAuthRouter, createSettingsRouter } from "./auth/routes.js";
 import { SessionService } from "./auth/sessions.js";
 import { FeatureRepository } from "./features/repository.js";
@@ -43,6 +45,10 @@ export interface AppDependencies {
 export function createApp(deps?: AppDependencies): Express {
   const app = express();
   app.set("trust proxy", 1);
+  // Web calls the API with credentials: "include" (cookie session auth), so
+  // the origin must be an explicit allow-list entry, not "*" — browsers
+  // reject Access-Control-Allow-Origin: "*" alongside credentialed requests.
+  app.use(cors({ origin: config.corsOrigin, credentials: true }));
   app.use(cookieParser());
 
   app.get("/health", (_req, res) => {

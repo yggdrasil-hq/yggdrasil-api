@@ -14,6 +14,13 @@ export const config = {
   cookieName: "yggdrasil_session",
   appPublicUrl: process.env.APP_PUBLIC_URL ?? "http://localhost:8080/app",
   apiPublicUrl: process.env.API_PUBLIC_URL ?? "http://localhost:8080/api",
+  // The only browser origin allowed to make credentialed cross-origin
+  // requests. Derived from APP_PUBLIC_URL rather than a separate env var so
+  // it can't drift — deploy/docker-compose.prod.yml already sets
+  // APP_PUBLIC_URL to the real https://${APP_HOST} in a subdomain deploy. In
+  // dev, web and api share an origin via nginx path routing
+  // (docs/conventions/deploy.md), so this only matters in prod-shaped envs.
+  corsOrigin: new URL(process.env.APP_PUBLIC_URL ?? "http://localhost:8080/app").origin,
   // Must match the Orchestrator's own APPS_BASE_DOMAIN (orchestrator/cmd/server/main.go)
   // — both sides independently derive the same <project-slug>.apps.<domain>
   // primary-deployment URL (ADR 003 §15, docs/conventions/deploy.md): the
