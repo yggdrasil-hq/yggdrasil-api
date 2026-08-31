@@ -37,6 +37,7 @@ GITHUB_APP_SLUG=
 GITHUB_APP_PRIVATE_KEY=
 GITHUB_APP_WEBHOOK_SECRET=
 SESSION_SECRET=        # cookie signing
+SESSION_COOKIE_DOMAIN= # subdomain deploys only, e.g. ".example.com" — see below
 DATABASE_URL=
 ```
 
@@ -51,6 +52,13 @@ Callback URL (dev): `{API_PUBLIC_URL}/auth/github/callback`
 - PostgreSQL migrations: `users`, `sessions`, `github_tokens`, `oauth_states`
   (`src/db/migrations/001_auth.sql`).
 - Session middleware (`HttpOnly`, `Path=/`, `SameSite=Lax`) — `src/auth/middleware.ts`.
+- Cookie options (`src/auth/cookies.ts`) apply `SESSION_COOKIE_DOMAIN` as the
+  `Domain` attribute when set. Required in a subdomain deploy (APP_HOST and
+  API_HOST on different hosts) — without it the cookie is scoped to the api
+  host only, so the Web app's middleware (which forwards the browser's
+  `Cookie` header to `GET /auth/me` server-side) never sees it and redirects
+  every request back to `/login`, no matter how many times GitHub sign-in
+  succeeds. Unset in dev, where web and api share one origin via path routing.
 - Single OAuth flow, no `intent` param — `src/github/routes.ts` looks up by
   `github_id`: found → login (refresh stored token); not found → auto-provision.
 - `pending_username` gate enforced in `src/auth/routes.ts` /

@@ -12,6 +12,15 @@ export const config = {
   databaseUrl: process.env.DATABASE_URL ?? "",
   sessionSecret: process.env.SESSION_SECRET ?? "dev-session-secret-change-me",
   cookieName: "yggdrasil_session",
+  // Cookie `Domain` attribute. Unset in dev, where web and api share an
+  // origin via nginx path routing (docs/conventions/deploy.md) so the
+  // cookie's default (exact-host) scope already covers both. Required in a
+  // subdomain deploy (e.g. ".example.com") — otherwise a cookie set by
+  // API_PUBLIC_URL's host (api.example.com) is invisible to requests made to
+  // APP_PUBLIC_URL's host (app.example.com), including the Next.js
+  // middleware's server-side session check, which then redirects back to
+  // /login no matter how many times the user completes GitHub OAuth.
+  sessionCookieDomain: process.env.SESSION_COOKIE_DOMAIN || undefined,
   appPublicUrl: process.env.APP_PUBLIC_URL ?? "http://localhost:8080/app",
   apiPublicUrl: process.env.API_PUBLIC_URL ?? "http://localhost:8080/api",
   // The only browser origin allowed to make credentialed cross-origin

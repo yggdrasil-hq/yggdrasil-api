@@ -7,6 +7,7 @@ export function sessionCookieOptions(maxAgeMs: number): CookieOptions {
     sameSite: "lax",
     path: "/",
     secure: config.nodeEnv === "production",
+    domain: config.sessionCookieDomain,
     maxAge: maxAgeMs,
   };
 }
@@ -22,5 +23,6 @@ export function clearSessionCookie(res: Response): void {
     sameSite: "lax",
     path: "/",
     secure: config.nodeEnv === "production",
+    domain: config.sessionCookieDomain,
   });
 }
