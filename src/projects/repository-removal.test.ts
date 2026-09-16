@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { getRepositoryRemovalBlockedReason } from "./repository-removal.js";
+import {
+  getProjectDeletionBlocker,
+  getRepositoryRemovalBlockedReason,
+} from "./repository-removal.js";
 import type { Project } from "./types.js";
 
 function makeProject(overrides: Partial<Project> = {}): Project {
@@ -106,6 +109,66 @@ describe("getRepositoryRemovalBlockedReason", () => {
         features as never,
         jobs as never,
       ),
+    ).resolves.toBeNull();
+  });
+});
+
+describe("getProjectDeletionBlocker", () => {
+  it("blocks deletion while features are active, naming them", async () => {
+    const project = makeProject();
+    const blockingFeature = {
+      id: "feat_1",
+      title: "Checkout flow",
+      slug: "checkout-flow",
+      status: "running",
+    };
+    const features = {
+      listBlocking: async () => [blockingFeature],
+    };
+    const jobs = {
+      listActiveTestRunsForProject: async () => [],
+    };
+
+    await expect(
+      getProjectDeletionBlocker(project, features as never, jobs as never),
+    ).resolves.toEqual({
+      reason: "Wait for active feature runs to finish before deleting this project.",
+      features: [blockingFeature],
+      testRuns: [],
+    });
+  });
+
+  it("blocks deletion while test runs are active, naming them", async () => {
+    const project = makeProject();
+    const features = {
+      listBlocking: async () => [],
+    };
+    const jobs = {
+      listActiveTestRunsForProject: async () => [
+        { id: "job_1", testId: "test_1" },
+      ],
+    };
+
+    await expect(
+      getProjectDeletionBlocker(project, features as never, jobs as never),
+    ).resolves.toEqual({
+      reason: "Wait for active test runs to finish before deleting this project.",
+      features: [],
+      testRuns: [{ jobId: "job_1", testId: "test_1" }],
+    });
+  });
+
+  it("allows deletion when project is idle", async () => {
+    const project = makeProject();
+    const features = {
+      listBlocking: async () => [],
+    };
+    const jobs = {
+      listActiveTestRunsForProject: async () => [],
+    };
+
+    await expect(
+      getProjectDeletionBlocker(project, features as never, jobs as never),
     ).resolves.toBeNull();
   });
 });

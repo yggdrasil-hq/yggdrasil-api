@@ -370,6 +370,11 @@ export class ProjectRepository {
     return "deleted";
   }
 
+  async delete(projectId: string): Promise<boolean> {
+    const result = await this.db.query(`DELETE FROM projects WHERE id = $1`, [projectId]);
+    return (result.rowCount ?? 0) > 0;
+  }
+
   async findByPrimaryRepository(
     githubOwner: string,
     githubRepo: string,

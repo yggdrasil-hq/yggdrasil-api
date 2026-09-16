@@ -379,6 +379,50 @@ export class FeatureRepository {
     return result.rows[0] ? mapFeature(result.rows[0]) : null;
   }
 
+  /**
+   * Force-cancels a feature synchronously — unlike the job-level cancel
+   * (which relies on the Orchestrator round-tripping a `run_cancelled`
+   * event before the feature status ever moves), this flips the feature
+   * straight to `cancelled` from the route, so cancellation can't get
+   * stuck mid-flight (ADR 006's known gap: "nothing does so on a
+   * timeout"). Guarded off the two true terminal states — already
+   * `cancelled` is a no-op, and `merged` can never be cancelled.
+   */
+  async cancel(featureId: string): Promise<Feature | null> {
+    const result = await this.db.query<FeatureRow>(
+      `UPDATE features
+       SET status = 'cancelled',
+           awaiting_user_input = FALSE,
+           updated_at = NOW()
+       WHERE id = $1 AND status NOT IN ('cancelled', 'merged')
+       RETURNING ${featureColumns}`,
+      [featureId],
+    );
+    return result.rows[0] ? mapFeature(result.rows[0]) : null;
+  }
+
+  /**
+   * Re-enters a cancelled feature back into `draft`, the same reset
+   * `resetForRetry` does for a failed one — a fresh spec_grill run drives
+   * it through the state machine from scratch. Guarded `WHERE status =
+   * 'cancelled'` so it can't resurrect a feature that moved on since.
+   */
+  async restartFromCancelled(featureId: string): Promise<Feature | null> {
+    const result = await this.db.query<FeatureRow>(
+      `UPDATE features
+       SET status = 'draft',
+           adr_approved = FALSE,
+           awaiting_user_input = FALSE,
+           return_reason = NULL,
+           return_comment = NULL,
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'cancelled'
+       RETURNING ${featureColumns}`,
+      [featureId],
+    );
+    return result.rows[0] ? mapFeature(result.rows[0]) : null;
+  }
+
   async setAwaitingUserInput(
     featureId: string,
     awaiting: boolean,
@@ -403,6 +447,18 @@ export class FeatureRepository {
       [projectId],
     );
     return result.rows[0]?.exists ?? false;
+  }
+
+  async listBlocking(projectId: string): Promise<Feature[]> {
+    const result = await this.db.query<FeatureRow>(
+      `SELECT ${featureColumns}
+       FROM features
+       WHERE project_id = $1
+         AND status IN ('draft', 'queued', 'running')
+       ORDER BY updated_at DESC`,
+      [projectId],
+    );
+    return result.rows.map(mapFeature);
   }
 
   async updateStatus(

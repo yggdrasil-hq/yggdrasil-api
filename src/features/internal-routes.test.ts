@@ -132,6 +132,8 @@ describe("GET /internal/projects/:projectId/features/:featureId/spec", () => {
     expect(res.body).toEqual({
       title: "Add dark mode",
       featureType: "normal",
+      projectName: "Test",
+      projectDescription: "",
       repos: [
         { cloneUrl: "https://github.com/acme/web.git", isPrimary: true },
         { cloneUrl: "https://github.com/acme/worker.git", isPrimary: false },
@@ -144,6 +146,23 @@ describe("GET /internal/projects/:projectId/features/:featureId/spec", () => {
     expect(mintInstallationAccessToken).toHaveBeenCalledWith(42, expect.any(String), expect.any(String), {
       contents: "read",
     });
+  });
+
+  it("carries the project's own name/description so spec_grill's prompt can seed the grill with them", async () => {
+    const app = buildApp({
+      projects: {
+        findById: async () =>
+          makeProject({ name: "Luffy Portfolio", description: "A personal portfolio site for Luffy" }),
+      },
+    });
+
+    const res = await request(app)
+      .get(`/internal/projects/${PROJECT_ID}/features/${FEATURE_ID}/spec`)
+      .set("Authorization", "Bearer test-internal-api-token");
+
+    expect(res.status).toBe(200);
+    expect(res.body.projectName).toBe("Luffy Portfolio");
+    expect(res.body.projectDescription).toBe("A personal portfolio site for Luffy");
   });
 
   it("returns 404 for an unknown feature", async () => {
@@ -192,6 +211,8 @@ describe("GET /internal/projects/:projectId/features/:featureId/spec", () => {
     expect(res.body).toEqual({
       title: "Add dark mode",
       featureType: "normal",
+      projectName: "Test",
+      projectDescription: "",
       repos: [
         { cloneUrl: "https://github.com/acme/web.git", isPrimary: true },
         { cloneUrl: "https://github.com/acme/worker.git", isPrimary: false },

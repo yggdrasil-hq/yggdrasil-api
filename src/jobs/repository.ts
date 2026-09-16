@@ -126,6 +126,19 @@ export class JobRepository {
     return result.rows[0]?.exists ?? false;
   }
 
+  async listActiveTestRunsForProject(projectId: string): Promise<Job[]> {
+    const result = await this.db.query<JobRow>(
+      `SELECT ${jobColumns}
+       FROM jobs
+       WHERE project_id = $1
+         AND kind IN ('test_run', 'script_test_run')
+         AND status IN ('pending', 'running')
+       ORDER BY created_at DESC`,
+      [projectId],
+    );
+    return result.rows.map(mapJob);
+  }
+
   async hasActiveTestRun(testId: string): Promise<boolean> {
     const result = await this.db.query<{ exists: boolean }>(
       `SELECT EXISTS(
@@ -269,5 +282,28 @@ export class JobRepository {
     }
     await this.db.query("SELECT pg_notify('job_cancellations', $1)", [jobId]);
     return true;
+  }
+
+  /**
+   * Best-effort counterpart to `cancel` for a force-cancel: cancels
+   * whatever job (any kind, pending or running) is currently outstanding
+   * for a feature, rather than requiring the caller to already know which
+   * kind/job is active. Notifies the Orchestrator for each — a `pending`
+   * job has no pod to abort yet, so the notify is a harmless no-op for it,
+   * but a `running` one needs it to actually stop. Never fails: the
+   * feature-level cancel this backs is the source of truth, so a job
+   * that's already finished on its own just isn't touched.
+   */
+  async cancelActiveForFeature(featureId: string): Promise<void> {
+    const result = await this.db.query<{ id: string }>(
+      `UPDATE jobs
+       SET status = 'cancelled', completed_at = now()
+       WHERE feature_id = $1 AND status IN ('pending', 'running')
+       RETURNING id`,
+      [featureId],
+    );
+    for (const row of result.rows) {
+      await this.db.query("SELECT pg_notify('job_cancellations', $1)", [row.id]);
+    }
   }
 }

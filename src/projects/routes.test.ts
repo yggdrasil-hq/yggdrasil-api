@@ -149,13 +149,19 @@ function buildApp(opts: BuildAppOptions) {
     create: vi.fn(async () => opts.project),
     markReady: vi.fn(async () => undefined),
     setAgenticReviewEnabled: vi.fn(async () => undefined),
+    delete: vi.fn(async () => true),
   };
   const features = {
     findById: vi.fn(async () => opts.feature ?? null),
     findProjectInit: vi.fn(async () => opts.feature ?? null),
     create: vi.fn(async () => opts.feature ?? makeFeature()),
     hasBlockingStatuses: vi.fn(async () => false),
+    listBlocking: vi.fn(async () => []),
     updateStatus: vi.fn(async () => opts.feature ?? null),
+    cancel: vi.fn(async () => (opts.feature ? { ...opts.feature, status: "cancelled" } : null)),
+    restartFromCancelled: vi.fn(async () =>
+      opts.feature ? { ...opts.feature, status: "draft" } : null,
+    ),
     setAwaitingUserInput: vi.fn(async () => opts.feature ?? null),
     resetForRetry: vi.fn(async () => opts.feature ?? null),
     queueBuild: vi.fn(async () => opts.feature ?? null),
@@ -169,8 +175,10 @@ function buildApp(opts: BuildAppOptions) {
   const jobs = {
     create: vi.fn(async () => ({ id: "job_1" })),
     hasActiveTestRunsForProject: vi.fn(async () => false),
+    listActiveTestRunsForProject: vi.fn(async () => []),
     findActiveSpecGrillJob: vi.fn(async () => opts.activeSpecGrillJob ?? null),
     findLatestByProjectAndKind: vi.fn(async () => opts.latestDeployJob ?? null),
+    cancelActiveForFeature: vi.fn(async () => undefined),
   };
   const notifications = { create: vi.fn(async () => undefined) };
   const installations = {
@@ -252,6 +260,7 @@ function authedRequest(app: express.Express) {
     get: (url: string) => request(app).get(url).set("Cookie", SESSION_COOKIE),
     post: (url: string) => request(app).post(url).set("Cookie", SESSION_COOKIE),
     patch: (url: string) => request(app).patch(url).set("Cookie", SESSION_COOKIE),
+    delete: (url: string) => request(app).delete(url).set("Cookie", SESSION_COOKIE),
   };
 }
 
@@ -841,5 +850,130 @@ describe("Action Items + Resume Implementation (ADR 015)", () => {
     expect(res.body.featureId).toBe(testingFeature.id);
     expect(res.body.runs[0].status).toBe("running");
     expect(res.body.runs[0].steps[0].name).toBe("opens checkout");
+  });
+});
+
+describe("DELETE /projects/:projectId", () => {
+  it("deletes the project when confirmation text matches", async () => {
+    const project = makeProject();
+    const { app, projects } = buildApp({ project });
+
+    const res = await authedRequest(app)
+      .delete(`/projects/${project.id}`)
+      .send({ confirm: "delete" });
+
+    expect(res.status).toBe(204);
+    expect(projects.delete).toHaveBeenCalledWith(project.id);
+  });
+
+  it("rejects deletion when confirmation text does not match", async () => {
+    const project = makeProject();
+    const { app, projects } = buildApp({ project });
+
+    const res = await authedRequest(app)
+      .delete(`/projects/${project.id}`)
+      .send({ confirm: "not-delete" });
+
+    expect(res.status).toBe(400);
+    expect(projects.delete).not.toHaveBeenCalled();
+  });
+
+  it("blocks deletion while features are active and names them", async () => {
+    const project = makeProject();
+    const { app, features, projects } = buildApp({ project });
+    features.hasBlockingStatuses.mockResolvedValue(true);
+    features.listBlocking.mockResolvedValue([
+      { id: "feat_1", title: "Checkout flow", slug: "checkout-flow", status: "running" },
+    ] as never);
+
+    const res = await authedRequest(app)
+      .delete(`/projects/${project.id}`)
+      .send({ confirm: "delete" });
+
+    expect(res.status).toBe(409);
+    expect(projects.delete).not.toHaveBeenCalled();
+    expect(res.body.features).toEqual([
+      { id: "feat_1", title: "Checkout flow", slug: "checkout-flow", status: "running" },
+    ]);
+  });
+
+  it("404s for a project the user cannot access", async () => {
+    const project = makeProject();
+    const { app } = buildApp({ project });
+
+    const res = await authedRequest(app)
+      .delete(`/projects/22222222-2222-4222-8222-222222222222`)
+      .send({ confirm: "delete" });
+
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /projects/:projectId/features/:featureId/cancel", () => {
+  it("force-cancels a feature synchronously and cancels its active jobs", async () => {
+    const feature = makeFeature({ status: "draft" });
+    const project = makeProject();
+    const { app, features, jobs } = buildApp({ project, feature });
+
+    const res = await authedRequest(app).post(
+      `/projects/${project.id}/features/${feature.id}/cancel`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe("cancelled");
+    expect(features.cancel).toHaveBeenCalledWith(feature.id);
+    expect(jobs.cancelActiveForFeature).toHaveBeenCalledWith(feature.id);
+  });
+
+  it("409s when the feature cannot be cancelled from its current state", async () => {
+    const feature = makeFeature({ status: "merged" });
+    const project = makeProject();
+    const { app, features, jobs } = buildApp({ project, feature });
+    features.cancel.mockResolvedValue(null);
+
+    const res = await authedRequest(app).post(
+      `/projects/${project.id}/features/${feature.id}/cancel`,
+    );
+
+    expect(res.status).toBe(409);
+    expect(jobs.cancelActiveForFeature).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /projects/:projectId/features/:featureId/restart", () => {
+  it("restarts a cancelled feature into draft and dispatches a fresh spec_grill", async () => {
+    const feature = makeFeature({ status: "cancelled" });
+    const project = makeProject();
+    const { app, features, jobs } = buildApp({
+      project,
+      feature,
+      orgSecrets: { MODEL_BASE_URL: "u", MODEL_API_KEY: "k", MODEL_ID: "m" },
+    });
+
+    const res = await authedRequest(app).post(
+      `/projects/${project.id}/features/${feature.id}/restart`,
+    );
+
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe("draft");
+    expect(features.restartFromCancelled).toHaveBeenCalledWith(feature.id);
+    expect(jobs.create).toHaveBeenCalled();
+  });
+
+  it("409s when the feature is not cancelled", async () => {
+    const feature = makeFeature({ status: "draft" });
+    const project = makeProject();
+    const { app, features } = buildApp({
+      project,
+      feature,
+      orgSecrets: { MODEL_BASE_URL: "u", MODEL_API_KEY: "k", MODEL_ID: "m" },
+    });
+    features.restartFromCancelled.mockResolvedValue(null);
+
+    const res = await authedRequest(app).post(
+      `/projects/${project.id}/features/${feature.id}/restart`,
+    );
+
+    expect(res.status).toBe(409);
   });
 });

@@ -15,8 +15,11 @@ import type { JobRepository } from "../jobs/repository.js";
  * (ADR 006 item 5, widened by ADR 010 item 1): the feature title, its
  * featureType ("normal" | "project_init" — ADR 008 item 1, lets
  * buildInitialPrompt pick the right skill instead of the model inferring it
- * from the title), and the project's linked repos, plus a fresh job-scoped
- * GitHub installation token. The token is minted here rather than read from
+ * from the title), the project's own name/description as entered by the
+ * user at creation time (so buildSpecGrillPrompt can seed the grill with
+ * them instead of the agent re-deriving purpose from the repo alone), and
+ * the project's linked repos, plus a fresh job-scoped GitHub installation
+ * token. The token is minted here rather than read from
  * `project_secrets` — it's short-lived and per-job (ADR 005 §14), the same
  * as the chart-fetch/chart-scaffold token, not a static project secret like
  * the model config (ADR 004).
@@ -122,6 +125,8 @@ export function createFeaturesInternalRouter(deps: {
         res.json({
           title: feature.title,
           featureType: feature.featureType,
+          projectName: project.name,
+          projectDescription: project.description,
           repos: project.repositories.map((repo) => ({
             cloneUrl: `https://github.com/${repo.githubOwner}/${repo.githubRepo}.git`,
             isPrimary: repo.isPrimary,

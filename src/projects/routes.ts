@@ -24,7 +24,10 @@ import {
 import { buildProjectOverview } from "./overview.js";
 import { scaffoldChart } from "./chart-scaffold.js";
 import type { ProjectRepository } from "./repository.js";
-import { getRepositoryRemovalBlockedReason } from "./repository-removal.js";
+import {
+  getRepositoryRemovalBlockedReason,
+  getProjectDeletionBlocker,
+} from "./repository-removal.js";
 import { toPublicProject } from "./types.js";
 import type { Project } from "./types.js";
 import { routeParam } from "../shared/route-param.js";
@@ -688,6 +691,37 @@ export function createProjectsRouter(deps: {
     res.json(await toPublicProjectWithRemovalMeta(updated));
   });
 
+  router.delete("/:projectId", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const parsed = parseBody(z.object({ confirm: z.string().min(1) }), req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    if (parsed.data.confirm !== "delete") {
+      res.status(400).json({ error: 'Type "delete" to confirm' });
+      return;
+    }
+
+    const blocker = await getProjectDeletionBlocker(project, deps.features, deps.jobs);
+    if (blocker) {
+      res.status(409).json({
+        error: blocker.reason,
+        features: blocker.features,
+        testRuns: blocker.testRuns,
+      });
+      return;
+    }
+
+    await deps.projects.delete(project.id);
+    res.status(204).send();
+  });
+
   router.get("/:projectId/overview", requireAuth, async (req, res) => {
     const project = await getOwnedProject(req, routeParam(req.params.projectId));
     if (!project) {
@@ -1145,11 +1179,14 @@ export function createProjectsRouter(deps: {
     res.status(200).json({});
   });
 
-  // Cancels a running spec_grill job (ADR 006's cancel/abort follow-up).
-  // The Orchestrator picks this up via Postgres LISTEN/NOTIFY on
-  // 'job_cancellations' — this route's only job is to flip the job's status
-  // and notify; the Orchestrator decides how to actually stop the session
-  // (sending Pi an abort command if attached, then deleting the pod).
+  // Force-cancels a feature. Flips the feature straight to `cancelled`
+  // synchronously (not waiting on the Orchestrator to round-trip a
+  // `run_cancelled` event the way job-level cancellation used to) so it
+  // can never get stuck mid-cancel, then best-effort cancels whatever job
+  // is currently outstanding for it — the Orchestrator picks that up via
+  // Postgres LISTEN/NOTIFY on 'job_cancellations' as before. `cancelled`
+  // is excluded from every project/repo-deletion blocking check, so this
+  // is how a stuck feature gets "cleaned up" for deletion purposes.
   router.post("/:projectId/features/:featureId/cancel", requireAuth, async (req, res) => {
     const project = await getOwnedProject(req, routeParam(req.params.projectId));
     if (!project) {
@@ -1163,26 +1200,57 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    const feature = await deps.features.findById(project.id, featureId);
-    if (!feature) {
-      res.status(404).json({ error: "Feature not found" });
-      return;
-    }
-
-    const job = await deps.jobs.findActiveSpecGrillJob(featureId);
-    if (!job) {
-      res.status(409).json({ error: "No active grill session to cancel" });
-      return;
-    }
-
-    const cancelled = await deps.jobs.cancel(job.id);
+    const cancelled = await deps.features.cancel(featureId);
     if (!cancelled) {
-      res.status(409).json({ error: "No active grill session to cancel" });
+      res.status(409).json({ error: "Feature cannot be cancelled from its current state" });
       return;
     }
 
-    res.status(200).json({});
+    await deps.jobs.cancelActiveForFeature(featureId);
+
+    res.status(200).json(toPublicFeature(cancelled));
   });
+
+  // Restarts a cancelled feature: re-enters `draft` (same reset
+  // retry-grill does for a failed feature) and kicks off a fresh
+  // spec_grill run from scratch.
+  router.post(
+    "/:projectId/features/:featureId/restart",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      if (!featureId) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      const modelConfigError = await assertModelConfigResolvable(project, "spec_grill");
+      if (modelConfigError) {
+        res.status(400).json({ error: modelConfigError });
+        return;
+      }
+
+      const restarted = await deps.features.restartFromCancelled(featureId);
+      if (!restarted) {
+        res.status(409).json({ error: "Feature is not cancelled" });
+        return;
+      }
+
+      await dispatchJob(deps.jobs, {
+        projectId: project.id,
+        kind: "spec_grill",
+        featureId: restarted.id,
+      });
+
+      res.status(201).json(toPublicFeature(restarted));
+    },
+  );
 
   // Re-runs a failed feature's spec_grill session (originally added to
   // recover a project stuck in `initializing` whose project_init spec_grill
