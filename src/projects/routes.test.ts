@@ -84,6 +84,38 @@ function fakeUserSecrets(bundle: Record<string, string> = {}) {
   };
 }
 
+const ORG_DEFAULT_MODEL_ID = "model_org_default";
+
+/**
+ * ADR 018 fakes standing in for the org's model provider/catalog/job-default
+ * stack. A complete `bundle` (the old flat triplet, kept as the test
+ * fixture's shape) resolves as if it were the org's default for every job
+ * kind — mirrors the pre-ADR-018 "one org bundle, applies everywhere" fixture
+ * semantics closely enough for these tests, which don't exercise per-job-kind
+ * variation.
+ */
+function fakeModelConfigDeps(bundle: Record<string, string> = {}) {
+  const complete = Boolean(bundle.MODEL_BASE_URL && bundle.MODEL_API_KEY && bundle.MODEL_ID);
+  const providers = {
+    decryptApiKey: vi.fn(async () => bundle.MODEL_API_KEY ?? null),
+    findById: vi.fn(async () => (complete ? { id: "provider_1", baseUrl: bundle.MODEL_BASE_URL } : null)),
+  };
+  const models = {
+    findById: vi.fn(async (_orgId: string, modelId: string) =>
+      complete && modelId === ORG_DEFAULT_MODEL_ID
+        ? { id: modelId, providerId: "provider_1", modelId: bundle.MODEL_ID }
+        : null,
+    ),
+  };
+  const jobDefaults = {
+    findForJobKind: vi.fn(async () => (complete ? { modelId: ORG_DEFAULT_MODEL_ID } : null)),
+  };
+  const projectOverrides = {
+    findForJobKind: vi.fn(async () => null),
+  };
+  return { providers, models, jobDefaults, projectOverrides };
+}
+
 interface BuildAppOptions {
   project: Project;
   feature?: Feature;
@@ -101,6 +133,7 @@ function buildApp(opts: BuildAppOptions) {
 
   const secrets = fakeSecrets(opts.projectSecrets);
   const orgSecrets = fakeUserSecrets(opts.orgSecrets);
+  const { providers, models, jobDefaults, projectOverrides } = fakeModelConfigDeps(opts.orgSecrets);
 
   const users = {
     findById: vi.fn(async () => ({ id: OWNER_ID } as User)),
@@ -202,6 +235,10 @@ function buildApp(opts: BuildAppOptions) {
       orgSecrets: orgSecrets as never,
       organizations: organizations as never,
       actionItems: actionItems as never,
+      providers: providers as never,
+      models: models as never,
+      jobDefaults: jobDefaults as never,
+      projectOverrides: projectOverrides as never,
     }),
   );
 

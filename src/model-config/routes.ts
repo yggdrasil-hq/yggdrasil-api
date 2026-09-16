@@ -1,0 +1,426 @@
+import { Router } from "express";
+import { z } from "zod";
+import { createAuthMiddleware } from "../auth/middleware.js";
+import type { SessionService } from "../auth/sessions.js";
+import { UserRepository } from "../users/repository.js";
+import type { OrganizationRepository } from "../organizations/repository.js";
+import { routeParam } from "../shared/route-param.js";
+import { isUuid } from "../shared/uuid.js";
+import type { OrgProviderRepository } from "./provider-repository.js";
+import type { OrgModelRepository } from "./model-repository.js";
+import type { JobModelDefaultRepository } from "./job-default-repository.js";
+import { AGENT_JOB_KINDS, DEFAULT_PROVIDER_BASE_URLS, PROVIDER_TYPES } from "./types.js";
+import type { AgentJobKind, ProviderType } from "./types.js";
+import { testProviderConnection } from "./connection-test.js";
+
+const jobKindSchema = z.enum(AGENT_JOB_KINDS);
+
+const createProviderSchema = z.object({
+  name: z.string().trim().min(1).max(128),
+  providerType: z.enum(PROVIDER_TYPES),
+  baseUrl: z.string().trim().min(1).optional(),
+  apiKey: z.string().trim().min(1),
+});
+
+const updateProviderSchema = z.object({
+  name: z.string().trim().min(1).max(128).optional(),
+  baseUrl: z.string().trim().min(1).optional(),
+  apiKey: z.string().trim().min(1).optional(),
+});
+
+const testProviderSchema = z.object({
+  providerType: z.enum(PROVIDER_TYPES),
+  baseUrl: z.string().trim().min(1).optional(),
+  apiKey: z.string().trim().min(1),
+});
+
+const createModelSchema = z.object({
+  providerId: z.string().uuid(),
+  displayName: z.string().trim().min(1).max(128),
+  modelId: z.string().trim().min(1).max(256),
+});
+
+const updateModelSchema = z.object({
+  displayName: z.string().trim().min(1).max(128).optional(),
+  modelId: z.string().trim().min(1).max(256).optional(),
+});
+
+const setJobDefaultSchema = z.object({
+  modelId: z.string().uuid(),
+});
+
+function resolveBaseUrl(providerType: ProviderType, provided?: string): string | null {
+  if (provided) return provided;
+  if (providerType === "custom_openai_compatible") return null;
+  return DEFAULT_PROVIDER_BASE_URLS[providerType];
+}
+
+/**
+ * ADR 018: org-scoped providers, model catalog, and per-job-kind defaults.
+ * Reads open to any org member; writes admin-only, mirroring the org-secrets
+ * routes' `role !== "admin"` gate.
+ */
+export function createModelConfigRouter(deps: {
+  users: UserRepository;
+  sessions: SessionService;
+  organizations: OrganizationRepository;
+  providers: OrgProviderRepository;
+  models: OrgModelRepository;
+  jobDefaults: JobModelDefaultRepository;
+}): Router {
+  const router = Router();
+  const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
+
+  type AuthedReq = Parameters<typeof requireAuth>[0];
+
+  function orgIdParam(req: AuthedReq): string | null {
+    const value = routeParam(req.params.organizationId);
+    return isUuid(value) ? value : null;
+  }
+
+  async function roleInOrg(orgId: string, userId: string) {
+    return deps.organizations.roleForUser(orgId, userId);
+  }
+
+  // --- Providers ---
+
+  router.get("/:organizationId/providers", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (!role) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const providers = await deps.providers.listForOrganization(orgId);
+    res.json(providers);
+  });
+
+  router.post("/:organizationId/providers", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+    const parsed = createProviderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
+      return;
+    }
+    const baseUrl = resolveBaseUrl(parsed.data.providerType, parsed.data.baseUrl);
+    if (!baseUrl) {
+      res.status(400).json({ error: "baseUrl is required for a custom provider" });
+      return;
+    }
+    const provider = await deps.providers.create({
+      organizationId: orgId,
+      name: parsed.data.name,
+      providerType: parsed.data.providerType,
+      baseUrl,
+      apiKey: parsed.data.apiKey,
+    });
+    res.status(201).json(provider);
+  });
+
+  router.put("/:organizationId/providers/:providerId", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+    const providerId = routeParam(req.params.providerId);
+    if (!isUuid(providerId)) {
+      res.status(404).json({ error: "Provider not found" });
+      return;
+    }
+    const parsed = updateProviderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
+      return;
+    }
+    const provider = await deps.providers.update(orgId, providerId, parsed.data);
+    if (!provider) {
+      res.status(404).json({ error: "Provider not found" });
+      return;
+    }
+    res.json(provider);
+  });
+
+  router.post("/:organizationId/providers/test-connection", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+    const parsed = testProviderSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
+      return;
+    }
+    const baseUrl = resolveBaseUrl(parsed.data.providerType, parsed.data.baseUrl);
+    if (!baseUrl) {
+      res.status(400).json({ error: "baseUrl is required for a custom provider" });
+      return;
+    }
+    const result = await testProviderConnection({
+      providerType: parsed.data.providerType,
+      baseUrl,
+      apiKey: parsed.data.apiKey,
+    });
+    res.status(200).json(result);
+  });
+
+  router.post("/:organizationId/providers/:providerId/test-connection", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+    const providerId = routeParam(req.params.providerId);
+    if (!isUuid(providerId)) {
+      res.status(404).json({ error: "Provider not found" });
+      return;
+    }
+    const provider = await deps.providers.findById(orgId, providerId);
+    if (!provider) {
+      res.status(404).json({ error: "Provider not found" });
+      return;
+    }
+    const apiKey = await deps.providers.decryptApiKey(providerId);
+    if (!apiKey) {
+      res.status(404).json({ error: "Provider not found" });
+      return;
+    }
+    const result = await testProviderConnection({
+      providerType: provider.providerType,
+      baseUrl: provider.baseUrl,
+      apiKey,
+    });
+    res.status(200).json(result);
+  });
+
+  router.delete("/:organizationId/providers/:providerId", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+    const providerId = routeParam(req.params.providerId);
+    if (!isUuid(providerId)) {
+      res.status(404).json({ error: "Provider not found" });
+      return;
+    }
+    try {
+      const deleted = await deps.providers.delete(orgId, providerId);
+      res.status(deleted ? 204 : 404).send();
+    } catch {
+      res.status(409).json({ error: "Provider has models in its catalog — remove those first" });
+    }
+  });
+
+  // --- Model catalog ---
+
+  router.get("/:organizationId/models", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (!role) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const models = await deps.models.listForOrganization(orgId);
+    res.json(models);
+  });
+
+  router.post("/:organizationId/models", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+    const parsed = createModelSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
+      return;
+    }
+    const provider = await deps.providers.findById(orgId, parsed.data.providerId);
+    if (!provider) {
+      res.status(400).json({ error: "Provider not found" });
+      return;
+    }
+    const model = await deps.models.create({
+      organizationId: orgId,
+      providerId: parsed.data.providerId,
+      displayName: parsed.data.displayName,
+      modelId: parsed.data.modelId,
+    });
+    res.status(201).json(model);
+  });
+
+  router.put("/:organizationId/models/:modelId", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+    const modelId = routeParam(req.params.modelId);
+    if (!isUuid(modelId)) {
+      res.status(404).json({ error: "Model not found" });
+      return;
+    }
+    const parsed = updateModelSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
+      return;
+    }
+    const model = await deps.models.update(orgId, modelId, {
+      displayName: parsed.data.displayName,
+      modelIdValue: parsed.data.modelId,
+    });
+    if (!model) {
+      res.status(404).json({ error: "Model not found" });
+      return;
+    }
+    res.json(model);
+  });
+
+  router.delete("/:organizationId/models/:modelId", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+    const modelId = routeParam(req.params.modelId);
+    if (!isUuid(modelId)) {
+      res.status(404).json({ error: "Model not found" });
+      return;
+    }
+    try {
+      const deleted = await deps.models.delete(orgId, modelId);
+      res.status(deleted ? 204 : 404).send();
+    } catch {
+      res.status(409).json({
+        error: "Model is assigned as a job default or project override — unassign it first",
+      });
+    }
+  });
+
+  // --- Per-job-kind org defaults ---
+
+  router.get("/:organizationId/job-model-defaults", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (!role) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const defaults = await deps.jobDefaults.listForOrganization(orgId);
+    res.json(defaults);
+  });
+
+  router.put("/:organizationId/job-model-defaults/:jobKind", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+    const jobKindParsed = jobKindSchema.safeParse(req.params.jobKind);
+    if (!jobKindParsed.success) {
+      res.status(400).json({ error: "Invalid job kind" });
+      return;
+    }
+    const parsed = setJobDefaultSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
+      return;
+    }
+    const model = await deps.models.findById(orgId, parsed.data.modelId);
+    if (!model) {
+      res.status(400).json({ error: "Model not found" });
+      return;
+    }
+    const jobDefault = await deps.jobDefaults.upsert(
+      orgId,
+      jobKindParsed.data as AgentJobKind,
+      parsed.data.modelId,
+    );
+    res.status(200).json(jobDefault);
+  });
+
+  router.delete("/:organizationId/job-model-defaults/:jobKind", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+    const jobKindParsed = jobKindSchema.safeParse(req.params.jobKind);
+    if (!jobKindParsed.success) {
+      res.status(400).json({ error: "Invalid job kind" });
+      return;
+    }
+    const cleared = await deps.jobDefaults.clear(orgId, jobKindParsed.data as AgentJobKind);
+    res.status(cleared ? 204 : 404).send();
+  });
+
+  return router;
+}

@@ -6,7 +6,7 @@ import { UserRepository } from "../users/repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
 import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
-import { MODEL_CONFIG_KEYS, resolveModelConfig } from "./model-config.js";
+import { MODEL_CONFIG_KEYS, extractModelConfigBundle } from "./model-config.js";
 import type { SecretRepository } from "./repository.js";
 import type { OrgSecretRepository } from "../organizations/org-secrets-repository.js";
 
@@ -61,8 +61,8 @@ export function createSecretsRouter(deps: {
     const secret = await deps.secrets.upsert(project.id, parsed.data.key, parsed.data.value);
 
     if (project.modelConfigWarning && (MODEL_CONFIG_KEYS as readonly string[]).includes(parsed.data.key)) {
-      const resolved = await resolveModelConfig(deps, project.id, project.organizationId);
-      if (resolved) {
+      const projectSecrets = await deps.secrets.decryptAllForProject(project.id);
+      if (extractModelConfigBundle(projectSecrets)) {
         await deps.projects.clearModelConfigWarning(project.id);
       }
     }

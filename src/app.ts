@@ -34,6 +34,12 @@ import { OrganizationRepository } from "./organizations/repository.js";
 import { OrganizationClusterRepository } from "./organizations/cluster-repository.js";
 import { createOrganizationsRouter } from "./organizations/routes.js";
 import { createOrganizationsInternalRouter } from "./organizations/internal-routes.js";
+import { OrgProviderRepository } from "./model-config/provider-repository.js";
+import { OrgModelRepository } from "./model-config/model-repository.js";
+import { JobModelDefaultRepository } from "./model-config/job-default-repository.js";
+import { ProjectModelOverrideRepository } from "./model-config/project-override-repository.js";
+import { createModelConfigRouter } from "./model-config/routes.js";
+import { createProjectModelOverridesRouter } from "./model-config/project-routes.js";
 import { TestRepository } from "./tests/repository.js";
 import { TestRunReportRepository } from "./tests/reports-repository.js";
 import { UserRepository } from "./users/repository.js";
@@ -93,6 +99,10 @@ export function createApp(deps?: AppDependencies): Express {
   const jobMessages = new JobMessageRepository(deps.pool);
   const organizations = new OrganizationRepository(deps.pool);
   const orgClusters = new OrganizationClusterRepository(deps.pool);
+  const modelProviders = new OrgProviderRepository(deps.pool);
+  const orgModels = new OrgModelRepository(deps.pool);
+  const jobModelDefaults = new JobModelDefaultRepository(deps.pool);
+  const projectModelOverrides = new ProjectModelOverrideRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions }));
   app.use(
@@ -103,6 +113,17 @@ export function createApp(deps?: AppDependencies): Express {
   app.use(
     "/organizations",
     createOrganizationsRouter({ users, sessions, organizations, clusters: orgClusters, orgSecrets }),
+  );
+  app.use(
+    "/organizations",
+    createModelConfigRouter({
+      users,
+      sessions,
+      organizations,
+      providers: modelProviders,
+      models: orgModels,
+      jobDefaults: jobModelDefaults,
+    }),
   );
   app.use(
     "/github",
@@ -133,6 +154,10 @@ export function createApp(deps?: AppDependencies): Express {
       secrets,
       orgSecrets,
       organizations,
+      providers: modelProviders,
+      models: orgModels,
+      jobDefaults: jobModelDefaults,
+      projectOverrides: projectModelOverrides,
     }),
   );
   app.use(
@@ -143,7 +168,27 @@ export function createApp(deps?: AppDependencies): Express {
     "/projects",
     createSecretsRouter({ users, sessions, projects, secrets, orgSecrets }),
   );
-  app.use("/internal", createSecretsInternalRouter({ secrets, orgSecrets, projects }));
+  app.use(
+    "/projects",
+    createProjectModelOverridesRouter({
+      users,
+      sessions,
+      projects,
+      models: orgModels,
+      projectOverrides: projectModelOverrides,
+    }),
+  );
+  app.use(
+    "/internal",
+    createSecretsInternalRouter({
+      secrets,
+      projects,
+      providers: modelProviders,
+      models: orgModels,
+      jobDefaults: jobModelDefaults,
+      projectOverrides: projectModelOverrides,
+    }),
+  );
   app.use(
     "/internal",
     createDesignsInternalRouter({ jobs, projects, installations }),

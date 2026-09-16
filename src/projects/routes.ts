@@ -31,11 +31,16 @@ import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
 import { slugify } from "../shared/slug.js";
 import type { GithubInstallationRepository } from "../github/installation-repository.js";
-import { MODEL_CONFIG_KEYS, resolveModelConfig } from "../secrets/model-config.js";
+import { MODEL_CONFIG_KEYS, resolveModelConfigForJob, resolveOrgModelConfig } from "../secrets/model-config.js";
 import type { ModelConfigBundle } from "../secrets/model-config.js";
 import type { SecretRepository } from "../secrets/repository.js";
 import type { OrgSecretRepository } from "../organizations/org-secrets-repository.js";
 import type { OrganizationRepository } from "../organizations/repository.js";
+import type { OrgProviderRepository } from "../model-config/provider-repository.js";
+import type { OrgModelRepository } from "../model-config/model-repository.js";
+import type { JobModelDefaultRepository } from "../model-config/job-default-repository.js";
+import type { ProjectModelOverrideRepository } from "../model-config/project-override-repository.js";
+import type { AgentJobKind } from "../model-config/types.js";
 
 function parseBody<T>(schema: z.ZodType<T>, body: unknown):
   | { success: true; data: T }
@@ -158,6 +163,10 @@ export function createProjectsRouter(deps: {
   secrets: SecretRepository;
   orgSecrets: OrgSecretRepository;
   organizations: OrganizationRepository;
+  providers: OrgProviderRepository;
+  models: OrgModelRepository;
+  jobDefaults: JobModelDefaultRepository;
+  projectOverrides: ProjectModelOverrideRepository;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -217,14 +226,17 @@ export function createProjectsRouter(deps: {
   }
 
   /**
-   * Gate enforced at every job-dispatch site (ADR 007): resolves live,
-   * project bundle first then the owning user's account default, and
-   * refuses to dispatch if neither resolves. Distinct from
+   * Gate enforced at every job-dispatch site (ADR 007, per-job-kind since
+   * ADR 018): resolves live for the job kind about to be dispatched, and
+   * refuses to dispatch if nothing resolves. Distinct from
    * `assertGitHubAccess` — model config and repo access are independent
    * prerequisites.
    */
-  async function assertModelConfigResolvable(project: Project): Promise<string | null> {
-    const resolved = await resolveModelConfig(deps, project.id, project.organizationId);
+  async function assertModelConfigResolvable(
+    project: Project,
+    jobKind: AgentJobKind,
+  ): Promise<string | null> {
+    const resolved = await resolveModelConfigForJob(deps, project.id, project.organizationId, jobKind);
     if (resolved) {
       return null;
     }
@@ -349,19 +361,18 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    // Resolve model config before creating anything (ADR 016 items 8-9): a
-    // request bundle wins, else the project inherits its org's config. There
-    // is no per-user default anymore (ADR 007 retired).
+    // Resolve model config before creating anything (ADR 018): a request
+    // bundle wins, else the project inherits its org's "spec_grill" default
+    // (project_init dispatches as spec_grill below). There is no per-user
+    // default anymore (ADR 007 retired).
     const requestedModelConfig = parsed.data.modelConfig
       ? toModelConfigBundle(parsed.data.modelConfig)
       : null;
     let effectiveModelConfig = requestedModelConfig;
     if (!effectiveModelConfig) {
-      const orgSecrets = await deps.orgSecrets.decryptAllForOrganization(org.id);
-      effectiveModelConfig = MODEL_CONFIG_KEYS.every((key) => orgSecrets[key])
-        ? (Object.fromEntries(
-            MODEL_CONFIG_KEYS.map((key) => [key, orgSecrets[key]]),
-          ) as ModelConfigBundle)
+      const orgDefault = await deps.jobDefaults.findForJobKind(org.id, "spec_grill");
+      effectiveModelConfig = orgDefault
+        ? await resolveOrgModelConfig(deps, org.id, orgDefault.modelId)
         : null;
     }
     if (!effectiveModelConfig) {
@@ -734,7 +745,7 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    const modelConfigError = await assertModelConfigResolvable(project);
+    const modelConfigError = await assertModelConfigResolvable(project, "spec_grill");
     if (modelConfigError) {
       res.status(400).json({ error: modelConfigError });
       return;
@@ -890,7 +901,7 @@ export function createProjectsRouter(deps: {
         return;
       }
 
-      const modelConfigError = await assertModelConfigResolvable(project);
+      const modelConfigError = await assertModelConfigResolvable(project, "feature_build");
       if (modelConfigError) {
         res.status(400).json({ error: modelConfigError });
         return;
@@ -1011,7 +1022,7 @@ export function createProjectsRouter(deps: {
       res.status(409).json({ error: accessError });
       return;
     }
-    const modelConfigError = await assertModelConfigResolvable(project);
+    const modelConfigError = await assertModelConfigResolvable(project, "design_grill");
     if (modelConfigError) {
       res.status(400).json({ error: modelConfigError });
       return;
@@ -1212,7 +1223,7 @@ export function createProjectsRouter(deps: {
         return;
       }
 
-      const modelConfigError = await assertModelConfigResolvable(project);
+      const modelConfigError = await assertModelConfigResolvable(project, "spec_grill");
       if (modelConfigError) {
         res.status(400).json({ error: modelConfigError });
         return;
@@ -1275,7 +1286,7 @@ export function createProjectsRouter(deps: {
         return;
       }
 
-      const modelConfigError = await assertModelConfigResolvable(project);
+      const modelConfigError = await assertModelConfigResolvable(project, "feature_build");
       if (modelConfigError) {
         res.status(400).json({ error: modelConfigError });
         return;
@@ -1509,7 +1520,7 @@ export function createProjectsRouter(deps: {
       res.status(409).json({ error: accessError });
       return;
     }
-    const modelConfigError = await assertModelConfigResolvable(project);
+    const modelConfigError = await assertModelConfigResolvable(project, "feature_build");
     if (modelConfigError) {
       res.status(400).json({ error: modelConfigError });
       return;

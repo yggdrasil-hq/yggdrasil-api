@@ -81,6 +81,20 @@ describe("reconcileUserInstallations", () => {
     expect(syncInstallationFromGitHub).not.toHaveBeenCalled();
   });
 
+  it("re-syncs repos for an already-synced installation when forceRefresh is set", async () => {
+    vi.mocked(fetchUserInstallations).mockResolvedValue([remoteInstallation()]);
+    const deps = makeDeps({ hasRepos: true });
+
+    const result = await reconcileUserInstallations({
+      ...deps,
+      userId: "user_1",
+      forceRefresh: true,
+    } as never);
+
+    expect(result).toEqual({ status: "ok" });
+    expect(syncInstallationFromGitHub).toHaveBeenCalledWith(deps.installations, 111, null);
+  });
+
   it("silently refreshes an expired token and retries on 401", async () => {
     vi.mocked(fetchUserInstallations)
       .mockRejectedValueOnce(new GithubApiUnauthorizedError("/user/installations"))

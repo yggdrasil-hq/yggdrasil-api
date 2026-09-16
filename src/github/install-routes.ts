@@ -125,6 +125,7 @@ export function createGitHubAppRouter(deps: {
         installations: deps.installations,
         userGithubAccess: deps.userGithubAccess,
         userId,
+        forceRefresh,
       });
       if (result.status === "reauth_required") {
         reauthRequired = true;

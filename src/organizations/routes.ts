@@ -10,6 +10,7 @@ import type { OrganizationClusterRepository } from "./cluster-repository.js";
 import type { OrgSecretRepository } from "./org-secrets-repository.js";
 import { ORG_ROLES, ROLE_DISPLAY_NAMES, toPublicOrganization } from "./types.js";
 import type { OrgRole } from "./types.js";
+import { testClusterConnection } from "./cluster-connection-test.js";
 
 const roleSchema = z.enum(ORG_ROLES);
 
@@ -363,6 +364,38 @@ export function createOrganizationsRouter(deps: {
     const cluster = await deps.clusters.upsert(orgId, parsed.data.kubeconfig);
     await deps.organizations.setStatus(orgId, "ready");
     res.status(200).json({ cluster });
+  });
+
+  router.post("/:organizationId/cluster/test-connection", requireAuth, async (req, res) => {
+    const orgId = orgIdParam(req);
+    if (!orgId) {
+      res.status(404).json({ error: "Organization not found" });
+      return;
+    }
+    const role = await roleInOrg(orgId, req.currentUser!.id);
+    if (role !== "admin") {
+      res.status(403).json({ error: "Admin role required" });
+      return;
+    }
+
+    const parsed = z
+      .object({
+        kubeconfig: z.string().min(1).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid input" });
+      return;
+    }
+
+    const kubeconfig = parsed.data.kubeconfig || (await deps.clusters.decryptKubeconfig(orgId));
+    if (!kubeconfig) {
+      res.status(400).json({ error: "No kubeconfig to test" });
+      return;
+    }
+
+    const result = await testClusterConnection(kubeconfig);
+    res.status(200).json(result);
   });
 
   router.delete("/:organizationId/cluster", requireAuth, async (req, res) => {

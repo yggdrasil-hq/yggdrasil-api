@@ -2,20 +2,31 @@ import { Router } from "express";
 import { isUuid } from "../shared/uuid.js";
 import { routeParam } from "../shared/route-param.js";
 import { requireInternalApiToken } from "./internal-auth.js";
-import { MODEL_CONFIG_KEYS, resolveModelConfig } from "./model-config.js";
+import { MODEL_CONFIG_KEYS, resolveModelConfigForJob } from "./model-config.js";
 import type { SecretRepository } from "./repository.js";
-import type { OrgSecretRepository } from "../organizations/org-secrets-repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
+import type { OrgProviderRepository } from "../model-config/provider-repository.js";
+import type { OrgModelRepository } from "../model-config/model-repository.js";
+import type { JobModelDefaultRepository } from "../model-config/job-default-repository.js";
+import type { ProjectModelOverrideRepository } from "../model-config/project-override-repository.js";
+import { AGENT_JOB_KINDS, type AgentJobKind } from "../model-config/types.js";
+
+function isAgentJobKind(value: unknown): value is AgentJobKind {
+  return typeof value === "string" && (AGENT_JOB_KINDS as readonly string[]).includes(value);
+}
 
 /**
  * The only place decrypted project secrets ever leave the API process —
- * called by the Orchestrator at deploy time (ADR 003 §16), never by
+ * called by the Orchestrator at dispatch time (ADR 003 §16), never by
  * session-authenticated (user-facing) routes.
  */
 export function createSecretsInternalRouter(deps: {
   secrets: SecretRepository;
-  orgSecrets: OrgSecretRepository;
   projects: ProjectRepository;
+  providers: OrgProviderRepository;
+  models: OrgModelRepository;
+  jobDefaults: JobModelDefaultRepository;
+  projectOverrides: ProjectModelOverrideRepository;
 }): Router {
   const router = Router();
 
@@ -35,15 +46,22 @@ export function createSecretsInternalRouter(deps: {
         return;
       }
 
+      // jobKind is only meaningful for the 5 agent-driven kinds (ADR 018);
+      // non-agent kinds (deploy, script_test_run) fetch other project
+      // secrets without any model config overlay.
+      const jobKind = req.query.jobKind;
       const secrets = await deps.secrets.decryptAllForProject(projectId);
 
-      // Model config resolves live (project bundle, else the owning
-      // Organization's config — ADR 016 items 8-9), merged over any other
-      // arbitrary project secret.
-      const modelConfig = await resolveModelConfig(deps, projectId, project.organizationId);
-      if (modelConfig) {
-        for (const key of MODEL_CONFIG_KEYS) {
-          secrets[key] = modelConfig[key];
+      if (isAgentJobKind(jobKind)) {
+        const modelConfig = await resolveModelConfigForJob(deps, projectId, project.organizationId, jobKind);
+        if (modelConfig) {
+          for (const key of MODEL_CONFIG_KEYS) {
+            secrets[key] = modelConfig[key];
+          }
+        } else {
+          for (const key of MODEL_CONFIG_KEYS) {
+            delete secrets[key];
+          }
         }
       } else {
         for (const key of MODEL_CONFIG_KEYS) {

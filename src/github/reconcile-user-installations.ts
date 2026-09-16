@@ -29,8 +29,10 @@ export async function reconcileUserInstallations(deps: {
   installations: GithubInstallationRepository;
   userGithubAccess: UserGithubAccessRepository;
   userId: string;
+  /** Force refresh (e.g. the picker's "Refresh" button) — re-syncs repos even for installations we already have some cached for, since access can be added to an existing installation between syncs. */
+  forceRefresh?: boolean;
 }): Promise<ReconcileUserInstallationsResult> {
-  const { githubTokens, installations, userGithubAccess, userId } = deps;
+  const { githubTokens, installations, userGithubAccess, userId, forceRefresh } = deps;
 
   const token = await githubTokens.get(userId);
   if (!token) {
@@ -82,7 +84,7 @@ export async function reconcileUserInstallations(deps: {
       await userGithubAccess.upsertAccess(userId, record.id);
 
       const hasRepos = await installations.hasAnyRepositories(record.id);
-      if (!hasRepos) {
+      if (forceRefresh || !hasRepos) {
         // Not attributing installedByUserId here — this user merely discovered
         // an installation that already existed on GitHub, they didn't install it.
         await syncInstallationFromGitHub(installations, remote.id, null);

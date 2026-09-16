@@ -40,6 +40,7 @@ export interface PublicProjectRepository {
 
 export interface PublicProject {
   id: string;
+  organizationId: string;
   name: string;
   slug: string;
   description: string;
@@ -90,6 +91,7 @@ export function toPublicProject(
 ): PublicProject {
   return {
     id: project.id,
+    organizationId: project.organizationId,
     name: project.name,
     slug: project.slug,
     description: project.description,
