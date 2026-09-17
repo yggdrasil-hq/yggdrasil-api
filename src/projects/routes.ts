@@ -48,6 +48,7 @@ import type { FeatureModelSecretRepository } from "../secrets/feature-model-repo
 import type { AgentJobKind } from "../model-config/types.js";
 import { AUDIT_ACTIONS } from "../audit/actions.js";
 import type { AuditRecorder } from "../audit/record.js";
+import type { DesignRepository } from "../designs/repository.js";
 
 function parseBody<T>(schema: z.ZodType<T>, body: unknown):
   | { success: true; data: T }
@@ -176,6 +177,7 @@ export function createProjectsRouter(deps: {
   projectOverrides: ProjectModelOverrideRepository;
   featureOverrides: FeatureJobModelOverrideRepository;
   featureSecrets: FeatureModelSecretRepository;
+  designs: DesignRepository;
   audit: AuditRecorder;
 }): Router {
   const router = Router();
@@ -1213,6 +1215,31 @@ export function createProjectsRouter(deps: {
       designSlug,
       designDescription: parsed.data.description,
     });
+
+    // ADR 020 item 2: the design becomes an index row the moment a session
+    // works on it, so browse/history shows designs in flight and not only
+    // finalized ones. Upsert on (project_id, slug) is what makes re-opening a
+    // design the same call as starting one — the slug is the artifact's
+    // identity on disk, so it can never produce a second row for one folder.
+    //
+    // Best-effort, like the notification and audit side effects below: the job
+    // is already dispatched and genuinely running, so failing the request here
+    // would report a failure the user cannot act on. It is also self-healing —
+    // `finalize` upserts, so a design that reaches `submit_design` always ends
+    // up indexed even if this write was lost.
+    let designId: string | null = null;
+    try {
+      const design = await deps.designs.startSession({
+        projectId: project.id,
+        name: parsed.data.name,
+        slug: designSlug,
+        jobId: job.id,
+      });
+      designId = design.id;
+    } catch (error) {
+      console.error(`failed to index design session ${job.id}:`, error);
+    }
+
     if (parsed.data.featureId && parsed.data.actionItemId) {
       await deps.actionItems.linkDesignSession(
         parsed.data.featureId,
@@ -1220,6 +1247,14 @@ export function createProjectsRouter(deps: {
         job.id,
       );
     }
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      action: AUDIT_ACTIONS.designSessionStarted,
+      targetType: "design",
+      targetId: designId,
+      metadata: { name: parsed.data.name, slug: designSlug, sessionId: job.id },
+    });
     res.status(201).json({
       id: job.id,
       name: parsed.data.name,
@@ -1227,6 +1262,7 @@ export function createProjectsRouter(deps: {
       description: parsed.data.description,
       status: job.status,
       createdAt: job.createdAt?.toISOString?.() ?? new Date().toISOString(),
+      designId,
     });
   });
 
@@ -1315,6 +1351,17 @@ export function createProjectsRouter(deps: {
       res.status(409).json({ error: "No active design session to cancel" });
       return;
     }
+    // ADR 028: the design index (ADR 020) gives this mutation the stable target
+    // it previously lacked, which is what the old out-of-scope row waited on.
+    // `job.designId` is only null for a session whose index write was lost.
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      action: AUDIT_ACTIONS.designSessionCancelled,
+      targetType: "design",
+      targetId: job.designId,
+      metadata: { slug: job.designSlug, sessionId: job.id },
+    });
     res.status(200).json({});
   });
 

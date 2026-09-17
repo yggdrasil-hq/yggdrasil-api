@@ -34,6 +34,13 @@ export const AUDIT_ACTIONS = {
   projectModelOverrideSet: "project_model_override.set",
   projectModelOverrideCleared: "project_model_override.cleared",
 
+  // --- Designs (ADR 014 sessions, ADR 020 persistence) ---
+  // Finalization is deliberately absent: it is driven by `submit_design`
+  // arriving on the internal job-event route, which ADR 028 keeps out of scope
+  // along with every other `/internal/*` write.
+  designSessionStarted: "design.session_started",
+  designSessionCancelled: "design.session_cancelled",
+
   // --- Organization, RBAC, cluster (ADR 016) ---
   orgCreated: "org.created",
   orgUpdated: "org.updated",

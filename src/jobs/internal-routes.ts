@@ -5,6 +5,7 @@ import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
 import type { FeatureActionItemRepository } from "../features/action-items-repository.js";
 import type { FeatureRepository } from "../features/repository.js";
+import type { DesignRepository } from "../designs/repository.js";
 import type { JobEventRepository } from "./events-repository.js";
 import type { JobRepository } from "./repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
@@ -144,6 +145,7 @@ export function createJobsInternalRouter(deps: {
   tests: TestRepository;
   testRunReports: TestRunReportRepository;
   projects: ProjectRepository;
+  designs: DesignRepository;
 }): Router {
   const router = Router();
 
@@ -256,6 +258,7 @@ async function syncFeatureState(
     tests: TestRepository;
     testRunReports: TestRunReportRepository;
     projects: ProjectRepository;
+    designs: DesignRepository;
   },
   jobId: string,
   event: z.infer<typeof jobEventSchema>,
@@ -285,6 +288,24 @@ async function syncFeatureState(
       return;
     }
     if (event.type === "submit_design") {
+      // ADR 020 item 4: this is the moment the design becomes committed and
+      // worth browsing — `submit_design` is the skill's own finalize step,
+      // which has already committed `designs/<slug>/` and opened the draft PR.
+      // Keyed by (project_id, slug) and upserted, so it also repairs a design
+      // whose index row was never written.
+      if (job && job.designSlug && job.designName) {
+        try {
+          await deps.designs.finalize({
+            projectId: job.projectId,
+            name: job.designName,
+            slug: job.designSlug,
+            jobId: job.id,
+            prUrl: event.prUrl ?? null,
+          });
+        } catch (error) {
+          console.error(`failed to finalize design for job ${jobId}:`, error);
+        }
+      }
       if (event.snapshot && deps.actionItems.resolveDesignSession) {
         await deps.actionItems.resolveDesignSession(jobId, event.snapshot);
       }

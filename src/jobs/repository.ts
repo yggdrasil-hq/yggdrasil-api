@@ -13,6 +13,7 @@ interface JobRow {
   design_name: string | null;
   design_slug: string | null;
   design_description: string | null;
+  design_id: string | null;
   spec_context: Record<string, unknown> | null;
   status: JobStatus;
   last_error: string | null;
@@ -24,7 +25,7 @@ interface JobRow {
 const jobColumns = `
     id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
     design_name, design_slug, design_description, spec_context,
-    status, last_error, created_at, started_at, completed_at
+    design_id, status, last_error, created_at, started_at, completed_at
 `;
 
 function mapJob(row: JobRow): Job {
@@ -40,6 +41,7 @@ function mapJob(row: JobRow): Job {
     designName: row.design_name,
     designSlug: row.design_slug,
     designDescription: row.design_description,
+    designId: row.design_id,
     specContext: row.spec_context,
     status: row.status,
     lastError: row.last_error,

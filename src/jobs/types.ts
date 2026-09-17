@@ -20,6 +20,8 @@ export interface Job {
   designName: string | null;
   designSlug: string | null;
   designDescription: string | null;
+  /** The `designs` row this session works on (ADR 020); null for every other kind. */
+  designId: string | null;
   specContext: Record<string, unknown> | null;
   status: JobStatus;
   lastError: string | null;

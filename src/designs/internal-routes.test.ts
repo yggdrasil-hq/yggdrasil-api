@@ -55,17 +55,22 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     createdAt: new Date(),
     startedAt: null,
     completedAt: null,
+    designId: null,
     ...overrides,
   };
 }
 
-function buildApp(job = makeJob()) {
+function buildApp(job = makeJob(), designs: Record<string, unknown> = {}) {
   const app = express();
   app.use(
     "/internal",
     createDesignsInternalRouter({
       projects: { findById: async () => makeProject() } as never,
       jobs: { findByIdForProject: async () => job } as never,
+      designs: {
+        findContinuationContext: async () => null,
+        ...designs,
+      } as never,
       installations: {
         findById: async () => ({
           id: "install_1",
@@ -119,5 +124,54 @@ describe("GET /internal/projects/:projectId/designs/:sessionId/spec", () => {
       .get(`/internal/projects/${PROJECT_ID}/designs/${SESSION_ID}/spec`)
       .set("Authorization", "Bearer test-internal-api-token");
     expect(response.status).toBe(404);
+  });
+
+  it("seeds a re-opened design with the prior session's PR and file list (ADR 020 item 5)", async () => {
+    const findContinuationContext = vi.fn(async () => ({
+      sessionId: "prior_session",
+      prUrl: "https://github.com/acme/web/pull/7",
+      paths: ["designs/checkout/page.html"],
+    }));
+
+    const response = await request(
+      buildApp(makeJob(), { findContinuationContext }),
+    )
+      .get(`/internal/projects/${PROJECT_ID}/designs/${SESSION_ID}/spec`)
+      .set("Authorization", "Bearer test-internal-api-token");
+
+    expect(response.status).toBe(200);
+    // Scoped to this project + slug, and excluding the session asking.
+    expect(findContinuationContext).toHaveBeenCalledWith(PROJECT_ID, "checkout", SESSION_ID);
+    expect(response.body.description).toContain("A checkout flow");
+    expect(response.body.description).toContain("continuation of an earlier design session");
+    expect(response.body.description).toContain("https://github.com/acme/web/pull/7");
+    expect(response.body.description).toContain("designs/checkout/page.html");
+  });
+
+  it("leaves the brief untouched for a first-time session", async () => {
+    const response = await request(
+      buildApp(makeJob(), { findContinuationContext: async () => null }),
+    )
+      .get(`/internal/projects/${PROJECT_ID}/designs/${SESSION_ID}/spec`)
+      .set("Authorization", "Bearer test-internal-api-token");
+
+    expect(response.body.description).toBe("A checkout flow");
+  });
+
+  it("still serves the spec when the continuation lookup fails", async () => {
+    // Degrades to a cold start rather than failing the session — the skill's
+    // own step 1 also inspects designs/<slug>/ when it is present.
+    const response = await request(
+      buildApp(makeJob(), {
+        findContinuationContext: async () => {
+          throw new Error("index unavailable");
+        },
+      }),
+    )
+      .get(`/internal/projects/${PROJECT_ID}/designs/${SESSION_ID}/spec`)
+      .set("Authorization", "Bearer test-internal-api-token");
+
+    expect(response.status).toBe(200);
+    expect(response.body.description).toBe("A checkout flow");
   });
 });

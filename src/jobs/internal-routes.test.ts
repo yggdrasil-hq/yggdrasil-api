@@ -38,6 +38,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     createdAt: new Date(),
     startedAt: new Date(),
     completedAt: null,
+    designId: null,
     designName: null,
     designSlug: null,
     designDescription: null,
@@ -87,6 +88,7 @@ function buildApp(deps: {
   upsertReport?: ReturnType<typeof vi.fn>;
   findReport?: ReturnType<typeof vi.fn>;
   projectFindById?: ReturnType<typeof vi.fn>;
+  finalizeDesign?: ReturnType<typeof vi.fn>;
 }) {
   const create: (input: CreateInput) => Promise<JobEvent> =
     deps.create ?? (async (input) => makeEvent({ jobId: input.jobId, type: input.type }));
@@ -151,6 +153,9 @@ function buildApp(deps: {
       tests: { listEnabledByProject: listEnabledTests } as never,
       testRunReports: { upsertStep, upsertReport, findByJob: findReport } as never,
       projects: { findById: projectFindById } as never,
+      designs: {
+        finalize: deps.finalizeDesign ?? vi.fn(async () => undefined),
+      } as never,
     }),
   );
   return app;
@@ -230,6 +235,7 @@ describe("POST /internal/jobs/:jobId/events", () => {
         tests: { listEnabledByProject: vi.fn(async () => []) } as never,
         testRunReports: {} as never,
         projects: {} as never,
+        designs: {} as never,
       }),
     );
 
@@ -321,6 +327,65 @@ describe("POST /internal/jobs/:jobId/events", () => {
     expect(resolveDesignSession).toHaveBeenCalledWith(
       JOB_ID,
       { "designs/auth/page.html": "<h1>Sign in</h1>" },
+    );
+  });
+
+  it("finalizes the design index row when the design is submitted (ADR 020 item 4)", async () => {
+    const finalizeDesign = vi.fn(async () => undefined);
+    const app = buildApp({
+      finalizeDesign,
+      findById: async () =>
+        makeJob({
+          id: JOB_ID,
+          featureId: null,
+          kind: "design_grill",
+          projectId: "proj_1",
+          designName: "Sign in",
+          designSlug: "auth",
+        }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "submit_design",
+        summary: "Finalized sign-in states",
+        prUrl: "https://github.com/acme/web/pull/9",
+        snapshot: { "designs/auth/page.html": "<h1>Sign in</h1>" },
+      });
+
+    expect(res.status).toBe(201);
+    // Keyed by (project, slug) rather than the design id, so this also repairs
+    // a session whose index row was never written at start.
+    expect(finalizeDesign).toHaveBeenCalledWith({
+      projectId: "proj_1",
+      name: "Sign in",
+      slug: "auth",
+      jobId: JOB_ID,
+      prUrl: "https://github.com/acme/web/pull/9",
+    });
+  });
+
+  it("passes a null PR url when the design session reported none", async () => {
+    const finalizeDesign = vi.fn(async () => undefined);
+    const app = buildApp({
+      finalizeDesign,
+      findById: async () =>
+        makeJob({ featureId: null, kind: "design_grill", designName: "Auth", designSlug: "auth" }),
+    });
+
+    await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "submit_design",
+        summary: "done",
+        snapshot: { "designs/auth/page.html": "<h1>Sign in</h1>" },
+      });
+
+    expect(finalizeDesign).toHaveBeenCalledWith(
+      expect.objectContaining({ prUrl: null }),
     );
   });
 

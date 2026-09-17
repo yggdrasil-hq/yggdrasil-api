@@ -221,6 +221,26 @@ function buildApp(opts: BuildAppOptions) {
   const audit = {
     record: vi.fn(async (_res: unknown, _input: { action: string }) => undefined),
   };
+  const designs = {
+    startSession: vi.fn(async (input: {
+      projectId: string;
+      name: string;
+      slug: string;
+      jobId: string;
+    }) => ({
+      id: "design_1",
+      projectId: input.projectId,
+      name: input.name,
+      slug: input.slug,
+      status: "in_progress" as const,
+      originJobId: input.jobId,
+      prUrl: null,
+      finalizedAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })),
+    linkSession: vi.fn(async () => undefined),
+  };
   const tests = {
     create: vi.fn(async (input: {
       projectId: string;
@@ -262,11 +282,12 @@ function buildApp(opts: BuildAppOptions) {
       projectOverrides: projectOverrides as never,
       featureOverrides: featureOverrides as never,
       featureSecrets: featureSecrets as never,
+      designs: designs as never,
       audit: audit as never,
     }),
   );
 
-  return { app, secrets, orgSecrets, features, jobs, projects, actionItems, testRunReports, tests, audit };
+  return { app, secrets, orgSecrets, features, jobs, projects, actionItems, testRunReports, tests, audit, designs };
 }
 
 const SESSION_COOKIE = "yggdrasil_session=sess_1";
@@ -631,6 +652,62 @@ describe("POST /:projectId/designs (ADR 014)", () => {
       `/projects/${makeProject().id}/designs`,
     ).send({ name: "Checkout", description: "Design checkout" });
     expect(response.status).toBe(409);
+  });
+
+  it("indexes the design and records the audit event (ADR 020)", async () => {
+    const { app, designs, audit, jobs } = buildApp({
+      project: makeProject(),
+      orgSecrets: {
+        MODEL_BASE_URL: "https://models.example",
+        MODEL_API_KEY: "key",
+        MODEL_ID: "model",
+      },
+    });
+
+    const response = await authedRequest(app).post(
+      `/projects/${makeProject().id}/designs`,
+    ).send({ name: "Checkout flow", description: "Design checkout" });
+
+    expect(response.status).toBe(201);
+    // Keyed by the slug the artifact will live under, so a later session on the
+    // same folder resolves to this same row instead of a duplicate.
+    expect(designs.startSession).toHaveBeenCalledWith({
+      projectId: makeProject().id,
+      name: "Checkout flow",
+      slug: "checkout-flow",
+      jobId: expect.any(String),
+    });
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "design.session_started",
+        targetType: "design",
+        metadata: { name: "Checkout flow", slug: "checkout-flow", sessionId: expect.any(String) },
+      }),
+    );
+    expect(response.body.designId).toBe("design_1");
+  });
+
+  it("still starts the session when the index write fails", async () => {
+    // The job is already dispatched and running, so reporting a failure here
+    // would describe something the user cannot act on. `finalize` upserts, so a
+    // design that reaches submit_design is indexed regardless.
+    const { app, designs } = buildApp({
+      project: makeProject(),
+      orgSecrets: {
+        MODEL_BASE_URL: "https://models.example",
+        MODEL_API_KEY: "key",
+        MODEL_ID: "model",
+      },
+    });
+    designs.startSession.mockRejectedValueOnce(new Error("index unavailable"));
+
+    const response = await authedRequest(app).post(
+      `/projects/${makeProject().id}/designs`,
+    ).send({ name: "Checkout flow", description: "Design checkout" });
+
+    expect(response.status).toBe(201);
+    expect(response.body.designId).toBeNull();
   });
 });
 

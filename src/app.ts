@@ -13,6 +13,8 @@ import { FeatureRepository } from "./features/repository.js";
 import { FeatureActionItemRepository } from "./features/action-items-repository.js";
 import { createFeaturesInternalRouter } from "./features/internal-routes.js";
 import { createDesignsInternalRouter } from "./designs/internal-routes.js";
+import { createDesignsRouter } from "./designs/routes.js";
+import { DesignRepository } from "./designs/repository.js";
 import { createGitHubRouter } from "./github/routes.js";
 import { createGitHubAppRouter } from "./github/install-routes.js";
 import { GithubInstallationRepository } from "./github/installation-repository.js";
@@ -111,6 +113,7 @@ export function createApp(deps?: AppDependencies): Express {
   const notifications = new NotificationRepository(deps.pool);
   const secrets = new SecretRepository(deps.pool);
   const orgSecrets = new OrgSecretRepository(deps.pool);
+  const designs = new DesignRepository(deps.pool);
   const jobEvents = new JobEventRepository(deps.pool);
   const jobMessages = new JobMessageRepository(deps.pool);
   const organizations = new OrganizationRepository(deps.pool);
@@ -185,6 +188,7 @@ export function createApp(deps?: AppDependencies): Express {
       projectOverrides: projectModelOverrides,
       featureOverrides: featureModelOverrides,
       featureSecrets: featureModelSecrets,
+      designs,
       audit,
     }),
   );
@@ -254,8 +258,11 @@ export function createApp(deps?: AppDependencies): Express {
   );
   app.use(
     "/internal",
-    createDesignsInternalRouter({ jobs, projects, installations }),
+    createDesignsInternalRouter({ jobs, projects, installations, designs }),
   );
+  // ADR 020 item 6: read-only design browse/history. Same `/projects` mount as
+  // the project/feature routers; it shares no param-shaped route with them.
+  app.use("/projects", createDesignsRouter({ users, sessions, projects, designs }));
   app.use(
     "/internal",
     createOrganizationsInternalRouter({ projects, clusters: orgClusters }),
@@ -275,6 +282,7 @@ export function createApp(deps?: AppDependencies): Express {
       tests,
       testRunReports,
       projects,
+      designs,
     }),
   );
 
