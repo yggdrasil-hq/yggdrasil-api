@@ -1,5 +1,7 @@
 import type pg from "pg";
 import type { Notification } from "./types.js";
+import { shouldNotify } from "./preferences.js";
+import { NotificationPreferencesRepository } from "./preferences-repository.js";
 
 interface NotificationRow {
   id: string;
@@ -32,7 +34,11 @@ function mapNotification(row: NotificationRow): Notification {
 }
 
 export class NotificationRepository {
-  constructor(private readonly db: pg.Pool) {}
+  private readonly preferences: NotificationPreferencesRepository;
+
+  constructor(private readonly db: pg.Pool) {
+    this.preferences = new NotificationPreferencesRepository(db);
+  }
 
   async listForUser(userId: string, limit = 50): Promise<Notification[]> {
     const result = await this.db.query<NotificationRow>(
@@ -56,6 +62,19 @@ export class NotificationRepository {
     return Number(result.rows[0]?.count ?? 0);
   }
 
+  /**
+   * Records a notification, unless the user's preferences (ADR 027) suppress
+   * it — in which case nothing is inserted and this returns null.
+   *
+   * Preferences are applied here, at creation, rather than filtered when the
+   * list is read: a suppressed notification is one the user never wanted, and
+   * keeping it out of the table is what makes the inbox and the unread count
+   * agree without every reader re-applying the rules. The consequence (enabling
+   * a kind later does not backfill what was suppressed) is documented in the
+   * ADR.
+   *
+   * Callers ignore the return value; null is the suppression signal.
+   */
   async create(input: {
     userId: string;
     projectId?: string;
@@ -63,14 +82,19 @@ export class NotificationRepository {
     title: string;
     body?: string;
     linkPath?: string;
-  }): Promise<Notification> {
+  }): Promise<Notification | null> {
+    const projectId = input.projectId ?? null;
+    if (!(await this.shouldRecord(input.userId, input.kind, projectId))) {
+      return null;
+    }
+
     const result = await this.db.query<NotificationRow>(
       `INSERT INTO notifications (user_id, project_id, kind, title, body, link_path)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING ${notificationColumns}`,
       [
         input.userId,
-        input.projectId ?? null,
+        projectId,
         input.kind,
         input.title,
         input.body ?? null,
@@ -78,6 +102,35 @@ export class NotificationRepository {
       ],
     );
     return mapNotification(result.rows[0]);
+  }
+
+  /**
+   * Whether this user wants this notification at all.
+   *
+   * A notification with no project cannot be traced to an organization —
+   * `notifications` stores only `project_id`, and both preference shapes are
+   * keyed off the project — so no preference row can match and the answer is
+   * "notify". That is the safe direction (it preserves pre-preferences
+   * behaviour) and it is stated in the ADR rather than left implicit. Every
+   * create site passes a project today; the branch exists because the column
+   * is nullable.
+   */
+  private async shouldRecord(
+    userId: string,
+    kind: string,
+    projectId: string | null,
+  ): Promise<boolean> {
+    if (projectId === null) return true;
+
+    const organizationId = await this.preferences.organizationIdForProject(projectId);
+    if (!organizationId) return true;
+
+    const [preferences, projectMuted] = await Promise.all([
+      this.preferences.listForUserOrganization(userId, organizationId),
+      this.preferences.isProjectMuted(userId, projectId),
+    ]);
+
+    return shouldNotify({ kind, projectId, projectMuted, preferences });
   }
 
   async markRead(notificationId: string, userId: string): Promise<Notification | null> {

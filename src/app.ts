@@ -27,6 +27,8 @@ import { JobMessageRepository } from "./jobs/messages-repository.js";
 import { createJobsInternalRouter } from "./jobs/internal-routes.js";
 import { NotificationRepository } from "./notifications/repository.js";
 import { createNotificationsRouter } from "./notifications/routes.js";
+import { createNotificationPreferencesRouter } from "./notifications/preferences-routes.js";
+import { NotificationPreferencesRepository } from "./notifications/preferences-repository.js";
 import { ProjectRepository } from "./projects/repository.js";
 import { createProjectsRouter } from "./projects/routes.js";
 import { createProjectsInternalRouter } from "./projects/internal-routes.js";
@@ -184,6 +186,16 @@ export function createApp(deps?: AppDependencies): Express {
       featureOverrides: featureModelOverrides,
       featureSecrets: featureModelSecrets,
       audit,
+    }),
+  );
+  app.use(
+    "/settings",
+    createNotificationPreferencesRouter({
+      users,
+      sessions,
+      organizations,
+      projects,
+      preferences: new NotificationPreferencesRepository(deps.pool),
     }),
   );
   app.use(
