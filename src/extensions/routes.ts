@@ -12,6 +12,7 @@ import type { AuditRecorder } from "../audit/record.js";
 import { EXTENSION_LIMITS, validateExtensionBundle } from "./bundle.js";
 import type { OrgExtensionRepository } from "./repository.js";
 import { toPublicOrgExtension } from "./types.js";
+import type { OrgExtension } from "./types.js";
 
 /**
  * ADR 025: uploaded Pi extensions are an **organization-level** resource
@@ -96,6 +97,30 @@ export function createOrgExtensionsRouter(deps: {
     return orgId;
   }
 
+  /**
+   * Build the public shape with the uploader and opt-in count a list row
+   * carries. Reading the list back rather than filling these in from the
+   * mutation means one extension has exactly one representation: an admin
+   * comparing a POST response against the list must not see two different
+   * "uploaded by" or "enabled in N projects" values for the same row.
+   */
+  async function withOrgContext(
+    orgId: string,
+    extension: OrgExtension,
+  ): Promise<ReturnType<typeof toPublicOrgExtension>> {
+    const rows = await deps.extensions.listForOrganization(orgId);
+    const row = rows.find((candidate) => candidate.id === extension.id);
+    if (row) return toPublicOrgExtension(row);
+    return toPublicOrgExtension({
+      ...extension,
+      uploadedByUsername: null,
+      uploadedByDisplayName: null,
+      // Not in the list this request just read — a racing delete, or a fake
+      // repository under test. Report zero rather than guessing a number.
+      enabledProjectCount: 0,
+    });
+  }
+
   router.get("/:organizationId/extensions", requireAuth, async (req, res) => {
     const orgId = await requireOrgAdmin(req, res);
     if (!orgId) return;
@@ -127,12 +152,7 @@ export function createOrgExtensionsRouter(deps: {
 
     res.json({
       extension: {
-        ...toPublicOrgExtension({
-          ...extension,
-          uploadedByUsername: null,
-          uploadedByDisplayName: null,
-          enabledProjectCount: enabledProjects.length,
-        }),
+        ...(await withOrgContext(orgId, extension)),
         // The source is served here so a second admin can read what is
         // actually installed before trusting it — the only real control this
         // feature has. Rendered as text by the Web app, never as HTML.
@@ -209,18 +229,13 @@ export function createOrgExtensionsRouter(deps: {
 
     res.status(201).json({
       extension: {
-        ...toPublicOrgExtension({
-          ...saved,
-          uploadedByUsername: null,
-          uploadedByDisplayName: null,
-          enabledProjectCount: 0,
-        }),
+        ...(await withOrgContext(orgId, saved)),
         files: bundle.files.map((file) => ({
           path: file.path,
           content: file.content,
           sizeBytes: file.sizeBytes,
         })),
-        enabledProjects: [],
+        enabledProjects: await deps.extensions.listEnabledProjects(orgId),
       },
     });
   });
@@ -259,12 +274,7 @@ export function createOrgExtensionsRouter(deps: {
 
     const refreshed = await deps.extensions.findById(extensionId);
     res.json({
-      extension: toPublicOrgExtension({
-        ...(refreshed ?? extension),
-        uploadedByUsername: null,
-        uploadedByDisplayName: null,
-        enabledProjectCount: 0,
-      }),
+      extension: await withOrgContext(orgId, refreshed ?? extension),
     });
   });
 

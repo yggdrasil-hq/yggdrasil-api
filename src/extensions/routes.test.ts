@@ -363,3 +363,55 @@ describe("DELETE /organizations/:organizationId/extensions/:extensionId", () => 
     expect(extensions.remove).not.toHaveBeenCalled();
   });
 });
+
+// The POST/PATCH/detail responses must agree with the list view about who
+// uploaded an extension and how many projects load it. Returning 0 there while
+// the list says 2 would be a quiet inaccuracy in the surface an admin uses to
+// decide whether to trust the thing.
+describe("mutation responses agree with the list view (ADR 025)", () => {
+  it("reports the real uploader and opt-in count on upload", async () => {
+    const { app } = buildApp({
+      existing: [
+        {
+          ...makeExtension(),
+          uploadedByUsername: "sarat",
+          uploadedByDisplayName: "Sarat",
+          enabledProjectCount: 2,
+        },
+      ],
+    });
+
+    const res = await authed(app)
+      .post(BASE)
+      .send(uploadBody({ name: "My extension", slug: "my-ext" }));
+
+    expect(res.status).toBe(201);
+    expect(res.body.extension.uploadedBy).toEqual({ username: "sarat", displayName: "Sarat" });
+    expect(res.body.extension.enabledProjectCount).toBe(2);
+  });
+
+  it("reports the opt-in count and uploader on the detail read", async () => {
+    const { app } = buildApp({
+      existing: [
+        {
+          ...makeExtension(),
+          uploadedByUsername: "sarat",
+          uploadedByDisplayName: "Sarat",
+          enabledProjectCount: 3,
+        },
+      ],
+      enabledProjects: [
+        { id: "p1", name: "Acme web", slug: "acme-web" },
+        { id: "p2", name: "Acme api", slug: "acme-api" },
+        { id: "p3", name: "Acme ops", slug: "acme-ops" },
+      ],
+    });
+
+    const res = await authed(app).get(`${BASE}/${EXTENSION_ID}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.extension.enabledProjectCount).toBe(3);
+    expect(res.body.extension.enabledProjects).toHaveLength(3);
+    expect(res.body.extension.uploadedBy).toEqual({ username: "sarat", displayName: "Sarat" });
+  });
+});
