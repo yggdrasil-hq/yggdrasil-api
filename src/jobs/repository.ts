@@ -1,4 +1,5 @@
 import type pg from "pg";
+import type { Queryable } from "../db/pool.js";
 import type { Job, JobKind, JobStatus } from "./types.js";
 
 interface JobRow {
@@ -70,8 +71,8 @@ export class JobRepository {
     designDescription?: string;
     specContext?: Record<string, unknown>;
     targetRevision?: number;
-  }): Promise<Job> {
-    const result = await this.db.query<JobRow>(
+  }, client?: Queryable): Promise<Job> {
+    const result = await (client ?? this.db).query<JobRow>(
       `INSERT INTO jobs
          (project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
           design_name, design_slug, design_description, spec_context, status,

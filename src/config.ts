@@ -54,6 +54,26 @@ export const config = {
   },
   secretsEncryptionKey: process.env.SECRETS_ENCRYPTION_KEY ?? "",
   internalApiToken: process.env.INTERNAL_API_TOKEN ?? "",
+  /**
+   * ADR 026's test-run scheduler, which the API process runs in-process (see
+   * `scheduling/scheduler.ts` for why it is not its own service).
+   *
+   * `intervalMs` is the resolution of every schedule — a test cannot fire
+   * sooner than one tick after its window opens — so it is deliberately well
+   * under the product's one-hour minimum test interval, and its minimum is
+   * floored so a bad env var cannot turn the ticker into a busy loop against
+   * the database. `enabled` exists so a developer can run the API without
+   * background work; it is on by default because a scheduler that has to be
+   * switched on is a scheduler that silently does nothing after a fresh
+   * install.
+   */
+  scheduler: {
+    enabled: process.env.TEST_SCHEDULER_ENABLED !== "false",
+    intervalMs: Math.max(
+      1_000,
+      Number(process.env.TEST_SCHEDULER_INTERVAL_MS) || 60_000,
+    ),
+  },
   sessionTtl: {
     defaultMs: 24 * 60 * 60 * 1000,
     rememberMs: 30 * 24 * 60 * 60 * 1000,

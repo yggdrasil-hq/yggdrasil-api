@@ -5,6 +5,8 @@ import type {
   TestRunStep,
   TestStepStatus,
 } from "./report-types.js";
+import type { JobStatus } from "../jobs/types.js";
+import type { TestRunHistoryEntry } from "./run-history.js";
 
 interface ReportRow {
   job_id: string;
@@ -28,6 +30,27 @@ interface StepRow {
   screenshot_path: string | null;
   created_at: Date;
 }
+
+/**
+ * ADR 026: the job-side columns a history entry needs, which the report
+ * tables do not carry.
+ */
+interface HistoryJobRow {
+  id: string;
+  test_id: string | null;
+  test_group: "unit" | "integration" | null;
+  status: JobStatus;
+  trigger_source: "feature" | "schedule" | null;
+  ref: string | null;
+  created_at: Date;
+  started_at: Date | null;
+  completed_at: Date | null;
+}
+
+const historyJobColumns = `
+  id, test_id, test_group, status, trigger_source, ref,
+  created_at, started_at, completed_at
+`;
 
 function mapStep(row: StepRow): TestRunStep {
   return {
@@ -181,5 +204,121 @@ export class TestRunReportRepository {
       [jobId],
     );
     return result.rows.map(mapStep);
+  }
+
+  /**
+   * ADR 026: a Test entity's run history, newest first.
+   *
+   * Three queries, not three per run: a page of history is one job query, one
+   * batched report query and one batched step query. The obvious per-job
+   * `findByJob` loop would issue 2N queries for a 50-run page, which is the
+   * kind of thing that only shows up on the slowest install.
+   *
+   * Every status is included, not just completed ones — a run that is still
+   * running, or that failed before reporting, is part of the history the page
+   * is meant to show, and dropping them would make a stuck schedule invisible.
+   */
+  async listRunsForTest(
+    testId: string,
+    limit: number,
+  ): Promise<TestRunHistoryEntry[]> {
+    const jobResult = await this.db.query<HistoryJobRow>(
+      `SELECT ${historyJobColumns}
+       FROM jobs
+       WHERE test_id = $1
+         AND kind IN ('test_run', 'script_test_run')
+       ORDER BY created_at DESC, id DESC
+       LIMIT $2`,
+      [testId, limit],
+    );
+    return this.assembleHistory(jobResult.rows);
+  }
+
+  /**
+   * One run of one test, or null when the job does not belong to that test.
+   *
+   * Scoping by `test_id` in the WHERE clause (rather than fetching the job and
+   * comparing in the caller) is what keeps a run from one project readable
+   * through another project's id: the route resolves the test through the
+   * caller's project first, so a cross-project read has nothing to match.
+   */
+  async findRunForTest(
+    testId: string,
+    jobId: string,
+  ): Promise<TestRunHistoryEntry | null> {
+    const jobResult = await this.db.query<HistoryJobRow>(
+      `SELECT ${historyJobColumns}
+       FROM jobs
+       WHERE test_id = $1
+         AND id = $2
+         AND kind IN ('test_run', 'script_test_run')`,
+      [testId, jobId],
+    );
+    const entries = await this.assembleHistory(jobResult.rows);
+    return entries[0] ?? null;
+  }
+
+  /**
+   * Joins a page of job rows to their reports and steps in two batched reads.
+   * Reports are keyed by job_id and joined in memory rather than in SQL so one
+   * shape of `mapReport` (the single spelling of a report) serves both this and
+   * `findByJob`.
+   */
+  private async assembleHistory(
+    jobs: HistoryJobRow[],
+  ): Promise<TestRunHistoryEntry[]> {
+    if (jobs.length === 0) return [];
+    const jobIds = jobs.map((job) => job.id);
+
+    const [reportResult, stepResult] = await Promise.all([
+      this.db.query<ReportRow>(
+        `SELECT job_id, passed, failed, skipped, total, coverage_percent,
+                failing_tests, summary, recording_path, created_at
+         FROM test_run_reports
+         WHERE job_id = ANY($1::uuid[])`,
+        [jobIds],
+      ),
+      this.db.query<StepRow>(
+        `SELECT job_id, name, status, details, screenshot_path, created_at
+         FROM test_run_steps
+         WHERE job_id = ANY($1::uuid[])
+         ORDER BY created_at ASC`,
+        [jobIds],
+      ),
+    ]);
+
+    const stepsByJob = new Map<string, TestRunStep[]>();
+    for (const row of stepResult.rows) {
+      const steps = stepsByJob.get(row.job_id) ?? [];
+      steps.push(mapStep(row));
+      stepsByJob.set(row.job_id, steps);
+    }
+
+    const reportByJob = new Map<string, ReportRow>();
+    for (const row of reportResult.rows) {
+      reportByJob.set(row.job_id, row);
+    }
+
+    return jobs.map((job) => {
+      const steps = stepsByJob.get(job.id) ?? [];
+      const reportRow = reportByJob.get(job.id);
+      return {
+        jobId: job.id,
+        testId: job.test_id ?? "",
+        status: job.status,
+        trigger: job.trigger_source,
+        testGroup: job.test_group,
+        ref: job.ref,
+        createdAt: job.created_at,
+        startedAt: job.started_at,
+        completedAt: job.completed_at,
+        // The job's own test_id is what completes the report row, whose batch
+        // query deliberately does not re-join `jobs` just to fetch it.
+        report: reportRow
+          ? mapReport({ ...reportRow, test_id: job.test_id }, steps)
+          : null,
+        steps,
+      };
+    });
   }
 }

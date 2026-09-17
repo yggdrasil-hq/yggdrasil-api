@@ -226,6 +226,9 @@ function buildApp(opts: BuildAppOptions) {
   };
   const testRunReports = {
     listByFeature: vi.fn(async () => []),
+    // ADR 026 (issue #16): the standalone Testing product's history reads.
+    listRunsForTest: vi.fn(async () => []),
+    findRunForTest: vi.fn(async () => null),
   };
   const audit = {
     record: vi.fn(async (_res: unknown, _input: { action: string }) => undefined),
@@ -262,6 +265,9 @@ function buildApp(opts: BuildAppOptions) {
     ),
   };
   const tests = {
+    // ADR 026's history routes resolve the test through the project before
+    // reading anything, so they need findById stubbed per test.
+    findById: vi.fn(async () => null),
     create: vi.fn(async (input: {
       projectId: string;
       name: string;
@@ -1360,5 +1366,245 @@ describe("POST /projects/:projectId/features/:featureId/restart", () => {
     );
 
     expect(res.status).toBe(409);
+  });
+});
+
+// ADR 026 (issue #16): the standalone Testing product's per-Test run history.
+// Distinct from ADR 015's per-feature Testing tab, which the suite already
+// covers above — these are the project-level reads.
+describe("GET /projects/:projectId/tests/:testId/runs", () => {
+  function historyEntry(overrides: Record<string, unknown> = {}) {
+    return {
+      jobId: "44444444-4444-4444-8444-444444444444",
+      testId: "33333333-3333-4333-8333-333333333333",
+      status: "completed",
+      trigger: "schedule",
+      testGroup: null,
+      ref: "main",
+      createdAt: new Date("2026-09-17T09:00:00Z"),
+      startedAt: new Date("2026-09-17T09:00:05Z"),
+      completedAt: new Date("2026-09-17T09:01:35Z"),
+      report: {
+        jobId: "44444444-4444-4444-8444-444444444444",
+        testId: "33333333-3333-4333-8333-333333333333",
+        passed: 12,
+        failed: 1,
+        skipped: 0,
+        total: 13,
+        coveragePercent: 84.5,
+        failingTests: ["checkout rejects an expired card"],
+        summary: "12 passed, 1 failed",
+        recordingPath: null,
+        createdAt: new Date("2026-09-17T09:01:30Z"),
+        steps: [],
+      },
+      steps: [],
+      ...overrides,
+    };
+  }
+
+  it("returns the test's run history, newest first, scoped to the project", async () => {
+    const project = makeProject();
+    const { app, testRunReports, tests } = buildApp({ project });
+    tests.findById.mockResolvedValue({ id: "33333333-3333-4333-8333-333333333333", projectId: project.id } as never);
+    testRunReports.listRunsForTest.mockResolvedValue([historyEntry()] as never);
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.testId).toBe("33333333-3333-4333-8333-333333333333");
+    expect(res.body.runs).toHaveLength(1);
+    expect(res.body.runs[0]).toMatchObject({
+      jobId: "44444444-4444-4444-8444-444444444444",
+      status: "completed",
+      trigger: "schedule",
+      ref: "main",
+    });
+    // The report is flattened for the wire, with its own timestamps ISO-d.
+    expect(res.body.runs[0].report).toMatchObject({
+      passed: 12,
+      failed: 1,
+      total: 13,
+      failingTests: ["checkout rejects an expired card"],
+    });
+    expect(typeof res.body.runs[0].createdAt).toBe("string");
+    // Duration is derived server-side so both surfaces agree.
+    expect(res.body.runs[0].durationMs).toBe(90_000);
+    // Scoped by the resolved test, not by a client-supplied id.
+    expect(testRunReports.listRunsForTest).toHaveBeenCalledWith("33333333-3333-4333-8333-333333333333", 50);
+  });
+
+  it("404s for a test that is not in this project", async () => {
+    const project = makeProject();
+    const { app, testRunReports, tests } = buildApp({ project });
+    tests.findById.mockResolvedValue(null);
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/tests/55555555-5555-4555-8555-555555555555/runs`,
+    );
+
+    expect(res.status).toBe(404);
+    // Crucially the history is never read: project scoping happens first.
+    expect(testRunReports.listRunsForTest).not.toHaveBeenCalled();
+  });
+
+  it("404s for an unknown project", async () => {
+    const project = makeProject();
+    const { app, testRunReports, projects } = buildApp({ project });
+    projects.findByIdForUser.mockResolvedValue(null);
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs`,
+    );
+
+    expect(res.status).toBe(404);
+    expect(testRunReports.listRunsForTest).not.toHaveBeenCalled();
+  });
+
+  it("401s when unauthenticated", async () => {
+    const project = makeProject();
+    const { app } = buildApp({ project });
+
+    const res = await request(app).get(
+      `/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs`,
+    );
+
+    expect(res.status).toBe(401);
+  });
+
+  it("honours a limit and caps an absurd one", async () => {
+    const project = makeProject();
+    const { app, testRunReports, tests } = buildApp({ project });
+    tests.findById.mockResolvedValue({ id: "33333333-3333-4333-8333-333333333333", projectId: project.id } as never);
+
+    await authedRequest(app).get(`/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs?limit=5`);
+    expect(testRunReports.listRunsForTest).toHaveBeenLastCalledWith("33333333-3333-4333-8333-333333333333", 5);
+
+    await authedRequest(app).get(`/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs?limit=99999`);
+    expect(testRunReports.listRunsForTest).toHaveBeenLastCalledWith("33333333-3333-4333-8333-333333333333", 200);
+
+    // A junk limit is a display hint, not a client error.
+    await authedRequest(app).get(`/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs?limit=abc`);
+    expect(testRunReports.listRunsForTest).toHaveBeenLastCalledWith("33333333-3333-4333-8333-333333333333", 50);
+  });
+
+  it("returns an empty history rather than failing for a never-run test", async () => {
+    const project = makeProject();
+    const { app, tests, testRunReports } = buildApp({ project });
+    tests.findById.mockResolvedValue({ id: "33333333-3333-4333-8333-333333333333", projectId: project.id } as never);
+    testRunReports.listRunsForTest.mockResolvedValue([] as never);
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.runs).toEqual([]);
+  });
+});
+
+describe("GET /projects/:projectId/tests/:testId/runs/:jobId", () => {
+  it("returns one run with its steps", async () => {
+    const project = makeProject();
+    const { app, testRunReports, tests } = buildApp({ project });
+    tests.findById.mockResolvedValue({ id: "33333333-3333-4333-8333-333333333333", projectId: project.id } as never);
+    testRunReports.findRunForTest.mockResolvedValue({
+      jobId: "44444444-4444-4444-8444-444444444444",
+      testId: "33333333-3333-4333-8333-333333333333",
+      status: "failed",
+      trigger: "schedule",
+      testGroup: null,
+      ref: "main",
+      createdAt: new Date("2026-09-17T09:00:00Z"),
+      startedAt: new Date("2026-09-17T09:00:00Z"),
+      completedAt: new Date("2026-09-17T09:00:30Z"),
+      report: null,
+      steps: [
+        {
+          name: "signs in",
+          status: "pass",
+          details: null,
+          screenshotPath: null,
+          createdAt: new Date("2026-09-17T09:00:10Z"),
+        },
+        {
+          name: "adds to cart",
+          status: "fail",
+          details: "cart badge stayed 0",
+          screenshotPath: "steps/cart.png",
+          createdAt: new Date("2026-09-17T09:00:20Z"),
+        },
+      ],
+    } as never);
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs/44444444-4444-4444-8444-444444444444`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.jobId).toBe("44444444-4444-4444-8444-444444444444");
+    expect(res.body.status).toBe("failed");
+    // A run that failed before reporting still shows its steps, and says so
+    // with a null report rather than a fabricated zeroed one.
+    expect(res.body.report).toBeNull();
+    expect(res.body.steps).toHaveLength(2);
+    expect(res.body.steps[1]).toMatchObject({
+      name: "adds to cart",
+      status: "fail",
+      details: "cart badge stayed 0",
+    });
+    expect(testRunReports.findRunForTest).toHaveBeenCalledWith("33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444");
+  });
+
+  it("404s when the run belongs to a different test", async () => {
+    const project = makeProject();
+    const { app, testRunReports, tests } = buildApp({ project });
+    tests.findById.mockResolvedValue({ id: "33333333-3333-4333-8333-333333333333", projectId: project.id } as never);
+    testRunReports.findRunForTest.mockResolvedValue(null);
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs/22222222-2222-4222-8222-222222222222`,
+    );
+
+    expect(res.status).toBe(404);
+  });
+
+  it("404s on a malformed job id without querying", async () => {
+    const project = makeProject();
+    const { app, testRunReports, tests } = buildApp({ project });
+    tests.findById.mockResolvedValue({ id: "33333333-3333-4333-8333-333333333333", projectId: project.id } as never);
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs/not-a-uuid`,
+    );
+
+    expect(res.status).toBe(404);
+    expect(testRunReports.findRunForTest).not.toHaveBeenCalled();
+  });
+
+  it("404s for a test outside this project", async () => {
+    const project = makeProject();
+    const { app, testRunReports, tests } = buildApp({ project });
+    tests.findById.mockResolvedValue(null);
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/tests/55555555-5555-4555-8555-555555555555/runs/44444444-4444-4444-8444-444444444444`,
+    );
+
+    expect(res.status).toBe(404);
+    expect(testRunReports.findRunForTest).not.toHaveBeenCalled();
+  });
+
+  it("401s when unauthenticated", async () => {
+    const project = makeProject();
+    const { app } = buildApp({ project });
+
+    const res = await request(app).get(
+      `/projects/${project.id}/tests/33333333-3333-4333-8333-333333333333/runs/44444444-4444-4444-8444-444444444444`,
+    );
+
+    expect(res.status).toBe(401);
   });
 });
