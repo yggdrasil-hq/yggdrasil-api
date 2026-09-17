@@ -63,6 +63,9 @@ import { createFeatureModelConfigRouter } from "./model-config/feature-routes.js
 import { FeatureModelSecretRepository } from "./secrets/feature-model-repository.js";
 import { TestRepository } from "./tests/repository.js";
 import { TestRunReportRepository } from "./tests/reports-repository.js";
+import { JobRecordingRepository } from "./recordings/repository.js";
+import { createRecordingsRouter } from "./recordings/routes.js";
+import { createRecordingsInternalRouter } from "./recordings/internal-routes.js";
 import { UserRepository } from "./users/repository.js";
 
 export interface AppDependencies {
@@ -100,6 +103,7 @@ export function createApp(deps?: AppDependencies): Express {
   const audit = new PostgresAuditRecorder(auditEvents);
   const deploys = new ProjectDeployRepository(deps.pool);
   const previews = new JobPreviewRepository(deps.pool);
+  const recordings = new JobRecordingRepository(deps.pool);
   app.use(
     "/webhooks",
     createGitHubWebhookRouter({
@@ -312,11 +316,25 @@ export function createApp(deps?: AppDependencies): Express {
   // ADR 003 §15: a project's previews, read-only. Same `/projects` mount as
   // the designs/deploys routers; no shared param-shaped route.
   app.use("/projects", createPreviewsRouter({ users, sessions, projects, previews }));
+  // ADR 029: a job's screen recording and its metadata, read behind the
+  // ordinary session cookie (deliberately not public, unlike previews — see
+  // recordings/routes.ts). Same `/projects` mount; the path is `jobs/:jobId`,
+  // which no sibling router claims.
+  app.use(
+    "/projects",
+    createRecordingsRouter({ users, sessions, projects, jobs, recordings }),
+  );
   app.use(
     "/internal",
     createOrganizationsInternalRouter({ projects, clusters: orgClusters }),
   );
   app.use("/internal", createProjectsInternalRouter({ projects, installations }));
+  // ADR 029: the Orchestrator uploads a job's recording here before the pod is
+  // deleted. Binary body, so the route carries its own `express.raw` parser.
+  app.use(
+    "/internal",
+    createRecordingsInternalRouter({ jobs, recordings }),
+  );
   app.use(
     "/internal",
     createFeaturesInternalRouter({ features, projects, installations, tests, jobs }),

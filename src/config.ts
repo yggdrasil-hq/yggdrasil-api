@@ -78,6 +78,38 @@ export const config = {
     defaultMs: 24 * 60 * 60 * 1000,
     rememberMs: 30 * 24 * 60 * 60 * 1000,
   },
+  /**
+   * ADR 029: test-run screen recordings.
+   *
+   * `maxBytes` is the single most important number here. A recording is orders
+   * of magnitude larger than the JSON report it accompanies, and ADR 029 stores
+   * the bytes in Postgres (no S3 client exists in this codebase — see
+   * `recordings/repository.ts`), so an unbounded upload is a way to exhaust the
+   * database. 25 MB comfortably covers a several-minute Playwright session of a
+   * UI test at a sane viewport; a run that exceeds it is *skipped*, not failed,
+   * and the fact that it was skipped is what the report records.
+   *
+   * `retentionDays` is the other half of that bound. Video accrues far faster
+   * than reports do, so "keep it forever" is only viable for a demo install;
+   * 30 days keeps a month of history, which is the window in which a failed
+   * run's recording is actually useful for diagnosis. Expiry does not delete the
+   * row — it tombstones it (see `recordings/repository.ts`), so the UI can still
+   * say a recording existed and was reclaimed.
+   *
+   * `sweepIntervalMs` is floored like the scheduler's, so a bad env var cannot
+   * turn the sweep into a busy loop. `enabled` follows the scheduler's
+   * reasoning: a background job that has to be switched on is one that silently
+   * does nothing after a fresh install.
+   */
+  recordings: {
+    enabled: process.env.RECORDINGS_ENABLED !== "false",
+    maxBytes: Math.max(0, Number(process.env.RECORDING_MAX_BYTES) || 25_000_000),
+    retentionDays: Math.max(1, Number(process.env.RECORDING_RETENTION_DAYS) || 30),
+    sweepIntervalMs: Math.max(
+      1_000,
+      Number(process.env.RECORDING_SWEEP_INTERVAL_MS) || 15 * 60_000,
+    ),
+  },
   rateLimit: {
     perUsername: { max: 10, windowMs: 15 * 60 * 1000 },
     perIp: { max: 30, windowMs: 15 * 60 * 1000 },
