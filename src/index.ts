@@ -7,6 +7,7 @@ import { closePool, createListenerClient, getPool } from "./db/pool.js";
 import { FeatureRepository } from "./features/repository.js";
 import { JobEventRepository } from "./jobs/events-repository.js";
 import { JobRepository } from "./jobs/repository.js";
+import { PostgresDeltaPublisher } from "./live/deltas.js";
 import { LiveHub } from "./live/hub.js";
 import { startLiveRelay } from "./live/relay.js";
 import { createLiveSocketServer } from "./live/socket.js";
@@ -20,7 +21,12 @@ async function main(): Promise<void> {
   const pool = getPool();
   await runMigrations(pool);
 
-  const app = createApp({ pool });
+  const app = createApp({
+    pool,
+    // ADR 019 item 13: deltas reach the hub through Postgres, not directly, so
+    // that every replica's sockets can be reached — see PostgresDeltaPublisher.
+    live: new PostgresDeltaPublisher(pool, { onError: (message) => console.error(message) }),
+  });
   // ADR 019: the live event socket is attached to the HTTP server rather than
   // to the Express app — a WebSocket upgrade is an HTTP event Express never
   // sees, so there is no router to mount. Building the server here (instead of

@@ -1,13 +1,20 @@
 import type { JobEventRepository, JobEventWithScope } from "../jobs/events-repository.js";
 import type { LiveHub } from "./hub.js";
-import { liveTopicForFeature, toLiveJobEvent, type ServerFrame } from "./types.js";
+import {
+  deltaFromPayload,
+  LIVE_JOB_EVENT_DELTAS_CHANNEL,
+  LIVE_JOB_EVENTS_CHANNEL,
+  liveTopicForFeature,
+  toLiveJobEvent,
+  type ServerFrame,
+} from "./types.js";
 
 /**
- * The Postgres channel `JobEventRepository.create` announces new rows on.
- * Single-spelled here and imported by the repository test, so the writer and
- * the listener cannot drift onto different channel names (ADR 019 item 6).
+ * Re-exported from `types.js`, where both channel names live together so the
+ * writer and this listener cannot drift apart. Kept exported from here because
+ * the repository test imports it from this module.
  */
-export const LIVE_JOB_EVENTS_CHANNEL = "job_events";
+export { LIVE_JOB_EVENTS_CHANNEL };
 
 /**
  * The slice of `pg.Client` the relay uses. Narrow on purpose: a fake
@@ -116,6 +123,17 @@ export function startLiveRelay(deps: LiveRelayDeps): LiveRelayHandle {
     // relay that has been shut down — or, with the kill switch, for a relay the
     // operator has explicitly turned off.
     if (stopped) return;
+    // A malformed or empty delta is dropped rather than treated as a delivery
+    // failure: it is ephemeral by design, so there is nothing to repair and
+    // nothing to retry.
+    const envelope = deltaFromPayload(payload);
+    if (!envelope) return;
+    deps.hub.publish(envelope.topic, envelope.frame);
+  }
+
+  async function deliverStored(payload: string): Promise<void> {
+    // Same shutdown window as `deliver`.
+    if (stopped) return;
     try {
       const scope = await deps.jobEvents.findByIdWithScope(payload);
       if (!scope) return;
@@ -137,9 +155,18 @@ export function startLiveRelay(deps: LiveRelayDeps): LiveRelayHandle {
     client = listener;
 
     listener.on("notification", (message: { channel?: string; payload?: string }) => {
-      if (message?.channel !== LIVE_JOB_EVENTS_CHANNEL) return;
-      if (typeof message.payload !== "string" || message.payload === "") return;
-      void deliver(message.payload);
+      if (typeof message?.payload !== "string" || message.payload === "") return;
+      // Two channels, two delivery paths, deliberately: a stored event must be
+      // read back (its notification carries only an id), while a delta is
+      // self-contained because there is no row to read back. One shared path
+      // would mean either storing deltas or looking up an id that never existed.
+      if (message.channel === LIVE_JOB_EVENTS_CHANNEL) {
+        void deliverStored(message.payload);
+        return;
+      }
+      if (message.channel === LIVE_JOB_EVENT_DELTAS_CHANNEL) {
+        void deliver(message.payload);
+      }
     });
 
     // 'error' and 'end' both mean the subscription is gone. Reconnecting from
@@ -165,7 +192,11 @@ export function startLiveRelay(deps: LiveRelayDeps): LiveRelayHandle {
         await listener.end().catch(() => {});
         return;
       }
+      // Both channels on one connection: LISTEN is connection-scoped state, so
+      // a second channel costs nothing here and avoids a second dedicated
+      // client per replica.
       await listener.query(`LISTEN ${LIVE_JOB_EVENTS_CHANNEL}`);
+      await listener.query(`LISTEN ${LIVE_JOB_EVENT_DELTAS_CHANNEL}`);
     } catch (error) {
       onLost(`failed to establish listener: ${describe(error)}`);
     }

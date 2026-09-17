@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   LIVE_PROTOCOL_VERSION,
+  LIVE_DELTA_MAX_PAYLOAD_BYTES,
+  deltaFromPayload,
+  encodeDeltaPayload,
   liveTopicForFeature,
   parseClientFrame,
   toLiveJobEvent,
@@ -124,5 +127,71 @@ describe("LIVE_PROTOCOL_VERSION", () => {
   it("is a positive integer, so a client can compare rather than guess", () => {
     expect(Number.isInteger(LIVE_PROTOCOL_VERSION)).toBe(true);
     expect(LIVE_PROTOCOL_VERSION).toBeGreaterThan(0);
+  });
+});
+
+describe("delta payload contract", () => {
+  const delta = { featureId: FEATURE_ID, jobId: "job_1", text: "Hello " };
+
+  it("round-trips a delta from the writer to the frame the client receives", () => {
+    // The two halves of the delta contract: the API's NOTIFY payload and the
+    // relay's parse of it. Pinned together because they are written in different
+    // modules but must agree exactly, and a mismatch would silently drop every
+    // delta rather than fail loudly.
+    const payload = encodeDeltaPayload(delta);
+    expect(payload).not.toBeNull();
+
+    expect(deltaFromPayload(payload!)).toEqual({
+      topic: `feature:${FEATURE_ID}`,
+      frame: {
+        type: "job_event_delta",
+        featureId: FEATURE_ID,
+        jobId: "job_1",
+        // Verbatim, whitespace included: the client concatenates these, so a
+        // trimmed chunk would corrupt the streamed text.
+        text: "Hello ",
+      },
+    });
+  });
+
+  it("refuses to encode an empty text, feature id, or job id", () => {
+    expect(encodeDeltaPayload({ ...delta, text: "" })).toBeNull();
+    expect(encodeDeltaPayload({ ...delta, featureId: "" })).toBeNull();
+    expect(encodeDeltaPayload({ ...delta, jobId: "" })).toBeNull();
+  });
+
+  it("refuses an oversize payload, measured in bytes", () => {
+    // pg_notify's hard limit is 8000 bytes. A multi-byte character costs more
+    // than one, so the guard has to count bytes rather than characters — this
+    // string is under the limit by length and over it by bytes.
+    const multibyte = "\u00e9".repeat(4_000);
+    expect(multibyte.length).toBeLessThan(LIVE_DELTA_MAX_PAYLOAD_BYTES);
+    expect(encodeDeltaPayload({ ...delta, text: multibyte })).toBeNull();
+  });
+
+  it("parses a payload with extra fields rather than rejecting it", () => {
+    // Forward compatibility: a later producer adding a field should not break
+    // the relay's parse.
+    const parsed = deltaFromPayload(
+      JSON.stringify({ ...delta, somethingNew: true }),
+    );
+    expect(parsed?.frame).toMatchObject({ type: "job_event_delta" });
+  });
+
+  it("returns null for malformed or incomplete payloads", () => {
+    expect(deltaFromPayload("not json")).toBeNull();
+    expect(deltaFromPayload("null")).toBeNull();
+    expect(deltaFromPayload('"a string"')).toBeNull();
+    expect(deltaFromPayload(JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1" }))).toBeNull();
+    expect(deltaFromPayload(JSON.stringify({ ...delta, text: "" }))).toBeNull();
+    expect(deltaFromPayload(JSON.stringify({ ...delta, featureId: 7 }))).toBeNull();
+  });
+
+  it("routes the delta to the feature topic, not the job", () => {
+    // Subscription is by feature (ADR 019 item 9), so a delta for a later job of
+    // the same feature must reach the same subscribers.
+    const parsed = deltaFromPayload(JSON.stringify({ ...delta, jobId: "job_2" }));
+    expect(parsed?.topic).toBe(`feature:${FEATURE_ID}`);
+    expect(parsed?.frame).toMatchObject({ jobId: "job_2" });
   });
 });

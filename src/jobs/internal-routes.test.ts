@@ -92,6 +92,8 @@ function buildApp(deps: {
   projectFindById?: ReturnType<typeof vi.fn>;
   finalizeDesign?: ReturnType<typeof vi.fn>;
   upsertUsage?: ReturnType<typeof vi.fn>;
+  /** ADR 019 item 13: the streaming-delta publisher. */
+  publishDelta?: ReturnType<typeof vi.fn>;
   /** The catalog default for a job kind, which is how usage attribution finds a provider. */
   jobDefaultModelId?: string | null;
   catalogModel?: { providerName?: string } | null;
@@ -133,6 +135,7 @@ function buildApp(deps: {
   const findReport = deps.findReport ?? vi.fn(async () => null);
   const upsertUsage =
     deps.upsertUsage ?? vi.fn(async (input: { jobId: string }) => ({ jobId: input.jobId }));
+  const publishDelta = deps.publishDelta ?? vi.fn(async () => undefined);
   // resolveModelConfigSource walks the precedence ladder narrowest-first, so a
   // fake that resolves at the org-default tier is the simplest way to drive
   // usage attribution to a provider without a real catalog.
@@ -184,6 +187,7 @@ function buildApp(deps: {
         finalize: deps.finalizeDesign ?? vi.fn(async () => undefined),
       } as never,
       usage: { upsert: upsertUsage } as never,
+      live: { publishDelta } as never,
       modelConfig,
     }),
   );
@@ -954,6 +958,194 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .send({ type: "ask_user", question: "x" });
 
     expect(res.status).toBe(201);
+  });
+});
+
+describe("POST /internal/jobs/:jobId/events (streaming deltas, ADR 019 item 13)", () => {
+  it("relays a delta and stores nothing", async () => {
+    // The defining property of the delta path: the Orchestrator's stream of
+    // chunks is forwarded to the live relay, and not one of them becomes a
+    // job_events row.
+    const create = vi.fn(async () => makeEvent({}));
+    const publishDelta = vi.fn(async () => undefined);
+    const app = buildApp({
+      create,
+      publishDelta,
+      findById: async () => makeJob({ id: JOB_ID, featureId: "feature_42" }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text_delta", message: "Drafting " });
+
+    expect(res.status).toBe(202);
+    // No row, and therefore no id to return.
+    expect(res.body).toEqual({});
+    expect(create).not.toHaveBeenCalled();
+    expect(publishDelta).toHaveBeenCalledWith({
+      featureId: "feature_42",
+      jobId: JOB_ID,
+      text: "Drafting ",
+    });
+  });
+
+  it("does not become a storable event type", async () => {
+    // `jobEventSchema`'s enum stays authoritative for what can be persisted. A
+    // delta is accepted only by its own schema, so there is no request shape that
+    // both stores and streams one.
+    const create = vi.fn(async () => makeEvent({}));
+    const app = buildApp({ create, publishDelta: vi.fn(async () => undefined) });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text", message: "the finished message" });
+
+    // The stored path, unchanged: 201 and a row.
+    expect(res.status).toBe(201);
+    expect(create).toHaveBeenCalled();
+  });
+
+  it("derives the feature from the stored job, not from the request body", async () => {
+    // Scope comes from the API's own data, as on the usage route: otherwise the
+    // routing of one feature's text to another feature's subscribers would be
+    // assertable from outside.
+    const publishDelta = vi.fn(async () => undefined);
+    const app = buildApp({
+      findById: async () =>
+        makeJob({ id: JOB_ID, featureId: "feature_from_db", projectId: "proj_1" }),
+      publishDelta,
+    });
+
+    await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text_delta", message: "chunk", featureId: "feature_attacker" });
+
+    expect(publishDelta).toHaveBeenCalledWith({
+      featureId: "feature_from_db",
+      jobId: JOB_ID,
+      text: "chunk",
+    });
+  });
+
+  it("drops a delta for a job with no feature", async () => {
+    // ADR 014's project-scoped design_grill has no feature topic to route to.
+    const publishDelta = vi.fn(async () => undefined);
+    const app = buildApp({
+      findById: async () => makeJob({ id: JOB_ID, featureId: null }),
+      publishDelta,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text_delta", message: "chunk" });
+
+    expect(res.status).toBe(202);
+    expect(publishDelta).not.toHaveBeenCalled();
+  });
+
+  it("drops a delta for a job that does not exist", async () => {
+    const publishDelta = vi.fn(async () => undefined);
+    const app = buildApp({ findById: async () => null, publishDelta });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text_delta", message: "chunk" });
+
+    expect(res.status).toBe(202);
+    expect(publishDelta).not.toHaveBeenCalled();
+  });
+
+  it("still answers 202 when the relay itself fails", async () => {
+    // Best-effort by contract: the delta is ephemeral and the client has a REST
+    // catch-up, so a relay failure must not report an error the agent cannot act
+    // on — nor make the Orchestrator treat a streaming chunk as job-fatal.
+    const create = vi.fn(async () => makeEvent({}));
+    const publishDelta = vi.fn(async () => {
+      throw new Error("notify failed");
+    });
+    const app = buildApp({ create, publishDelta });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text_delta", message: "chunk" });
+
+    expect(res.status).toBe(202);
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it("rejects an empty or oversize delta rather than relaying it", async () => {
+    const publishDelta = vi.fn(async () => undefined);
+    const app = buildApp({ publishDelta });
+
+    for (const message of ["", "x".repeat(5_000)]) {
+      const res = await request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({ type: "agent_text_delta", message });
+
+      // Falls through to the stored-event schema, which rejects the type — so a
+      // malformed delta is a 400 rather than a silently forwarded no-op.
+      expect(res.status).toBe(400);
+    }
+    expect(publishDelta).not.toHaveBeenCalled();
+  });
+
+  it("requires the internal bearer token", async () => {
+    const publishDelta = vi.fn(async () => undefined);
+    const app = buildApp({ publishDelta });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .send({ type: "agent_text_delta", message: "chunk" });
+
+    expect(res.status).toBe(401);
+    expect(publishDelta).not.toHaveBeenCalled();
+  });
+
+  it("404s a delta for a job id that is not a uuid", async () => {
+    const app = buildApp({ publishDelta: vi.fn(async () => undefined) });
+
+    const res = await request(app)
+      .post("/internal/jobs/not-a-uuid/events")
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text_delta", message: "chunk" });
+
+    expect(res.status).toBe(404);
+  });
+
+  it("accepts a delta at default when no publisher is configured", async () => {
+    // The relay-off path: same status, nothing published, no error. A job must
+    // not break because the live relay is switched off.
+    const app = express();
+    app.use(express.json());
+    app.use(
+      "/internal",
+      createJobsInternalRouter({
+        jobEvents: { create: async () => makeEvent({}) } as never,
+        jobs: { findById: async () => makeJob({ featureId: "feature_42" }) } as never,
+        features: {} as never,
+        actionItems: {} as never,
+        tests: {} as never,
+        testRunReports: {} as never,
+        projects: {} as never,
+        designs: {} as never,
+        usage: {} as never,
+        modelConfig: {} as never,
+      }),
+    );
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text_delta", message: "chunk" });
+
+    expect(res.status).toBe(202);
   });
 });
 

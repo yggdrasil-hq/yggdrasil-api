@@ -86,13 +86,109 @@ export function liveTopicForFeature(featureId: string): string {
   return `feature:${featureId}`;
 }
 
+/**
+ * `pg_notify`'s hard limit is 8000 bytes. A streaming chunk is a handful of
+ * bytes, so this is not a real constraint on deltas — it is a guard so that a
+ * pathological value (a bug upstream, or a non-streaming producer misusing the
+ * endpoint) is dropped with a log line instead of failing the notification and
+ * taking the whole delta path down with it.
+ */
+export const LIVE_DELTA_MAX_PAYLOAD_BYTES = 7_000;
+
+/** The JSON shape `LIVE_JOB_EVENT_DELTAS_CHANNEL`'s payload carries. */
+export interface LiveDeltaPayload {
+  featureId: string;
+  jobId: string;
+  text: string;
+}
+
+/**
+ * Serialises a delta for `pg_notify`, or null when it cannot be sent.
+ *
+ * Pure and separate from the publisher so the payload contract (what the writer
+ * emits and what `deltaFromPayload` reads) is testable on both sides without a
+ * database — the same reason `relayEnvelopeFor` exists for stored events.
+ */
+export function encodeDeltaPayload(delta: LiveDeltaPayload): string | null {
+  if (delta.text === "" || delta.featureId === "" || delta.jobId === "") return null;
+  const payload = JSON.stringify(delta);
+  // Measured in bytes, not characters: the 8000-byte NOTIFY limit counts the
+  // encoded bytes, and a multi-byte character costs more than one.
+  if (Buffer.byteLength(payload) > LIVE_DELTA_MAX_PAYLOAD_BYTES) return null;
+  return payload;
+}
+
+/**
+ * Parses a delta notification back into the frame its feature's subscribers
+ * should receive, or null for anything malformed.
+ *
+ * Unlike the stored-event path this needs no database read, because the payload
+ * is self-contained (the row it would have read does not exist). Null is the
+ * whole error story: a delta is ephemeral, so a malformed one is dropped rather
+ * than being allowed to disturb the listener.
+ */
+export function deltaFromPayload(
+  payload: string,
+): { topic: string; frame: ServerFrame } | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(payload);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+
+  const delta = parsed as Record<string, unknown>;
+  if (typeof delta.featureId !== "string" || delta.featureId === "") return null;
+  if (typeof delta.jobId !== "string" || delta.jobId === "") return null;
+  if (typeof delta.text !== "string" || delta.text === "") return null;
+
+  return {
+    topic: liveTopicForFeature(delta.featureId),
+    frame: {
+      type: "job_event_delta",
+      featureId: delta.featureId,
+      jobId: delta.jobId,
+      text: delta.text,
+    },
+  };
+}
+
 export type ServerFrame =
   | { type: "ready"; protocolVersion: number }
   | { type: "subscribed"; featureId: string }
   | { type: "unsubscribed"; featureId: string }
   | { type: "job_event"; featureId: string; jobId: string; event: LiveJobEvent }
+  | { type: "job_event_delta"; featureId: string; jobId: string; text: string }
   | { type: "error"; message: string }
   | { type: "pong" };
+
+/**
+ * The Postgres channels the relay listens on.
+ *
+ * They live here, next to the frame vocabulary, because both are part of the
+ * same cross-process contract and the writer and the listener must agree on the
+ * exact spelling — a mismatch produces a relay that is silently never woken.
+ * A test pins the repository's `pg_notify` against `LIVE_JOB_EVENTS_CHANNEL`
+ * for exactly that reason.
+ */
+
+/**
+ * Payload: one event id. The listener reads the row back, because NOTIFY caps
+ * its payload at 8000 bytes and a stored event legitimately carries large
+ * markdown, summaries and design snapshots.
+ */
+export const LIVE_JOB_EVENTS_CHANNEL = "job_events";
+
+/**
+ * Payload: JSON `{featureId, jobId, text}` — self-contained, because a delta is
+ * never stored and therefore cannot be read back. This is also why a delta must
+ * not go directly to a single process's in-memory hub: every API replica's
+ * listener has to see it so that sockets held by *any* replica receive it
+ * (ADR 019 item 6; with the 2-replica deployment ADR 003 §20 commits to, an
+ * in-process-only publish reaches roughly half of them).
+ */
+export const LIVE_JOB_EVENT_DELTAS_CHANNEL = "job_event_deltas";
 
 export type ClientFrame =
   | { type: "subscribe"; projectId: string; featureId: string }

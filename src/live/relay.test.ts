@@ -8,7 +8,7 @@ import {
   type LiveListenerClient,
 } from "./relay.js";
 import type { JobEventWithScope } from "../jobs/events-repository.js";
-import type { ServerFrame } from "./types.js";
+import { LIVE_JOB_EVENT_DELTAS_CHANNEL, type ServerFrame } from "./types.js";
 
 const FEATURE_ID = "33333333-3333-4333-8333-333333333333";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
@@ -123,13 +123,130 @@ describe("relayEnvelopeFor", () => {
   });
 });
 
+describe("startLiveRelay: deltas", () => {
+  it("publishes a delta to its feature's subscribers without a database read", async () => {
+    // The delta path's reason for existing: one frame per chunk, with no row and
+    // no lookup.
+    const { fake, received, findByIdWithScope } = build();
+    await flush();
+
+    fake.emit("notification", {
+      channel: LIVE_JOB_EVENT_DELTAS_CHANNEL,
+      payload: JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1", text: "Hello " }),
+    });
+    await flush();
+
+    expect(received).toEqual([
+      { type: "job_event_delta", featureId: FEATURE_ID, jobId: "job_1", text: "Hello " },
+    ]);
+    expect(findByIdWithScope).not.toHaveBeenCalled();
+  });
+
+  it("preserves delta order", async () => {
+    // Ordering is the one thing a client cannot repair: it concatenates these.
+    const { fake, received } = build();
+    await flush();
+
+    for (const text of ["Drafting ", "the ", "ADR."]) {
+      fake.emit("notification", {
+        channel: LIVE_JOB_EVENT_DELTAS_CHANNEL,
+        payload: JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1", text }),
+      });
+    }
+    await flush();
+
+    expect(received.map((frame) => (frame as { text: string }).text)).toEqual([
+      "Drafting ",
+      "the ",
+      "ADR.",
+    ]);
+  });
+
+  it("keeps the two channels separate", async () => {
+    // A stored event's payload is an id and would parse as nothing on the delta
+    // path; a delta payload sent down the events channel is looked up as an id
+    // and, finding no such row, yields nothing. Neither may be mistaken for the
+    // other. The fake resolves only the real event id, like the repository would.
+    const { fake, received, findByIdWithScope } = build({
+      findByIdWithScope: vi.fn(async (id: string) => (id === EVENT_ID ? scope() : null)),
+    });
+    await flush();
+
+    const deltaPayload = JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1", text: "x" });
+
+    fake.emit("notification", { channel: LIVE_JOB_EVENT_DELTAS_CHANNEL, payload: EVENT_ID });
+    fake.emit("notification", { channel: LIVE_JOB_EVENTS_CHANNEL, payload: deltaPayload });
+    await flush();
+
+    expect(received).toEqual([]);
+    // The events channel attempted exactly one read-back, and it read the delta
+    // payload as though it were an event id — which is precisely the mistake the
+    // channel check exists to prevent. The delta channel did not read at all.
+    expect(findByIdWithScope).toHaveBeenCalledTimes(1);
+    expect(findByIdWithScope).toHaveBeenCalledWith(deltaPayload);
+  });
+
+  it("drops a malformed delta without disturbing the listener", async () => {
+    const { fake, received, onError, handle } = build();
+    await flush();
+
+    fake.emit("notification", { channel: LIVE_JOB_EVENT_DELTAS_CHANNEL, payload: "not json" });
+    fake.emit("notification", { channel: LIVE_JOB_EVENT_DELTAS_CHANNEL, payload: "{}" });
+    fake.emit("notification", {
+      channel: LIVE_JOB_EVENT_DELTAS_CHANNEL,
+      payload: JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1", text: "" }),
+    });
+    await flush();
+
+    expect(received).toEqual([]);
+    // Dropped quietly: an ephemeral frame is not worth an error line, still less
+    // a reconnect.
+    expect(onError).not.toHaveBeenCalled();
+    expect(fake.end).not.toHaveBeenCalled();
+    await handle.stop();
+  });
+
+  it("routes a delta by feature, so a later job of the same feature still reaches subscribers", async () => {
+    const { fake, received } = build();
+    await flush();
+
+    fake.emit("notification", {
+      channel: LIVE_JOB_EVENT_DELTAS_CHANNEL,
+      payload: JSON.stringify({ featureId: FEATURE_ID, jobId: "job_2", text: "retry text" }),
+    });
+    await flush();
+
+    expect(received).toEqual([
+      { type: "job_event_delta", featureId: FEATURE_ID, jobId: "job_2", text: "retry text" },
+    ]);
+  });
+
+  it("does not deliver a delta after stop", async () => {
+    const { fake, received, handle } = build();
+    await flush();
+    await handle.stop();
+
+    fake.emit("notification", {
+      channel: LIVE_JOB_EVENT_DELTAS_CHANNEL,
+      payload: JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1", text: "late" }),
+    });
+    await flush();
+
+    expect(received).toEqual([]);
+  });
+});
+
 describe("startLiveRelay", () => {
-  it("opens a dedicated connection and subscribes to the channel", async () => {
+  it("opens a dedicated connection and subscribes to both channels", async () => {
     const { fake } = build();
     await flush();
 
     expect(fake.connect).toHaveBeenCalledTimes(1);
     expect(fake.query).toHaveBeenCalledWith(`LISTEN ${LIVE_JOB_EVENTS_CHANNEL}`);
+    // Deltas ride their own channel — their payload is self-contained, so unlike
+    // a stored event there is no row to read back — but share the connection:
+    // LISTEN is connection-scoped state, so a second channel is free.
+    expect(fake.query).toHaveBeenCalledWith(`LISTEN ${LIVE_JOB_EVENT_DELTAS_CHANNEL}`);
   });
 
   it("delivers a notified event to the feature's subscribers", async () => {

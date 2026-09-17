@@ -70,9 +70,17 @@ import { JobRecordingRepository } from "./recordings/repository.js";
 import { createRecordingsRouter } from "./recordings/routes.js";
 import { createRecordingsInternalRouter } from "./recordings/internal-routes.js";
 import { UserRepository } from "./users/repository.js";
+import { NOOP_LIVE_PUBLISHER, type LivePublisher } from "./live/deltas.js";
 
 export interface AppDependencies {
   pool: pg.Pool;
+  /**
+   * ADR 019 item 13's streaming-delta relay. Omitted by every test (they build an
+   * app without a socket server or a listener), in which case a delta is
+   * accepted and dropped — the same outcome as a deployment with the relay
+   * switched off. `index.ts` is the only caller that passes a real one.
+   */
+  live?: LivePublisher;
 }
 
 export function createApp(deps?: AppDependencies): Express {
@@ -363,6 +371,7 @@ export function createApp(deps?: AppDependencies): Express {
       projects,
       designs,
       usage: jobUsage,
+      live: deps.live ?? NOOP_LIVE_PUBLISHER,
       modelConfig: {
         secrets,
         featureSecrets: featureModelSecrets,

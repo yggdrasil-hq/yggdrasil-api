@@ -18,6 +18,7 @@ import {
   type ModelConfigResolutionDeps,
 } from "../secrets/model-config.js";
 import type { JobUsageRepository } from "../usage/repository.js";
+import { NOOP_LIVE_PUBLISHER, type LivePublisher } from "../live/deltas.js";
 import { summarizeGrillTranscript } from "./grill-context.js";
 
 const actionItemSchema = z.object({
@@ -140,6 +141,25 @@ const requestedActionItemSchema = z.object({
 });
 
 /**
+ * ADR 019 item 13: one streaming chunk of assistant text.
+ *
+ * Deliberately NOT a member of `jobEventSchema`'s enum, and deliberately its own
+ * schema rather than a widened enum with a runtime exclusion. The stored-event
+ * enum stays authoritative for what can become a `job_events` row, so
+ * "`agent_text_delta` is relayed but never stored" is enforced by the shape of
+ * the validation rather than by a branch someone could later reorder.
+ *
+ * `message` is the delta text (the same field the Orchestrator already uses for
+ * prose), bounded because it travels through a `pg_notify` payload whose hard
+ * limit is 8000 bytes — a genuine chunk is a handful of bytes, so this only
+ * rejects a producer that is not actually streaming.
+ */
+const jobEventDeltaSchema = z.object({
+  type: z.literal("agent_text_delta"),
+  message: z.string().min(1).max(4_000),
+});
+
+/**
  * ADR 023: the accounting block the Orchestrator reads from Pi's own
  * get_session_stats at the end of a job's session. Non-negative throughout —
  * Pi cannot legitimately report negative usage, so a negative value is a bug
@@ -173,8 +193,15 @@ export function createJobsInternalRouter(deps: {
   designs: DesignRepository;
   usage: JobUsageRepository;
   modelConfig: ModelConfigResolutionDeps;
+  /**
+   * ADR 019 item 13's streaming-delta relay. Optional so the many tests that
+   * build this router without caring about the live path keep working, and so a
+   * deployment with the relay switched off can simply not pass one.
+   */
+  live?: LivePublisher;
 }): Router {
   const router = Router();
+  const live = deps.live ?? NOOP_LIVE_PUBLISHER;
 
   /**
    * ADR 023: records a finished job's token/cost accounting.
@@ -244,6 +271,25 @@ export function createJobsInternalRouter(deps: {
         return;
       }
 
+      // ADR 019 item 13: streaming text deltas are relayed, never stored, so this
+      // is checked BEFORE the stored-event schema — otherwise the enum would
+      // reject the type and no delta would ever be relayed at all.
+      //
+      // The scope is derived from the stored job rather than taken from the
+      // body, matching the usage route above: letting the caller name the
+      // feature would make the routing of one feature's text to another
+      // feature's subscribers assertable from outside.
+      const delta = jobEventDeltaSchema.safeParse(req.body);
+      if (delta.success) {
+        await publishDelta(deps, live, jobId, delta.data.message);
+        // 202, not 201: nothing was created. The caller cannot tell the
+        // difference between a relayed delta and a dropped one, and that is
+        // intended — deltas are best-effort and an error would report something
+        // the agent could not act on.
+        res.status(202).json({});
+        return;
+      }
+
       const parsed = jobEventSchema.safeParse(req.body);
       if (!parsed.success) {
         res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid event" });
@@ -299,6 +345,33 @@ export function createJobsInternalRouter(deps: {
   );
 
   return router;
+}
+
+/**
+ * Relays one streaming delta to a feature's subscribers (ADR 019 item 13).
+ *
+ * Never throws and never fails the request: the delta is ephemeral, the client
+ * already has a REST catch-up path, and the authoritative text still arrives as
+ * `agent_text`. A failure here is logged so it is visible without being
+ * propagated to a caller that has no way to act on it.
+ *
+ * A job with no `feature_id` (ADR 014's project-scoped `design_grill`) has no
+ * feature topic to route to and is dropped, exactly as the stored-event relay
+ * drops one.
+ */
+async function publishDelta(
+  deps: { jobs: JobRepository },
+  live: LivePublisher,
+  jobId: string,
+  text: string,
+): Promise<void> {
+  try {
+    const job = await deps.jobs.findById(jobId);
+    if (!job || !job.featureId) return;
+    await live.publishDelta({ featureId: job.featureId, jobId, text });
+  } catch (error) {
+    console.error(`failed to relay event delta for job ${jobId}:`, error);
+  }
 }
 
 /**
