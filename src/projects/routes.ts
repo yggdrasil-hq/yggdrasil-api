@@ -22,6 +22,7 @@ import { toPublicFeature } from "../features/types.js";
 import type { TestRepository } from "../tests/repository.js";
 import type { TestRunReportRepository } from "../tests/reports-repository.js";
 import { toPublicTestRunExecution } from "../tests/report-types.js";
+import { toPublicTestRunHistoryEntry } from "../tests/run-history.js";
 import {
   isValidCronExpression,
   meetsMinimumInterval,
@@ -161,6 +162,22 @@ const updateTestSchema = z.object({
   scheduleCron: z.string().min(1).optional(),
   enabled: z.boolean().optional(),
 });
+
+/**
+ * ADR 026: page size for a test's run history. Mirrors the audit trail's
+ * convention (default 50, capped at 200) so one read surface cannot be asked
+ * for an unbounded number of rows. A malformed value falls back to the default
+ * rather than erroring: this is a display hint, and a bad query string should
+ * not turn a readable page into a 400.
+ */
+const HISTORY_DEFAULT_LIMIT = 50;
+const HISTORY_MAX_LIMIT = 200;
+
+function historyLimit(raw: unknown): number {
+  const parsed = Number(typeof raw === "string" ? raw : HISTORY_DEFAULT_LIMIT);
+  if (!Number.isInteger(parsed) || parsed < 1) return HISTORY_DEFAULT_LIMIT;
+  return Math.min(parsed, HISTORY_MAX_LIMIT);
+}
 
 const addSubRepositorySchema = z.object({
   githubOwner: z.string().trim().min(1),
@@ -2254,6 +2271,83 @@ export function createProjectsRouter(deps: {
 
     res.json(toPublicTest(test));
   });
+
+  // ADR 026 (issue #16): a Test entity's own run history — the standalone
+  // Testing product's view, as opposed to ADR 015's per-feature Testing tab
+  // (`GET /:projectId/features/:featureId/testing`, below), which answers
+  // "did this feature's branch pass before review". Both read the same reports;
+  // they differ in what they are grouped by and what they show around them.
+  //
+  // Read-only, so no audit event (ADR 028 records mutations; read-auditing is
+  // explicitly out of its scope), and the same project-access gate as every
+  // other project read.
+  router.get("/:projectId/tests/:testId/runs", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const testId = parseFeatureId(routeParam(req.params.testId));
+    if (!testId) {
+      res.status(404).json({ error: "Test not found" });
+      return;
+    }
+
+    // Resolved through the project first, so another project's test id is a
+    // 404 rather than a readable history.
+    const test = await deps.tests.findById(project.id, testId);
+    if (!test) {
+      res.status(404).json({ error: "Test not found" });
+      return;
+    }
+
+    const limit = historyLimit(req.query.limit);
+    const runs = await deps.testRunReports.listRunsForTest(test.id, limit);
+
+    res.json({
+      testId: test.id,
+      runs: runs.map(toPublicTestRunHistoryEntry),
+    });
+  });
+
+  router.get(
+    "/:projectId/tests/:testId/runs/:jobId",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+
+      const testId = parseFeatureId(routeParam(req.params.testId));
+      if (!testId) {
+        res.status(404).json({ error: "Test not found" });
+        return;
+      }
+
+      const test = await deps.tests.findById(project.id, testId);
+      if (!test) {
+        res.status(404).json({ error: "Test not found" });
+        return;
+      }
+
+      const jobId = parseFeatureId(routeParam(req.params.jobId));
+      if (!jobId) {
+        res.status(404).json({ error: "Run not found" });
+        return;
+      }
+
+      const run = await deps.testRunReports.findRunForTest(test.id, jobId);
+      if (!run) {
+        res.status(404).json({ error: "Run not found" });
+        return;
+      }
+
+      res.json(toPublicTestRunHistoryEntry(run));
+    },
+  );
 
   return router;
 }

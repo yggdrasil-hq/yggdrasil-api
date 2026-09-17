@@ -2,6 +2,8 @@ import { createApp } from "./app.js";
 import { config } from "./config.js";
 import { runMigrations } from "./db/migrate.js";
 import { closePool, getPool } from "./db/pool.js";
+import { JobRepository } from "./jobs/repository.js";
+import { startScheduler } from "./scheduling/scheduler.js";
 
 async function main(): Promise<void> {
   const pool = getPool();
@@ -11,6 +13,20 @@ async function main(): Promise<void> {
   app.listen(config.port, "0.0.0.0", () => {
     console.log(`API listening on :${config.port}`);
   });
+
+  // ADR 026: the test-run scheduler. Started here rather than inside
+  // `createApp`, so building an app (every test in this repo) never spawns a
+  // background ticker, and so the ticker's lifetime is the process's. Several
+  // API replicas may each run one — that is safe by construction (the claim
+  // transaction's SKIP LOCKED, see scheduling/scheduler.ts), not by there being
+  // only one instance.
+  if (config.scheduler.enabled) {
+    startScheduler(
+      { pool, jobs: new JobRepository(pool) },
+      config.scheduler.intervalMs,
+      (message) => console.error(message),
+    );
+  }
 }
 
 if (process.env.NODE_ENV !== "test") {
