@@ -17,6 +17,15 @@ export const AUDIT_ACTIONS = {
   projectRepositoryUnlinked: "project.repository_unlinked",
   projectMarkedReady: "project.marked_ready",
   projectChartScaffoldFailed: "project.chart_scaffold_failed",
+  /**
+   * ADR 022: a primary-deployment rollback was requested. Recorded even though
+   * the resulting job row also exists, because the job row carries no actor —
+   * and "who sent production back to an older revision, and when" is exactly
+   * what an audit trail is for. Note the routine `POST /deploy` trigger is
+   * still deliberately unaudited (ADR 028's out-of-scope table); the asymmetry
+   * is intentional and explained in ADR 022.
+   */
+  deployRolledBack: "deploy.rolled_back",
 
   // --- Features / the six-stage lifecycle (ADR 015) ---
   featureCreated: "feature.created",

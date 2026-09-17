@@ -43,6 +43,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     designSlug: null,
     designDescription: null,
     specContext: null,
+    targetRevision: null,
     ...overrides,
   };
 }

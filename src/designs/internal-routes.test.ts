@@ -56,6 +56,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     startedAt: null,
     completedAt: null,
     designId: null,
+    targetRevision: null,
     ...overrides,
   };
 }
