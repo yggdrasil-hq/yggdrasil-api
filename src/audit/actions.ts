@@ -81,6 +81,10 @@ export const AUDIT_ACTIONS = {
   jobModelDefaultSet: "job_model_default.set",
   jobModelDefaultCleared: "job_model_default.cleared",
 
+  // --- Resource allocation caps (ADR 030) ---
+  projectTokenCapSet: "project_token_cap.set",
+  projectResourceQuotaSet: "project_resource_quota.set",
+
   // --- GitHub App install / repo access (ADR 005) ---
   githubReposSynced: "github.repos_synced",
   githubInstallationUpdated: "github.installation_updated",

@@ -54,6 +54,9 @@ import { ProjectModelOverrideRepository } from "./model-config/project-override-
 import { FeatureJobModelOverrideRepository } from "./model-config/feature-override-repository.js";
 import { JobUsageRepository } from "./usage/repository.js";
 import { createUsageRouter } from "./usage/routes.js";
+import { AllocationRepository } from "./allocations/repository.js";
+import { createAllocationsRouter } from "./allocations/routes.js";
+import { createAllocationsInternalRouter } from "./allocations/internal-routes.js";
 import { createModelConfigRouter } from "./model-config/routes.js";
 import { createProjectModelOverridesRouter } from "./model-config/project-routes.js";
 import { createFeatureModelConfigRouter } from "./model-config/feature-routes.js";
@@ -134,6 +137,7 @@ export function createApp(deps?: AppDependencies): Express {
   const featureModelOverrides = new FeatureJobModelOverrideRepository(deps.pool);
   const featureModelSecrets = new FeatureModelSecretRepository(deps.pool);
   const jobUsage = new JobUsageRepository(deps.pool);
+  const allocations = new AllocationRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions }));
   app.use(
@@ -295,6 +299,13 @@ export function createApp(deps?: AppDependencies): Express {
     "/internal",
     createPreviewsInternalRouter({ previews, jobs }),
   );
+  // ADR 030: the org-admin cap surface. Same `/organizations` mount as the
+  // audit trail — `/allocations` is a literal segment, so it cannot be
+  // swallowed by a param route on either router.
+  app.use(
+    "/organizations",
+    createAllocationsRouter({ users, sessions, organizations, projects, allocations, audit }),
+  );
   // ADR 003 §15: a project's previews, read-only. Same `/projects` mount as
   // the designs/deploys routers; no shared param-shaped route.
   app.use("/projects", createPreviewsRouter({ users, sessions, projects, previews }));
@@ -303,6 +314,7 @@ export function createApp(deps?: AppDependencies): Express {
     createOrganizationsInternalRouter({ projects, clusters: orgClusters }),
   );
   app.use("/internal", createProjectsInternalRouter({ projects, installations }));
+  app.use("/internal", createAllocationsInternalRouter({ projects, allocations }));
   app.use(
     "/internal",
     createFeaturesInternalRouter({ features, projects, installations, tests, jobs }),
