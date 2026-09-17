@@ -9,6 +9,9 @@ import { auditContextMiddleware } from "./audit/request-context.js";
 import { createAuditRouter } from "./audit/routes.js";
 import { ProjectDeployRepository } from "./deploys/repository.js";
 import { createDeploysInternalRouter } from "./deploys/internal-routes.js";
+import { JobPreviewRepository } from "./previews/repository.js";
+import { createPreviewsInternalRouter } from "./previews/internal-routes.js";
+import { createPreviewsRouter } from "./previews/routes.js";
 import { createAuthRouter, createSettingsRouter } from "./auth/routes.js";
 import { SessionService } from "./auth/sessions.js";
 import { FeatureRepository } from "./features/repository.js";
@@ -93,6 +96,7 @@ export function createApp(deps?: AppDependencies): Express {
   const auditEvents = new AuditEventRepository(deps.pool);
   const audit = new PostgresAuditRecorder(auditEvents);
   const deploys = new ProjectDeployRepository(deps.pool);
+  const previews = new JobPreviewRepository(deps.pool);
   app.use(
     "/webhooks",
     createGitHubWebhookRouter({
@@ -285,6 +289,15 @@ export function createApp(deps?: AppDependencies): Express {
     "/internal",
     createDeploysInternalRouter({ deploys, jobs }),
   );
+  // ADR 003 §15: the Orchestrator's preview registry — register/teardown, plus
+  // the stale list the orphan sweep works from.
+  app.use(
+    "/internal",
+    createPreviewsInternalRouter({ previews, jobs }),
+  );
+  // ADR 003 §15: a project's previews, read-only. Same `/projects` mount as
+  // the designs/deploys routers; no shared param-shaped route.
+  app.use("/projects", createPreviewsRouter({ users, sessions, projects, previews }));
   app.use(
     "/internal",
     createOrganizationsInternalRouter({ projects, clusters: orgClusters }),
