@@ -89,7 +89,7 @@ export class OrgModelRepository {
     return this.findById(organizationId, modelId);
   }
 
-  /** Throws (FK violation surfaces as a DB error) if this model is a job default or project override — ADR 018 item 4. */
+  /** Throws (FK violation surfaces as a DB error) if this model is a job default, a project override, or a feature override — ADR 018 item 4, extended to the feature tier by the ADR 018 amendment (issue #5). */
   async delete(organizationId: string, modelId: string): Promise<boolean> {
     const result = await this.db.query(
       `DELETE FROM organization_models WHERE organization_id = $1 AND id = $2`,

@@ -38,8 +38,11 @@ import { OrgProviderRepository } from "./model-config/provider-repository.js";
 import { OrgModelRepository } from "./model-config/model-repository.js";
 import { JobModelDefaultRepository } from "./model-config/job-default-repository.js";
 import { ProjectModelOverrideRepository } from "./model-config/project-override-repository.js";
+import { FeatureJobModelOverrideRepository } from "./model-config/feature-override-repository.js";
 import { createModelConfigRouter } from "./model-config/routes.js";
 import { createProjectModelOverridesRouter } from "./model-config/project-routes.js";
+import { createFeatureModelConfigRouter } from "./model-config/feature-routes.js";
+import { FeatureModelSecretRepository } from "./secrets/feature-model-repository.js";
 import { TestRepository } from "./tests/repository.js";
 import { TestRunReportRepository } from "./tests/reports-repository.js";
 import { UserRepository } from "./users/repository.js";
@@ -103,6 +106,8 @@ export function createApp(deps?: AppDependencies): Express {
   const orgModels = new OrgModelRepository(deps.pool);
   const jobModelDefaults = new JobModelDefaultRepository(deps.pool);
   const projectModelOverrides = new ProjectModelOverrideRepository(deps.pool);
+  const featureModelOverrides = new FeatureJobModelOverrideRepository(deps.pool);
+  const featureModelSecrets = new FeatureModelSecretRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions }));
   app.use(
@@ -158,6 +163,8 @@ export function createApp(deps?: AppDependencies): Express {
       models: orgModels,
       jobDefaults: jobModelDefaults,
       projectOverrides: projectModelOverrides,
+      featureOverrides: featureModelOverrides,
+      featureSecrets: featureModelSecrets,
     }),
   );
   app.use(
@@ -178,15 +185,39 @@ export function createApp(deps?: AppDependencies): Express {
       projectOverrides: projectModelOverrides,
     }),
   );
+  // ADR 018 amendment (issue #5): the per-feature model-config tier, same
+  // `/projects` mount as the project tier it mirrors.
+  app.use(
+    "/projects",
+    createFeatureModelConfigRouter({
+      users,
+      sessions,
+      projects,
+      features,
+      models: orgModels,
+      featureOverrides: featureModelOverrides,
+      featureSecrets: featureModelSecrets,
+      resolution: {
+        secrets,
+        providers: modelProviders,
+        models: orgModels,
+        jobDefaults: jobModelDefaults,
+        projectOverrides: projectModelOverrides,
+      },
+    }),
+  );
   app.use(
     "/internal",
     createSecretsInternalRouter({
       secrets,
       projects,
+      features,
       providers: modelProviders,
       models: orgModels,
       jobDefaults: jobModelDefaults,
       projectOverrides: projectModelOverrides,
+      featureOverrides: featureModelOverrides,
+      featureSecrets: featureModelSecrets,
     }),
   );
   app.use(

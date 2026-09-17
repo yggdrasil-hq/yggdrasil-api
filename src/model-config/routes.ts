@@ -346,7 +346,7 @@ export function createModelConfigRouter(deps: {
       res.status(deleted ? 204 : 404).send();
     } catch {
       res.status(409).json({
-        error: "Model is assigned as a job default or project override — unassign it first",
+        error: "Model is assigned as a job default or a project/feature override — unassign it first",
       });
     }
   });

@@ -55,8 +55,53 @@ export interface ProjectJobModelOverride {
   updatedAt: Date;
 }
 
+/**
+ * ADR 018 amendment (issue #5): the feature tier's catalog override, mirroring
+ * ProjectJobModelOverride one level down. Presence of a row means override;
+ * absence means inherit the project/org tiers.
+ */
+export interface FeatureJobModelOverride {
+  featureId: string;
+  jobKind: AgentJobKind;
+  modelId: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Which tier a job's model configuration actually resolved from, narrowest
+ * first (ADR 018 amendment, issue #5). `"none"` means nothing resolved — a
+ * dispatch site refuses the job, exactly as before.
+ *
+ * This is the *source* of a resolution, deliberately separated from the
+ * resolution's values: the source is safe to show a user (the feature page
+ * says "inherited from Acme Retail's default"), the values never are
+ * (MODEL_API_KEY in particular).
+ */
+export const MODEL_CONFIG_SOURCES = [
+  "feature_custom",
+  "feature_override",
+  "project_custom",
+  "project_override",
+  "organization_default",
+  "none",
+] as const;
+export type ModelConfigSource = (typeof MODEL_CONFIG_SOURCES)[number];
+
+/** The tier a resolution came from, plus the catalog model it selected when that tier is catalog-based. */
+export interface ModelConfigSourceResolution {
+  source: ModelConfigSource;
+  /** Set only for the three catalog tiers; null for custom-triplet tiers and `"none"`. */
+  modelId: string | null;
+}
+
 export interface ResolvedModelConfig {
   MODEL_BASE_URL: string;
   MODEL_API_KEY: string;
   MODEL_ID: string;
+}
+
+/** A resolved config plus where it came from (ADR 018 amendment, issue #5). */
+export interface ModelConfigResolution extends ModelConfigSourceResolution {
+  config: ResolvedModelConfig | null;
 }

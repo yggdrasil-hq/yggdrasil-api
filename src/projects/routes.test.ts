@@ -113,7 +113,16 @@ function fakeModelConfigDeps(bundle: Record<string, string> = {}) {
   const projectOverrides = {
     findForJobKind: vi.fn(async () => null),
   };
-  return { providers, models, jobDefaults, projectOverrides };
+  // ADR 018 amendment (issue #5): these tests don't exercise the feature tier,
+  // so its fakes resolve to "nothing set here" and every existing assertion
+  // keeps its original project/org meaning.
+  const featureOverrides = {
+    findForJobKind: vi.fn(async () => null),
+  };
+  const featureSecrets = {
+    decryptAllForFeature: vi.fn(async () => ({})),
+  };
+  return { providers, models, jobDefaults, projectOverrides, featureOverrides, featureSecrets };
 }
 
 interface BuildAppOptions {
@@ -133,7 +142,8 @@ function buildApp(opts: BuildAppOptions) {
 
   const secrets = fakeSecrets(opts.projectSecrets);
   const orgSecrets = fakeUserSecrets(opts.orgSecrets);
-  const { providers, models, jobDefaults, projectOverrides } = fakeModelConfigDeps(opts.orgSecrets);
+  const { providers, models, jobDefaults, projectOverrides, featureOverrides, featureSecrets } =
+    fakeModelConfigDeps(opts.orgSecrets);
 
   const users = {
     findById: vi.fn(async () => ({ id: OWNER_ID } as User)),
@@ -247,6 +257,8 @@ function buildApp(opts: BuildAppOptions) {
       models: models as never,
       jobDefaults: jobDefaults as never,
       projectOverrides: projectOverrides as never,
+      featureOverrides: featureOverrides as never,
+      featureSecrets: featureSecrets as never,
     }),
   );
 
