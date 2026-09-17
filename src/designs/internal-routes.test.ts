@@ -55,6 +55,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     createdAt: new Date(),
     startedAt: null,
     completedAt: null,
+    targetRevision: null,
     ...overrides,
   };
 }

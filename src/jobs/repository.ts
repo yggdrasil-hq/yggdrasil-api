@@ -19,12 +19,13 @@ interface JobRow {
   created_at: Date;
   started_at: Date | null;
   completed_at: Date | null;
+  target_revision: number | null;
 }
 
 const jobColumns = `
     id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
     design_name, design_slug, design_description, spec_context,
-    status, last_error, created_at, started_at, completed_at
+    status, last_error, created_at, started_at, completed_at, target_revision
 `;
 
 function mapJob(row: JobRow): Job {
@@ -46,6 +47,7 @@ function mapJob(row: JobRow): Job {
     createdAt: row.created_at,
     startedAt: row.started_at,
     completedAt: row.completed_at,
+    targetRevision: row.target_revision,
   };
 }
 
@@ -64,12 +66,14 @@ export class JobRepository {
     designSlug?: string;
     designDescription?: string;
     specContext?: Record<string, unknown>;
+    targetRevision?: number;
   }): Promise<Job> {
     const result = await this.db.query<JobRow>(
       `INSERT INTO jobs
          (project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
-          design_name, design_slug, design_description, spec_context, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending')
+          design_name, design_slug, design_description, spec_context, status,
+          target_revision)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12)
        RETURNING ${jobColumns}`,
       [
         input.projectId,
@@ -83,6 +87,7 @@ export class JobRepository {
         input.designSlug ?? null,
         input.designDescription ?? null,
         input.specContext ?? null,
+        input.targetRevision ?? null,
       ],
     );
     return mapJob(result.rows[0]);
@@ -234,6 +239,27 @@ export class JobRepository {
        ORDER BY created_at DESC
        LIMIT 1`,
       [projectId, kind],
+    );
+    return result.rows[0] ? mapJob(result.rows[0]) : null;
+  }
+
+  /**
+   * The most recent job of any of the given kinds for a project (ADR 022).
+   *
+   * A deploy and a rollback both change what is running, so "is a deployment
+   * operation in flight?" — and "what operation last ran?" — have to span both
+   * kinds. Asking only about `deploy` would let a rollback run concurrently
+   * with a deploy, which Helm would reject mid-operation at best.
+   */
+  async findLatestByProjectAndKinds(projectId: string, kinds: JobKind[]): Promise<Job | null> {
+    if (kinds.length === 0) return null;
+    const result = await this.db.query<JobRow>(
+      `SELECT ${jobColumns}
+       FROM jobs
+       WHERE project_id = $1 AND kind = ANY($2::text[])
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [projectId, kinds],
     );
     return result.rows[0] ? mapJob(result.rows[0]) : null;
   }

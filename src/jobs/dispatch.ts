@@ -18,6 +18,8 @@ export async function dispatchJob(
     designSlug?: string;
     designDescription?: string;
     specContext?: Record<string, unknown>;
+    /** ADR 022: the Helm revision a `rollback` job should target. */
+    targetRevision?: number;
   },
 ) {
   return jobs.create(input);

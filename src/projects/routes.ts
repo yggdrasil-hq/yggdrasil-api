@@ -48,6 +48,8 @@ import type { FeatureModelSecretRepository } from "../secrets/feature-model-repo
 import type { AgentJobKind } from "../model-config/types.js";
 import { AUDIT_ACTIONS } from "../audit/actions.js";
 import type { AuditRecorder } from "../audit/record.js";
+import type { ProjectDeployRepository } from "../deploys/repository.js";
+import { toPublicProjectDeploy } from "../deploys/types.js";
 
 function parseBody<T>(schema: z.ZodType<T>, body: unknown):
   | { success: true; data: T }
@@ -176,6 +178,7 @@ export function createProjectsRouter(deps: {
   projectOverrides: ProjectModelOverrideRepository;
   featureOverrides: FeatureJobModelOverrideRepository;
   featureSecrets: FeatureModelSecretRepository;
+  deploys: ProjectDeployRepository;
   audit: AuditRecorder;
 }): Router {
   const router = Router();
@@ -685,14 +688,17 @@ export function createProjectsRouter(deps: {
     res.json(await toPublicProjectWithRemovalMeta(updated));
   });
 
-  // Reads the project's most recent `deploy` job (ADR 013 addendum) so the
-  // Web app can show whether the always-on primary deployment is up to
-  // date, still rolling out, or last failed — there was previously no
-  // frontend feedback for this at all. `deploy` jobs carry no curated
-  // event stream (unlike spec_grill/feature_build): the Orchestrator runs
-  // `runDeploy` synchronously in-process and reports only pending →
-  // running → completed/failed + last_error, so job status/lastError is
-  // the whole picture here, no `events` array needed.
+  // Reads the project's most recent deployment operation (ADR 013 addendum,
+  // widened to rollbacks by ADR 022) so the Web app can show whether the
+  // always-on primary deployment is up to date, still rolling out, or last
+  // failed. Deploy and rollback jobs carry no curated event stream (unlike
+  // spec_grill/feature_build): the Orchestrator runs them synchronously
+  // in-process and reports only pending → running → completed/failed +
+  // last_error, so job status/lastError is the whole picture here.
+  //
+  // Deliberately spans both kinds: after a rollback the latest *deploy* is no
+  // longer the newest operation, and reporting it anyway would tell an
+  // operator the project is running one revision when it is running another.
   router.get("/:projectId/deploy", requireAuth, async (req, res) => {
     const project = await getOwnedProject(req, routeParam(req.params.projectId));
     if (!project) {
@@ -700,18 +706,132 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    const job = await deps.jobs.findLatestByProjectAndKind(project.id, "deploy");
+    const job = await deps.jobs.findLatestByProjectAndKinds(project.id, [
+      "deploy",
+      "rollback",
+    ]);
+    const revision = await deps.deploys.currentRevision(project.id);
     res.json({
       status: job?.status ?? null,
       lastError: job?.lastError ?? null,
       startedAt: job?.startedAt ?? null,
       completedAt: job?.completedAt ?? null,
+      // Which operation is being reported — the Web app labels a rollback as
+      // one rather than as a fresh deploy.
+      kind: job?.kind ?? null,
+      // The revision currently live, from the deploy ledger (ADR 022). Null
+      // before the first successful deploy.
+      revision,
       // Deterministic from the project slug (ADR 003 §15,
       // docs/conventions/deploy.md's URL scheme) — always present
       // regardless of job status; the Web app only links to it once
       // `status === "completed"` confirms something is actually running.
       url: buildDeployUrl(project.slug),
     });
+  });
+
+  // A project's deploy history and the revisions it can be rolled back to
+  // (ADR 022). Read-only; the rollback itself is a separate mutation below.
+  router.get("/:projectId/deploys", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const [deploys, currentRevision, rollbackTargets] = await Promise.all([
+      deps.deploys.listForProject(project.id),
+      deps.deploys.currentRevision(project.id),
+      deps.deploys.listRollbackTargets(project.id),
+    ]);
+
+    res.json({
+      deploys: deploys.map(toPublicProjectDeploy),
+      currentRevision,
+      rollbackTargets: rollbackTargets.map((target) => ({
+        revision: target.revision,
+        deployedAt: target.deployedAt.toISOString(),
+        kind: target.kind,
+      })),
+      url: buildDeployUrl(project.slug),
+    });
+  });
+
+  // Rolls the project's primary deployment back to an earlier Helm revision
+  // (ADR 022) — the safety net ADR 003 §9 shipped without.
+  //
+  // Enqueues a `rollback` job rather than calling the Orchestrator
+  // synchronously: the Postgres queue is the durability boundary for every
+  // other cluster-mutating operation (ADR 003 §18), so routing this one around
+  // it would give rollback weaker crash-safety than the deploys it exists to
+  // undo. Not agent-driven — the Orchestrator runs it deterministically.
+  router.post("/:projectId/rollback", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const parsed = parseBody(
+      z.object({ revision: z.number().int().positive() }),
+      req.body,
+    );
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    // Only revisions this project actually produced are rollback targets —
+    // an arbitrary integer would otherwise reach Helm and fail there, or in
+    // the worst case name a revision that never applied.
+    const known = await deps.deploys.hasRevision(project.id, parsed.data.revision);
+    if (!known) {
+      res.status(404).json({ error: "Unknown revision for this project" });
+      return;
+    }
+
+    const current = await deps.deploys.currentRevision(project.id);
+    if (current !== null && current === parsed.data.revision) {
+      res.status(409).json({ error: "That revision is already deployed" });
+      return;
+    }
+
+    // One deployment operation at a time per project. A concurrent deploy
+    // would race this rollback on the same Helm release; Helm refuses the
+    // second operation while the first is pending, which would surface as a
+    // confusing failure rather than as "something is already running".
+    const inFlight = await deps.jobs.findLatestByProjectAndKinds(project.id, [
+      "deploy",
+      "rollback",
+    ]);
+    if (inFlight && (inFlight.status === "pending" || inFlight.status === "running")) {
+      res.status(409).json({ error: "A deployment operation is already in progress" });
+      return;
+    }
+
+    const job = await dispatchJob(deps.jobs, {
+      projectId: project.id,
+      kind: "rollback",
+      targetRevision: parsed.data.revision,
+    });
+
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.deployRolledBack,
+      targetType: "project",
+      targetId: project.id,
+      metadata: {
+        // Both numbers matter: `revision` is what was live and is being undone,
+        // `targetRevision` is what the operator asked to go back to.
+        revision: current,
+        targetRevision: parsed.data.revision,
+        jobId: job.id,
+      },
+    });
+
+    res.status(201).json({});
   });
 
   // Manually (re)dispatches a `deploy` job — the "Deploy now" action for a
@@ -732,9 +852,12 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    const latestJob = await deps.jobs.findLatestByProjectAndKind(project.id, "deploy");
+    const latestJob = await deps.jobs.findLatestByProjectAndKinds(project.id, [
+      "deploy",
+      "rollback",
+    ]);
     if (latestJob && (latestJob.status === "pending" || latestJob.status === "running")) {
-      res.status(409).json({ error: "A deploy is already in progress for this project" });
+      res.status(409).json({ error: "A deployment operation is already in progress for this project" });
       return;
     }
 

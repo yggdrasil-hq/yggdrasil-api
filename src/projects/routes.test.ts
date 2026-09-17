@@ -133,6 +133,11 @@ interface BuildAppOptions {
   activeSpecGrillJob?: unknown;
   latestDeployJob?: unknown;
   personalOrg?: { id: string; status: string } | null;
+  /** ADR 022 deploy-ledger state. */
+  projectDeploys?: unknown[];
+  currentRevision?: number | null;
+  rollbackTargets?: unknown[];
+  knownRevisions?: number[];
 }
 
 function buildApp(opts: BuildAppOptions) {
@@ -188,6 +193,10 @@ function buildApp(opts: BuildAppOptions) {
     listActiveTestRunsForProject: vi.fn(async () => []),
     findActiveSpecGrillJob: vi.fn(async () => opts.activeSpecGrillJob ?? null),
     findLatestByProjectAndKind: vi.fn(async () => opts.latestDeployJob ?? null),
+    // ADR 022: the deploy/rollback pair shares one in-flight guard, so the
+    // routes now ask for both kinds at once. Fed from the same fake so every
+    // existing deploy assertion keeps its original meaning.
+    findLatestByProjectAndKinds: vi.fn(async () => opts.latestDeployJob ?? null),
     cancelActiveForFeature: vi.fn(async () => undefined),
   };
   const notifications = { create: vi.fn(async () => undefined) };
@@ -220,6 +229,17 @@ function buildApp(opts: BuildAppOptions) {
   };
   const audit = {
     record: vi.fn(async (_res: unknown, _input: { action: string }) => undefined),
+  };
+  // ADR 022: the deploy ledger. Existing tests only needed a latest-deploy job
+  // (opts.latestDeployJob); this lane's tests set the ledger state explicitly.
+  const deploys = {
+    record: vi.fn(async (input: Record<string, unknown>) => ({ id: "deploy_1", ...input })),
+    listForProject: vi.fn(async () => opts.projectDeploys ?? []),
+    currentRevision: vi.fn(async () => opts.currentRevision ?? null),
+    listRollbackTargets: vi.fn(async () => opts.rollbackTargets ?? []),
+    hasRevision: vi.fn(async (_projectId: string, revision: number) =>
+      (opts.knownRevisions ?? []).includes(revision),
+    ),
   };
   const tests = {
     create: vi.fn(async (input: {
@@ -262,11 +282,12 @@ function buildApp(opts: BuildAppOptions) {
       projectOverrides: projectOverrides as never,
       featureOverrides: featureOverrides as never,
       featureSecrets: featureSecrets as never,
+      deploys: deploys as never,
       audit: audit as never,
     }),
   );
 
-  return { app, secrets, orgSecrets, features, jobs, projects, actionItems, testRunReports, tests, audit };
+  return { app, secrets, orgSecrets, features, jobs, projects, actionItems, testRunReports, tests, audit, deploys };
 }
 
 const SESSION_COOKIE = "yggdrasil_session=sess_1";
@@ -672,6 +693,10 @@ describe("GET /:projectId/deploy", () => {
       lastError: null,
       startedAt: null,
       completedAt: null,
+      // ADR 022 additions: which operation is being reported, and the revision
+      // currently live per the deploy ledger (null before the first deploy).
+      kind: null,
+      revision: null,
       url: `https://${project.slug}.apps.yggdrasil.local`,
     });
   });
@@ -727,6 +752,214 @@ describe("POST /:projectId/deploy", () => {
     const res = await authedRequest(app).post(`/projects/${project.id}/deploy`);
 
     expect(res.status).toBe(409);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET /:projectId/deploys (ADR 022)", () => {
+  it("returns the ledger newest first with the current revision and targets", async () => {
+    const project = makeProject({ status: "ready" });
+    const deployedAt = new Date("2026-09-17T10:00:00Z");
+    const { app, deploys } = buildApp({
+      project,
+      currentRevision: 12,
+      projectDeploys: [
+        {
+          id: "deploy_2",
+          projectId: project.id,
+          jobId: "job_2",
+          kind: "rollback",
+          helmRevision: 12,
+          targetRevision: 9,
+          status: "completed",
+          lastError: null,
+          ref: null,
+          createdAt: deployedAt,
+        },
+      ],
+      rollbackTargets: [{ revision: 9, deployedAt, kind: "deploy" }],
+    });
+
+    const res = await authedRequest(app).get(`/projects/${project.id}/deploys`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.currentRevision).toBe(12);
+    expect(res.body.deploys).toEqual([
+      {
+        id: "deploy_2",
+        jobId: "job_2",
+        kind: "rollback",
+        helmRevision: 12,
+        targetRevision: 9,
+        status: "completed",
+        lastError: null,
+        ref: null,
+        createdAt: deployedAt.toISOString(),
+      },
+    ]);
+    // The offered targets exclude what is already running, so the current
+    // revision 12 is absent.
+    expect(res.body.rollbackTargets).toEqual([
+      { revision: 9, deployedAt: deployedAt.toISOString(), kind: "deploy" },
+    ]);
+    expect(deploys.listForProject).toHaveBeenCalledWith(project.id);
+  });
+
+  it("404s for a project the caller cannot access", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app } = buildApp({ project });
+
+    const res = await authedRequest(app).get(
+      "/projects/99999999-9999-4999-8999-999999999999/deploys",
+    );
+
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /:projectId/rollback (ADR 022)", () => {
+  it("enqueues a rollback job pinned to the requested revision and audits it", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs, audit } = buildApp({
+      project,
+      currentRevision: 12,
+      knownRevisions: [9, 12],
+      latestDeployJob: { status: "completed" },
+    });
+
+    const res = await authedRequest(app)
+      .post(`/projects/${project.id}/rollback`)
+      .send({ revision: 9 });
+
+    expect(res.status).toBe(201);
+    // The target is pinned onto the job row rather than resolved at claim
+    // time, so a deploy landing before this job is claimed cannot change what
+    // it rolls back to.
+    expect(jobs.create).toHaveBeenCalledWith({
+      projectId: project.id,
+      kind: "rollback",
+      targetRevision: 9,
+    });
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "deploy.rolled_back",
+        projectId: project.id,
+        metadata: expect.objectContaining({ revision: 12, targetRevision: 9 }),
+      }),
+    );
+  });
+
+  // A rollback is a destructive production operation, so it has to be recorded
+  // with an actor — unlike the routine deploy trigger, which ADR 028 leaves
+  // unaudited because the job row already covers it (see ADR 022).
+  it("records the acting user on the audit event", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, audit } = buildApp({
+      project,
+      currentRevision: 2,
+      knownRevisions: [1, 2],
+    });
+
+    await authedRequest(app).post(`/projects/${project.id}/rollback`).send({ revision: 1 });
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ actorUserId: OWNER_ID }),
+    );
+  });
+
+  it("rejects a revision the project never produced", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs, audit } = buildApp({
+      project,
+      currentRevision: 12,
+      knownRevisions: [12],
+    });
+
+    const res = await authedRequest(app)
+      .post(`/projects/${project.id}/rollback`)
+      .send({ revision: 99 });
+
+    // 404, not 400: the request is well-formed, the target simply does not
+    // exist for this project.
+    expect(res.status).toBe(404);
+    expect(jobs.create).not.toHaveBeenCalled();
+    expect(audit.record).not.toHaveBeenCalled();
+  });
+
+  it("409s when the requested revision is already deployed", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs } = buildApp({
+      project,
+      currentRevision: 12,
+      knownRevisions: [12],
+    });
+
+    const res = await authedRequest(app)
+      .post(`/projects/${project.id}/rollback`)
+      .send({ revision: 12 });
+
+    expect(res.status).toBe(409);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  // One deployment operation at a time, across BOTH kinds. A rollback racing a
+  // deploy would have Helm reject whichever arrives second, mid-operation.
+  it("409s while a deploy is already in flight", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs } = buildApp({
+      project,
+      currentRevision: 12,
+      knownRevisions: [9, 12],
+      latestDeployJob: { status: "running" },
+    });
+
+    const res = await authedRequest(app)
+      .post(`/projects/${project.id}/rollback`)
+      .send({ revision: 9 });
+
+    expect(res.status).toBe(409);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("409s while a rollback is already in flight", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs } = buildApp({
+      project,
+      currentRevision: 12,
+      knownRevisions: [9, 12],
+      latestDeployJob: { status: "pending" },
+    });
+
+    const res = await authedRequest(app)
+      .post(`/projects/${project.id}/rollback`)
+      .send({ revision: 9 });
+
+    expect(res.status).toBe(409);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed revision", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs } = buildApp({ project, knownRevisions: [1] });
+
+    const res = await authedRequest(app)
+      .post(`/projects/${project.id}/rollback`)
+      .send({ revision: 0 });
+
+    expect(res.status).toBe(400);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("404s for a project the caller cannot access", async () => {
+    const { app, jobs } = buildApp({ project: makeProject() });
+
+    const res = await authedRequest(app)
+      .post("/projects/99999999-9999-4999-8999-999999999999/rollback")
+      .send({ revision: 1 });
+
+    expect(res.status).toBe(404);
     expect(jobs.create).not.toHaveBeenCalled();
   });
 });

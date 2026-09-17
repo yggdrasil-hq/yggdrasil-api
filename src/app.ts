@@ -7,6 +7,8 @@ import { AuditEventRepository } from "./audit/repository.js";
 import { PostgresAuditRecorder } from "./audit/record.js";
 import { auditContextMiddleware } from "./audit/request-context.js";
 import { createAuditRouter } from "./audit/routes.js";
+import { ProjectDeployRepository } from "./deploys/repository.js";
+import { createDeploysInternalRouter } from "./deploys/internal-routes.js";
 import { createAuthRouter, createSettingsRouter } from "./auth/routes.js";
 import { SessionService } from "./auth/sessions.js";
 import { FeatureRepository } from "./features/repository.js";
@@ -86,6 +88,7 @@ export function createApp(deps?: AppDependencies): Express {
   const featureActionItems = new FeatureActionItemRepository(deps.pool);
   const auditEvents = new AuditEventRepository(deps.pool);
   const audit = new PostgresAuditRecorder(auditEvents);
+  const deploys = new ProjectDeployRepository(deps.pool);
   app.use(
     "/webhooks",
     createGitHubWebhookRouter({
@@ -185,6 +188,7 @@ export function createApp(deps?: AppDependencies): Express {
       projectOverrides: projectModelOverrides,
       featureOverrides: featureModelOverrides,
       featureSecrets: featureModelSecrets,
+      deploys,
       audit,
     }),
   );
@@ -255,6 +259,10 @@ export function createApp(deps?: AppDependencies): Express {
   app.use(
     "/internal",
     createDesignsInternalRouter({ jobs, projects, installations }),
+  );
+  app.use(
+    "/internal",
+    createDeploysInternalRouter({ deploys, jobs }),
   );
   app.use(
     "/internal",
