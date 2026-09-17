@@ -1,18 +1,57 @@
+import { createServer } from "node:http";
 import { createApp } from "./app.js";
+import { SessionService } from "./auth/sessions.js";
 import { config } from "./config.js";
 import { runMigrations } from "./db/migrate.js";
-import { closePool, getPool } from "./db/pool.js";
+import { closePool, createListenerClient, getPool } from "./db/pool.js";
+import { FeatureRepository } from "./features/repository.js";
+import { JobEventRepository } from "./jobs/events-repository.js";
 import { JobRepository } from "./jobs/repository.js";
+import { LiveHub } from "./live/hub.js";
+import { startLiveRelay } from "./live/relay.js";
+import { createLiveSocketServer } from "./live/socket.js";
+import { ProjectRepository } from "./projects/repository.js";
 import { JobRecordingRepository } from "./recordings/repository.js";
 import { startRecordingSweep } from "./recordings/sweep.js";
 import { startScheduler } from "./scheduling/scheduler.js";
+import { UserRepository } from "./users/repository.js";
 
 async function main(): Promise<void> {
   const pool = getPool();
   await runMigrations(pool);
 
   const app = createApp({ pool });
-  app.listen(config.port, "0.0.0.0", () => {
+  // ADR 019: the live event socket is attached to the HTTP server rather than
+  // to the Express app — a WebSocket upgrade is an HTTP event Express never
+  // sees, so there is no router to mount. Building the server here (instead of
+  // `app.listen`) is also what keeps `createApp` free of sockets: every test in
+  // this repo builds an app and never opens a port.
+  const server = createServer(app);
+
+  const hub = new LiveHub();
+  createLiveSocketServer({
+    server,
+    hub,
+    sessions: new SessionService(pool),
+    users: new UserRepository(pool),
+    projects: new ProjectRepository(pool),
+    features: new FeatureRepository(pool),
+    onError: (message) => console.error(message),
+  });
+  // The listener is started here, not inside `createApp`, for the same reason
+  // the scheduler and recording sweep below are: a subscription's lifetime is
+  // the process's, and constructing an app must never open one.
+  if (config.live.enabled) {
+    startLiveRelay({
+      clientFactory: createListenerClient,
+      hub,
+      jobEvents: new JobEventRepository(pool),
+      retryDelayMs: config.live.retryDelayMs,
+      onError: (message) => console.error(message),
+    });
+  }
+
+  server.listen(config.port, "0.0.0.0", () => {
     console.log(`API listening on :${config.port}`);
   });
 

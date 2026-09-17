@@ -1,0 +1,193 @@
+import type { JobEventRepository, JobEventWithScope } from "../jobs/events-repository.js";
+import type { LiveHub } from "./hub.js";
+import { liveTopicForFeature, toLiveJobEvent, type ServerFrame } from "./types.js";
+
+/**
+ * The Postgres channel `JobEventRepository.create` announces new rows on.
+ * Single-spelled here and imported by the repository test, so the writer and
+ * the listener cannot drift onto different channel names (ADR 019 item 6).
+ */
+export const LIVE_JOB_EVENTS_CHANNEL = "job_events";
+
+/**
+ * The slice of `pg.Client` the relay uses. Narrow on purpose: a fake
+ * implementation is then a dozen lines, which is what lets the reconnect and
+ * routing rules be tested without a database (ADR 019 item 5).
+ */
+export interface LiveListenerClient {
+  // `Promise<unknown>`, not `Promise<void>`: pg.Client's connect() resolves to
+  // the client itself, and a narrower return type here would make a real client
+  // structurally unassignable to this interface.
+  connect(): Promise<unknown>;
+  query(sql: string, values?: unknown[]): Promise<unknown>;
+  // Method syntax (not a property) so this stays assignable from pg.Client's
+  // own overloaded EventEmitter `on`.
+  on(event: string, listener: (...args: any[]) => void): unknown;
+  end(): Promise<void>;
+}
+
+export interface LiveRelayDeps {
+  clientFactory: () => LiveListenerClient;
+  hub: LiveHub;
+  jobEvents: Pick<JobEventRepository, "findByIdWithScope">;
+  onError?: (message: string) => void;
+  /**
+   * Injected so tests can drive reconnection deterministically. The default
+   * uses the real timer.
+   */
+  scheduleRetry?: (run: () => void, delayMs: number) => unknown;
+  cancelRetry?: (handle: unknown) => void;
+  retryDelayMs?: number;
+}
+
+export interface LiveRelayHandle {
+  /** Idempotent. Closes the listener and cancels any pending reconnect. */
+  stop(): Promise<void>;
+}
+
+/**
+ * Default reconnect delay. Fixed rather than backed off: the realistic failure
+ * here is Postgres being unreachable for a while, which is not a burst that a
+ * backoff would smooth out, and a flat 5s keeps the log readable and the
+ * recovery prompt. The cost of a wrong guess is one failed query every 5s while
+ * the database is down (ADR 019 item 8).
+ */
+export const LIVE_RELAY_RETRY_MS = 5000;
+
+/**
+ * Maps a loaded event to the frame its feature's subscribers should receive,
+ * or null when there is nothing to deliver.
+ *
+ * Split out as a pure function so "which event goes to which topic" — the only
+ * routing decision in the relay — is testable without a socket, a database, or
+ * a Postgres connection. Null covers both harmless cases: the job was deleted
+ * before the listener read it, and a job with no feature at all (ADR 014's
+ * project-scoped `design_grill`, which has no feature to route by).
+ */
+export function relayEnvelopeFor(
+  scope: JobEventWithScope,
+): { topic: string; frame: ServerFrame } | null {
+  if (!scope.featureId) return null;
+  return {
+    topic: liveTopicForFeature(scope.featureId),
+    frame: {
+      type: "job_event",
+      featureId: scope.featureId,
+      jobId: scope.event.jobId,
+      event: toLiveJobEvent(scope.event),
+    },
+  };
+}
+
+/**
+ * Fans Postgres `job_events` notifications out to the sockets this process
+ * holds (ADR 019 item 6).
+ *
+ * Why LISTEN/NOTIFY rather than a poll: the API already uses NOTIFY for the
+ * reply and cancellation channels (ADR 006 items 9-10), and a timer poll would
+ * reintroduce exactly the latency this lane exists to remove, just moved to the
+ * server. Why not an in-process emitter on the write path: the events this
+ * must relay are written by *any* API replica, and several replicas share the
+ * database — an emitter would silently relay only the events the same process
+ * happened to handle. Every replica runs one listener and reaches its own
+ * sockets; the database is the bus between them.
+ *
+ * The connection is a dedicated client rather than a pooled one: LISTEN is
+ * stateful per-connection, and a pooled connection may be recycled or reset
+ * underneath it, silently dropping the subscription.
+ */
+export function startLiveRelay(deps: LiveRelayDeps): LiveRelayHandle {
+  const retryDelayMs = deps.retryDelayMs ?? LIVE_RELAY_RETRY_MS;
+  const scheduleRetry =
+    deps.scheduleRetry ??
+    ((run: () => void, delayMs: number) => setTimeout(run, delayMs));
+  const cancelRetry =
+    deps.cancelRetry ??
+    ((handle: unknown) => clearTimeout(handle as ReturnType<typeof setTimeout>));
+  const report = deps.onError ?? (() => {});
+
+  let client: LiveListenerClient | null = null;
+  let pendingRetry: unknown = null;
+  let stopped = false;
+
+  async function deliver(payload: string): Promise<void> {
+    // A notification can arrive in the window between `stop()` and the
+    // connection actually closing. Publishing then would write to sockets for a
+    // relay that has been shut down — or, with the kill switch, for a relay the
+    // operator has explicitly turned off.
+    if (stopped) return;
+    try {
+      const scope = await deps.jobEvents.findByIdWithScope(payload);
+      if (!scope) return;
+      const envelope = relayEnvelopeFor(scope);
+      if (!envelope) return;
+      deps.hub.publish(envelope.topic, envelope.frame);
+    } catch (error) {
+      // A failed delivery is a gap in a live view, not a reason to tear the
+      // listener down: the event is already durable in `job_events`, and the
+      // poll fallback plus the next reconnect's catch-up read both still
+      // surface it. Losing the socket is what we are here to avoid.
+      report(`live relay: failed to deliver event ${payload}: ${describe(error)}`);
+    }
+  }
+
+  async function connect(): Promise<void> {
+    if (stopped) return;
+    const listener = deps.clientFactory();
+    client = listener;
+
+    listener.on("notification", (message: { channel?: string; payload?: string }) => {
+      if (message?.channel !== LIVE_JOB_EVENTS_CHANNEL) return;
+      if (typeof message.payload !== "string" || message.payload === "") return;
+      void deliver(message.payload);
+    });
+
+    // 'error' and 'end' both mean the subscription is gone. Reconnecting from
+    // either is what keeps the relay from quietly becoming a no-op — a socket
+    // client would keep its (now eventless) connection open and look healthy.
+    const onLost = (reason: string) => {
+      if (stopped || client !== listener) return;
+      client = null;
+      report(`live relay: ${reason}; retrying in ${retryDelayMs}ms`);
+      void listener.end().catch(() => {});
+      pendingRetry = scheduleRetry(() => {
+        pendingRetry = null;
+        void connect();
+      }, retryDelayMs);
+    };
+
+    listener.on("error", (error: unknown) => onLost(`listener error: ${describe(error)}`));
+    listener.on("end", () => onLost("listener connection ended"));
+
+    try {
+      await listener.connect();
+      if (stopped) {
+        await listener.end().catch(() => {});
+        return;
+      }
+      await listener.query(`LISTEN ${LIVE_JOB_EVENTS_CHANNEL}`);
+    } catch (error) {
+      onLost(`failed to establish listener: ${describe(error)}`);
+    }
+  }
+
+  void connect();
+
+  return {
+    async stop(): Promise<void> {
+      if (stopped) return;
+      stopped = true;
+      if (pendingRetry !== null) {
+        cancelRetry(pendingRetry);
+        pendingRetry = null;
+      }
+      const listener = client;
+      client = null;
+      if (listener) await listener.end().catch(() => {});
+    },
+  };
+}
+
+function describe(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

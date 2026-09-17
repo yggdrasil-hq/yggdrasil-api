@@ -74,6 +74,28 @@ export const config = {
       Number(process.env.TEST_SCHEDULER_INTERVAL_MS) || 60_000,
     ),
   },
+  /**
+   * ADR 019: the live job-event relay (the Web app's WebSocket).
+   *
+   * `enabled` is a kill switch, on by default. The relay is an *accelerator*
+   * over the REST read the Web app already polls, so switching it off degrades
+   * to the pre-existing behaviour rather than breaking anything — which is
+   * exactly the property that makes a toggle worth having: if the socket path
+   * misbehaves in a live install it can be turned off without a rollback. It
+   * defaults on for the same reason the scheduler and recording sweep do: a
+   * relay that must be switched on is one that silently does nothing after a
+   * fresh install.
+   *
+   * `retryDelayMs` is floored so a bad env var cannot turn a failing Postgres
+   * connection into a tight reconnect loop.
+   */
+  live: {
+    enabled: process.env.LIVE_RELAY_ENABLED !== "false",
+    retryDelayMs: Math.max(
+      1_000,
+      Number(process.env.LIVE_RELAY_RETRY_MS) || 5_000,
+    ),
+  },
   sessionTtl: {
     defaultMs: 24 * 60 * 60 * 1000,
     rememberMs: 30 * 24 * 60 * 60 * 1000,

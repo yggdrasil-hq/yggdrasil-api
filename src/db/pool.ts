@@ -19,6 +19,20 @@ export function getPool(): pg.Pool {
   return pool;
 }
 
+/**
+ * A dedicated, non-pooled client for connection-scoped state — `LISTEN` today
+ * (ADR 019's live relay), and nothing else.
+ *
+ * Deliberately not `getPool()`: a subscription lives on one connection, and a
+ * pooled connection may be recycled or reset under it, which would silently
+ * drop the subscription and leave the relay looking healthy while delivering
+ * nothing. The caller owns this client's lifetime and must `connect()` and
+ * `end()` it itself.
+ */
+export function createListenerClient(): pg.Client {
+  return new pg.Client({ connectionString: assertDatabaseUrl() });
+}
+
 export async function closePool(): Promise<void> {
   if (pool) {
     await pool.end();
