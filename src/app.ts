@@ -49,6 +49,8 @@ import { OrgModelRepository } from "./model-config/model-repository.js";
 import { JobModelDefaultRepository } from "./model-config/job-default-repository.js";
 import { ProjectModelOverrideRepository } from "./model-config/project-override-repository.js";
 import { FeatureJobModelOverrideRepository } from "./model-config/feature-override-repository.js";
+import { JobUsageRepository } from "./usage/repository.js";
+import { createUsageRouter } from "./usage/routes.js";
 import { createModelConfigRouter } from "./model-config/routes.js";
 import { createProjectModelOverridesRouter } from "./model-config/project-routes.js";
 import { createFeatureModelConfigRouter } from "./model-config/feature-routes.js";
@@ -127,6 +129,7 @@ export function createApp(deps?: AppDependencies): Express {
   const projectModelOverrides = new ProjectModelOverrideRepository(deps.pool);
   const featureModelOverrides = new FeatureJobModelOverrideRepository(deps.pool);
   const featureModelSecrets = new FeatureModelSecretRepository(deps.pool);
+  const jobUsage = new JobUsageRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions }));
   app.use(
@@ -141,6 +144,17 @@ export function createApp(deps?: AppDependencies): Express {
   app.use(
     "/organizations",
     createAuditRouter({ users, sessions, organizations, audit: auditEvents }),
+  );
+  // ADR 023: token/cost consumption reporting, org- and project-scoped reads.
+  // Mounted on both prefixes because the project-level routes live under
+  // `/projects`; each route carries its own full path (see usage/routes.ts).
+  app.use(
+    "/organizations",
+    createUsageRouter({ users, sessions, organizations, projects, usage: jobUsage }),
+  );
+  app.use(
+    "/projects",
+    createUsageRouter({ users, sessions, organizations, projects, usage: jobUsage }),
   );
   app.use(
     "/organizations",
@@ -291,6 +305,16 @@ export function createApp(deps?: AppDependencies): Express {
       testRunReports,
       projects,
       designs,
+      usage: jobUsage,
+      modelConfig: {
+        secrets,
+        featureSecrets: featureModelSecrets,
+        providers: modelProviders,
+        models: orgModels,
+        jobDefaults: jobModelDefaults,
+        projectOverrides: projectModelOverrides,
+        featureOverrides: featureModelOverrides,
+      },
     }),
   );
 

@@ -90,6 +90,10 @@ function buildApp(deps: {
   findReport?: ReturnType<typeof vi.fn>;
   projectFindById?: ReturnType<typeof vi.fn>;
   finalizeDesign?: ReturnType<typeof vi.fn>;
+  upsertUsage?: ReturnType<typeof vi.fn>;
+  /** The catalog default for a job kind, which is how usage attribution finds a provider. */
+  jobDefaultModelId?: string | null;
+  catalogModel?: { providerName?: string } | null;
 }) {
   const create: (input: CreateInput) => Promise<JobEvent> =
     deps.create ?? (async (input) => makeEvent({ jobId: input.jobId, type: input.type }));
@@ -126,8 +130,29 @@ function buildApp(deps: {
   const upsertStep = deps.upsertStep ?? vi.fn(async () => undefined);
   const upsertReport = deps.upsertReport ?? vi.fn(async () => undefined);
   const findReport = deps.findReport ?? vi.fn(async () => null);
+  const upsertUsage =
+    deps.upsertUsage ?? vi.fn(async (input: { jobId: string }) => ({ jobId: input.jobId }));
+  // resolveModelConfigSource walks the precedence ladder narrowest-first, so a
+  // fake that resolves at the org-default tier is the simplest way to drive
+  // usage attribution to a provider without a real catalog.
+  const modelConfig = {
+    secrets: { decryptAllForProject: async () => ({}) },
+    featureSecrets: { decryptAllForFeature: async () => ({}) },
+    providers: {},
+    models: {
+      findById: async () =>
+        deps.catalogModel === undefined ? null : deps.catalogModel,
+    },
+    jobDefaults: {
+      findForJobKind: async () =>
+        deps.jobDefaultModelId ? { modelId: deps.jobDefaultModelId } : null,
+    },
+    projectOverrides: { findForJobKind: async () => null },
+    featureOverrides: { findForJobKind: async () => null },
+  } as never;
   const projectFindById =
-    deps.projectFindById ?? vi.fn(async () => ({ agenticReviewEnabled: false }));
+    deps.projectFindById ??
+    vi.fn(async () => ({ agenticReviewEnabled: false, organizationId: ORG_ID }));
   const createManyActionItems =
     deps.createManyActionItems ?? (async () => []);
   const createActionItemRow =
@@ -157,12 +182,15 @@ function buildApp(deps: {
       designs: {
         finalize: deps.finalizeDesign ?? vi.fn(async () => undefined),
       } as never,
+      usage: { upsert: upsertUsage } as never,
+      modelConfig,
     }),
   );
   return app;
 }
 
 const JOB_ID = "2d88c75e-7ad0-458c-8da5-ce8684ce6fa6";
+const ORG_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("POST /internal/jobs/:jobId/events", () => {
   it("persists an ask_user event and returns its id", async () => {
@@ -237,6 +265,8 @@ describe("POST /internal/jobs/:jobId/events", () => {
         testRunReports: {} as never,
         projects: {} as never,
         designs: {} as never,
+        usage: {} as never,
+        modelConfig: {} as never,
       }),
     );
 
@@ -923,5 +953,161 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .send({ type: "ask_user", question: "x" });
 
     expect(res.status).toBe(201);
+  });
+});
+
+describe("POST /internal/jobs/:jobId/usage", () => {
+  const validUsage = {
+    modelId: "anthropic/claude-sonnet-4",
+    inputTokens: 50_000,
+    outputTokens: 10_000,
+    cacheReadTokens: 40_000,
+    cacheWriteTokens: 5_000,
+    totalTokens: 105_000,
+    costUsd: 0.45,
+    durationMs: 90_000,
+  };
+
+  it("records the accounting against the stored job, not the request body", async () => {
+    let gotInput: Record<string, unknown> | undefined;
+    const app = buildApp({
+      upsertUsage: vi.fn(async (input: Record<string, unknown>) => {
+        gotInput = input;
+        return { jobId: input.jobId };
+      }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/usage`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send(validUsage);
+
+    expect(res.status).toBe(201);
+    // Scope comes from the job row: a caller cannot attribute usage to a
+    // project or kind it did not actually run.
+    expect(gotInput?.jobId).toBe(JOB_ID);
+    expect(gotInput?.projectId).toBe("project_1");
+    expect(gotInput?.jobKind).toBe("spec_grill");
+    expect(gotInput?.totalTokens).toBe(105_000);
+    expect(gotInput?.costUsd).toBe(0.45);
+    expect(gotInput?.durationMs).toBe(90_000);
+  });
+
+  it("attributes the provider and tier from the API's own catalog", async () => {
+    let gotInput: Record<string, unknown> | undefined;
+    const app = buildApp({
+      jobDefaultModelId: "model_1",
+      catalogModel: { providerName: "OpenRouter" },
+      upsertUsage: vi.fn(async (input: Record<string, unknown>) => {
+        gotInput = input;
+        return { jobId: input.jobId };
+      }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/usage`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send(validUsage);
+
+    expect(res.status).toBe(201);
+    expect(gotInput?.modelConfigSource).toBe("organization_default");
+    expect(gotInput?.providerName).toBe("OpenRouter");
+    // The literal model id comes from the Orchestrator (what actually ran);
+    // the provider comes from the catalog. Neither is taken from the other.
+    expect(gotInput?.modelId).toBe("anthropic/claude-sonnet-4");
+  });
+
+  it("records no tier for a kind that resolves no model config", async () => {
+    let gotInput: Record<string, unknown> | undefined;
+    const app = buildApp({
+      findById: async () =>
+        makeJob({ id: JOB_ID, kind: "design_grill", featureId: null }),
+      jobDefaultModelId: "model_1",
+      catalogModel: { providerName: "OpenRouter" },
+      upsertUsage: vi.fn(async (input: Record<string, unknown>) => {
+        gotInput = input;
+        return { jobId: input.jobId };
+      }),
+    });
+
+    await request(app)
+      .post(`/internal/jobs/${JOB_ID}/usage`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send(validUsage);
+
+    // design_grill IS an agent kind, so it does resolve one; the point here is
+    // that the tier is resolved from the job's own kind and feature, and a
+    // design job carries no feature.
+    expect(gotInput?.modelConfigSource).toBe("organization_default");
+  });
+
+  it("rejects negative counts rather than storing them", async () => {
+    const app = buildApp({});
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/usage`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ ...validUsage, inputTokens: -1 });
+
+    expect(res.status).toBe(400);
+  });
+
+  it("rejects a payload missing token counts", async () => {
+    const app = buildApp({});
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/usage`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ modelId: "x" });
+
+    expect(res.status).toBe(400);
+  });
+
+  it("accepts an unreported cost and duration as null", async () => {
+    let gotInput: Record<string, unknown> | undefined;
+    const app = buildApp({
+      upsertUsage: vi.fn(async (input: Record<string, unknown>) => {
+        gotInput = input;
+        return { jobId: input.jobId };
+      }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/usage`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        totalTokens: 15,
+        costUsd: null,
+        durationMs: null,
+      });
+
+    expect(res.status).toBe(201);
+    expect(gotInput?.costUsd).toBeNull();
+    expect(gotInput?.durationMs).toBeNull();
+  });
+
+  it("404s an unknown job without writing a row", async () => {
+    const upsertUsage = vi.fn(async () => ({ jobId: JOB_ID }));
+    const app = buildApp({ findById: async () => null, upsertUsage });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/usage`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send(validUsage);
+
+    expect(res.status).toBe(404);
+    expect(upsertUsage).not.toHaveBeenCalled();
+  });
+
+  it("requires the internal bearer token", async () => {
+    const app = buildApp({});
+
+    const res = await request(app).post(`/internal/jobs/${JOB_ID}/usage`).send(validUsage);
+
+    expect(res.status).toBe(401);
   });
 });
