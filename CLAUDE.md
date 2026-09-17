@@ -19,7 +19,7 @@ tokens, dispatches jobs to the Orchestrator, and delivers real-time events to th
 Web app.
 
 - **Role in Yggdrasil:** API
-- **Stack:** Express + TypeScript, REST + WebSocket (planned), PostgreSQL, S3/MinIO for artefacts
+- **Stack:** Express + TypeScript, REST + WebSocket, PostgreSQL, S3/MinIO for artefacts
 - **Talks to:** Web (REST + WebSocket), Orchestrator (job dispatch + streamed events), GitHub (OAuth, scoped tokens for runs)
 
 ## Suite-wide context (up-links to the meta repo)
