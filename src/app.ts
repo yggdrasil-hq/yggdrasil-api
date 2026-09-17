@@ -46,6 +46,9 @@ import { OrgSecretRepository } from "./organizations/org-secrets-repository.js";
 import { OrganizationRepository } from "./organizations/repository.js";
 import { OrganizationClusterRepository } from "./organizations/cluster-repository.js";
 import { createOrganizationsRouter } from "./organizations/routes.js";
+import { OrgExtensionRepository } from "./extensions/repository.js";
+import { createOrgExtensionsRouter } from "./extensions/routes.js";
+import { createExtensionsInternalRouter } from "./extensions/internal-routes.js";
 import { createOrganizationsInternalRouter } from "./organizations/internal-routes.js";
 import { OrgProviderRepository } from "./model-config/provider-repository.js";
 import { OrgModelRepository } from "./model-config/model-repository.js";
@@ -134,6 +137,7 @@ export function createApp(deps?: AppDependencies): Express {
   const featureModelOverrides = new FeatureJobModelOverrideRepository(deps.pool);
   const featureModelSecrets = new FeatureModelSecretRepository(deps.pool);
   const jobUsage = new JobUsageRepository(deps.pool);
+  const orgExtensions = new OrgExtensionRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions }));
   app.use(
@@ -291,6 +295,16 @@ export function createApp(deps?: AppDependencies): Express {
   );
   // ADR 003 §15: the Orchestrator's preview registry — register/teardown, plus
   // the stale list the orphan sweep works from.
+  // ADR 025: uploaded Pi extensions -- org-admin CRUD, plus the bundle the
+  // Orchestrator fetches at dispatch time for a project that opted in.
+  app.use(
+    "/organizations",
+    createOrgExtensionsRouter({ users, sessions, organizations, extensions: orgExtensions, audit }),
+  );
+  app.use(
+    "/internal",
+    createExtensionsInternalRouter({ projects, extensions: orgExtensions }),
+  );
   app.use(
     "/internal",
     createPreviewsInternalRouter({ previews, jobs }),

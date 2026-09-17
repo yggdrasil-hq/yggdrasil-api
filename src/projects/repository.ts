@@ -15,6 +15,7 @@ interface ProjectRow {
   github_access_warning: boolean;
   model_config_warning: boolean;
   agentic_review_enabled: boolean;
+  uploaded_extensions_enabled: boolean;
   has_design_surface: boolean;
   created_at: Date;
   updated_at: Date;
@@ -42,6 +43,7 @@ const projectColumnNames = [
   "github_access_warning",
   "model_config_warning",
   "agentic_review_enabled",
+  "uploaded_extensions_enabled",
   "has_design_surface",
   "created_at",
   "updated_at",
@@ -75,6 +77,7 @@ function mapProject(row: ProjectRow, repositories: ProjectRepositoryRecord[]): P
     githubAccessWarning: row.github_access_warning,
     modelConfigWarning: row.model_config_warning,
     agenticReviewEnabled: row.agentic_review_enabled,
+    uploadedExtensionsEnabled: row.uploaded_extensions_enabled,
     hasDesignSurface: row.has_design_surface,
     repositories,
     createdAt: row.created_at,
@@ -291,6 +294,14 @@ export class ProjectRepository {
   async setAgenticReviewEnabled(projectId: string, enabled: boolean): Promise<void> {
     await this.db.query(
       `UPDATE projects SET agentic_review_enabled = $2, updated_at = NOW() WHERE id = $1`,
+      [projectId, enabled],
+    );
+  }
+
+  /** ADR 025 item 7: whether this project's Pi jobs load uploaded extensions. */
+  async setUploadedExtensionsEnabled(projectId: string, enabled: boolean): Promise<void> {
+    await this.db.query(
+      `UPDATE projects SET uploaded_extensions_enabled = $2, updated_at = NOW() WHERE id = $1`,
       [projectId, enabled],
     );
   }

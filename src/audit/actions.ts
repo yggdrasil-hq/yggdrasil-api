@@ -85,6 +85,33 @@ export const AUDIT_ACTIONS = {
   githubReposSynced: "github.repos_synced",
   githubInstallationUpdated: "github.installation_updated",
   githubRepositoriesUpdated: "github.repositories_updated",
+
+  // --- Uploaded Pi extensions (ADR 025) ---
+  /**
+   * ADR 025: code uploaded by an org admin that will run inside job
+   * containers holding the project's GitHub token and the org's model key.
+   * These three are the highest-signal events in this file for anyone
+   * answering "what changed before that happened" — an extension arriving,
+   * being switched off, or being replaced is exactly the kind of change a
+   * post-incident reader needs to see.
+   *
+   * A replacement records `extension.uploaded` with `replaced: true` in its
+   * metadata rather than a separate action: it is the same act on the same
+   * target, and splitting it would make "every revision of extension X" a
+   * two-filter query. The digest in metadata is what distinguishes revisions.
+   */
+  extensionUploaded: "extension.uploaded",
+  extensionActivationChanged: "extension.activation_changed",
+  extensionDeleted: "extension.deleted",
+  /**
+   * Enabling uploaded extensions in a project is recorded on its own action
+   * rather than folded into `project.updated` (which is what the analogous
+   * agentic-review toggle does). The difference is intent: this toggle decides
+   * whether arbitrary third-party code runs with the project's credentials,
+   * and a reader scanning a trail for "when did we start doing that here"
+   * should not have to open every project update to find out.
+   */
+  projectUploadedExtensionsChanged: "project.uploaded_extensions_changed",
 } as const;
 
 export type AuditActionName = (typeof AUDIT_ACTIONS)[keyof typeof AUDIT_ACTIONS];

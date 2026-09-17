@@ -24,6 +24,12 @@ export interface Project {
   modelConfigWarning: boolean;
   /** ADR 015 item 12: Agentic Review gate per-project, default on. */
   agenticReviewEnabled: boolean;
+  /**
+   * ADR 025 item 7: whether this project's Pi jobs load the organization's
+   * uploaded extensions. Default off — this is the narrower half of the
+   * trust decision, and it must be a deliberate act.
+   */
+  uploadedExtensionsEnabled: boolean;
   /** ADR 014: whether this project has a user-facing design surface. */
   hasDesignSurface: boolean;
   repositories: ProjectRepositoryRecord[];
@@ -49,6 +55,7 @@ export interface PublicProject {
   githubAccessWarning: boolean;
   modelConfigWarning: boolean;
   agenticReviewEnabled: boolean;
+  uploadedExtensionsEnabled: boolean;
   hasDesignSurface: boolean;
   repositories: PublicProjectRepository[];
   repositoryRemovalBlockedReason: string | null;
@@ -100,6 +107,7 @@ export function toPublicProject(
     githubAccessWarning: project.githubAccessWarning,
     modelConfigWarning: project.modelConfigWarning,
     agenticReviewEnabled: project.agenticReviewEnabled,
+    uploadedExtensionsEnabled: project.uploadedExtensionsEnabled,
     hasDesignSurface: project.hasDesignSurface,
     repositories: project.repositories.map((repo) => ({
       id: repo.id,
