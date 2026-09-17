@@ -36,4 +36,14 @@ export interface Job {
    * deploys land before it is claimed.
    */
   targetRevision: number | null;
+  /**
+   * ADR 024: the `job_events` turn this run's seed context was rewound to,
+   * when the run came from a per-message "restart from here" rather than a
+   * first attempt or an ADR 015 kickback. Null for every other run.
+   *
+   * Exists so a restarted session is identifiable from the job alone: the seed
+   * itself is in `specContext`, which is deliberately never exposed publicly
+   * (it can carry a whole previous ADR and transcript).
+   */
+  restartedFromEventId: string | null;
 }

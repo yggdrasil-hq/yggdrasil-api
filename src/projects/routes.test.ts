@@ -138,6 +138,11 @@ interface BuildAppOptions {
   currentRevision?: number | null;
   rollbackTargets?: unknown[];
   knownRevisions?: number[];
+  /** ADR 024 state: the latest job (whose events form the transcript) and its events. */
+  latestJob?: unknown;
+  transcriptEvents?: unknown[];
+  /** Forces `resetForMessageRestart` to report the feature moved on before the rewind landed. */
+  resetForMessageRestartRefused?: boolean;
 }
 
 function buildApp(opts: BuildAppOptions) {
@@ -179,6 +184,12 @@ function buildApp(opts: BuildAppOptions) {
     ),
     setAwaitingUserInput: vi.fn(async () => opts.feature ?? null),
     resetForRetry: vi.fn(async () => opts.feature ?? null),
+    // ADR 024: the guarded rewind. Mirrors the real guard by returning null
+    // when the caller opts a feature out, so the "feature moved on" race is
+    // exercisable without a database.
+    resetForMessageRestart: vi.fn(async () =>
+      opts.resetForMessageRestartRefused ? null : { ...(opts.feature ?? makeFeature()), status: "draft" },
+    ),
     queueBuild: vi.fn(async () => opts.feature ?? null),
     resumeImplementation: vi.fn(async () => opts.feature ?? null),
     setReturned: vi.fn(async () => opts.feature ?? null),
@@ -188,10 +199,17 @@ function buildApp(opts: BuildAppOptions) {
     createSubtask: vi.fn(async () => opts.feature ?? makeFeature()),
   };
   const jobs = {
-    create: vi.fn(async () => ({ id: "job_1" })),
+    // `_input` is typed (and unused) so this fake's recorded call arguments are
+    // addressable by assertions — several routes' tests inspect what was
+    // dispatched (ADR 024's seed, ADR 022's target revision).
+    create: vi.fn(async (_input: unknown) => ({ id: "job_1" })),
     hasActiveTestRunsForProject: vi.fn(async () => false),
     listActiveTestRunsForProject: vi.fn(async () => []),
     findActiveSpecGrillJob: vi.fn(async () => opts.activeSpecGrillJob ?? null),
+    // ADR 024: the transcript a per-message restart rewinds is the feature's
+    // latest job's, so the route resolves it the same way the events endpoint
+    // does.
+    findLatestJob: vi.fn(async () => opts.latestJob ?? null),
     findLatestByProjectAndKind: vi.fn(async () => opts.latestDeployJob ?? null),
     // ADR 022: the deploy/rollback pair shares one in-flight guard, so the
     // routes now ask for both kinds at once. Fed from the same fake so every
@@ -288,7 +306,10 @@ function buildApp(opts: BuildAppOptions) {
       tests: tests as never,
       testRunReports: testRunReports as never,
       jobs: jobs as never,
-      jobEvents: {} as never,
+      jobEvents: {
+        listByJob: vi.fn(async () => opts.transcriptEvents ?? []),
+        listSpecGrillByFeature: vi.fn(async () => opts.transcriptEvents ?? []),
+      } as never,
       jobMessages: {} as never,
       notifications: notifications as never,
       installations: installations as never,
@@ -1360,5 +1381,237 @@ describe("POST /projects/:projectId/features/:featureId/restart", () => {
     );
 
     expect(res.status).toBe(409);
+  });
+});
+
+describe("POST /projects/:projectId/features/:featureId/restart-from-message (ADR 024)", () => {
+  const MODEL_ENV = { MODEL_BASE_URL: "u", MODEL_API_KEY: "k", MODEL_ID: "m" };
+
+  const FIRST_TURN = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const SECOND_TURN = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const TERMINAL_EVENT = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+
+  /**
+   * A finished grill transcript: an agent question, the user's answer, then the
+   * terminal `submit_adr` marker.
+   */
+  function grillEvents() {
+    const base = {
+      jobId: "job_1",
+      markdown: null,
+      status: null,
+      prUrl: null,
+      summary: null,
+      actionItems: null,
+      snapshot: null,
+      createdAt: new Date(),
+    };
+    return [
+      { ...base, id: FIRST_TURN, type: "ask_user", question: "One saved card, or many?", message: null },
+      { ...base, id: SECOND_TURN, type: "user_message", question: null, message: "Many, with one default." },
+      { ...base, id: TERMINAL_EVENT, type: "submit_adr", question: null, message: null },
+    ];
+  }
+
+  function setup(overrides: Partial<BuildAppOptions> = {}) {
+    const feature = makeFeature({ status: "draft" });
+    const project = makeProject();
+    const built = buildApp({
+      project,
+      feature,
+      orgSecrets: MODEL_ENV,
+      latestJob: { id: "job_1", kind: "spec_grill", status: "completed" },
+      transcriptEvents: grillEvents(),
+      ...overrides,
+    });
+    return { feature, project, ...built };
+  }
+
+  function restartRequest(app: express.Express, projectId: string, featureId: string) {
+    return authedRequest(app).post(
+      `/projects/${projectId}/features/${featureId}/restart-from-message`,
+    );
+  }
+
+  /** The argument the route dispatched for the most recent job insert. */
+  function dispatchedJob(jobs: { create: { mock: { calls: unknown[][] } } }) {
+    return jobs.create.mock.calls[0][0] as {
+      kind: string;
+      restartedFromEventId?: string;
+      specContext: { grillTranscriptSummary: string; restartFromMessage: boolean };
+    };
+  }
+
+  it("rewinds to draft and seeds a new spec_grill from the turns before the chosen one", async () => {
+    const { app, feature, project, jobs } = setup();
+
+    const res = await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
+
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe("draft");
+    expect(jobs.create).toHaveBeenCalledTimes(1);
+
+    const dispatched = dispatchedJob(jobs);
+    expect(dispatched.kind).toBe("spec_grill");
+    expect(dispatched.specContext.restartFromMessage).toBe(true);
+    // Exclusive boundary: the question before the chosen turn is kept, and the
+    // user's own answer at it is not — that is the turn being redone.
+    expect(dispatched.specContext.grillTranscriptSummary).toBe(
+      "Agent question: One saved card, or many?",
+    );
+  });
+
+  it("records which turn the rewind was taken at, on the job and in the audit trail", async () => {
+    const { app, feature, project, jobs, audit } = setup();
+
+    await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
+
+    expect(jobs.create.mock.calls[0][0]).toMatchObject({
+      restartedFromEventId: SECOND_TURN,
+    });
+    // ADR 028 coverage: the mutation is recorded, and the turn is part of the
+    // record — "a grill was rewound" without "how far" would not be actionable.
+    const recorded = audit.record.mock.calls.map(
+      (call) => call[1] as { action: string; targetId: string; metadata?: { restartedFromEventId?: string } },
+    );
+    expect(recorded).toContainEqual(
+      expect.objectContaining({
+        action: "feature.grill_restarted_from_message",
+        targetId: feature.id,
+        metadata: expect.objectContaining({ restartedFromEventId: SECOND_TURN }),
+      }),
+    );
+  });
+
+  it("keeps the superseded run as history rather than mutating it", async () => {
+    const { app, feature, project, jobs } = setup();
+
+    await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
+
+    // ADR 012's precedent: always a new job row. The old run is left alone.
+    expect(jobs.create).toHaveBeenCalledTimes(1);
+    expect(Object.keys(jobs)).not.toContain("update");
+  });
+
+  it("404s for an event id that is not in the current transcript", async () => {
+    const { app, feature, project, jobs } = setup();
+
+    const res = await restartRequest(app, project.id, feature.id).send({
+      eventId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    });
+
+    expect(res.status).toBe(404);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("404s when the chosen event is a terminal marker, not a conversation turn", async () => {
+    const { app, feature, project, jobs } = setup();
+
+    const res = await restartRequest(app, project.id, feature.id).send({
+      eventId: TERMINAL_EVENT,
+    });
+
+    expect(res.status).toBe(404);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("400s on a missing or malformed event id", async () => {
+    const { app, feature, project } = setup();
+
+    const missing = await restartRequest(app, project.id, feature.id).send({});
+    const malformed = await restartRequest(app, project.id, feature.id).send({
+      eventId: "not-a-uuid",
+    });
+
+    expect(missing.status).toBe(400);
+    expect(malformed.status).toBe(400);
+  });
+
+  it("409s while a grill session is running, which ADR 006's mid-run reply already steers", async () => {
+    const { app, feature, project, jobs } = setup({ activeSpecGrillJob: { id: "job_1" } });
+
+    const res = await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("already running");
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("409s once the feature has moved past Spec, naming the state", async () => {
+    const { app, project, jobs } = setup({ feature: makeFeature({ status: "in_review" }) });
+
+    const res = await restartRequest(app, project.id, "22222222-2222-4222-8222-222222222222").send(
+      { eventId: SECOND_TURN },
+    );
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("in_review");
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("409s when the latest run is not a grill, so a failed build's transcript is not rewritten", async () => {
+    const { app, feature, project, jobs } = setup({
+      feature: makeFeature({ status: "failed" }),
+      latestJob: { id: "job_1", kind: "feature_build", status: "failed" },
+    });
+
+    const res = await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toContain("not a grill");
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("409s without dispatching when the guarded rewind refuses — the feature moved on", async () => {
+    const { app, feature, project, jobs } = setup({ resetForMessageRestartRefused: true });
+
+    const res = await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
+
+    expect(res.status).toBe(409);
+    // The point of the guarded UPDATE: never leave an orphan grill run for a
+    // feature that is no longer in a restartable state.
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("passes the allowed status set to the guarded rewind", async () => {
+    const { app, feature, project, features } = setup();
+
+    await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
+
+    expect(features.resetForMessageRestart).toHaveBeenCalledWith(feature.id, [
+      "draft",
+      "spec_ready",
+      "failed",
+      "cancelled",
+    ]);
+  });
+
+  it("404s for a project the user does not own", async () => {
+    const { app, feature } = setup();
+
+    const res = await restartRequest(
+      app,
+      "99999999-9999-4999-8999-999999999999",
+      feature.id,
+    ).send({ eventId: SECOND_TURN });
+
+    expect(res.status).toBe(404);
+  });
+
+  it("400s when no model configuration is resolvable, before touching the feature", async () => {
+    const project = makeProject();
+    const feature = makeFeature({ status: "draft" });
+    const { app, features, jobs } = buildApp({
+      project,
+      feature,
+      latestJob: { id: "job_1", kind: "spec_grill", status: "completed" },
+      transcriptEvents: grillEvents(),
+    });
+
+    const res = await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
+
+    expect(res.status).toBe(400);
+    expect(features.resetForMessageRestart).not.toHaveBeenCalled();
+    expect(jobs.create).not.toHaveBeenCalled();
   });
 });

@@ -5,6 +5,12 @@ import { createAuthMiddleware } from "../auth/middleware.js";
 import type { SessionService } from "../auth/sessions.js";
 import { dispatchJob } from "../jobs/dispatch.js";
 import type { JobRepository } from "../jobs/repository.js";
+import {
+  buildGrillRestartSeed,
+  canRestartFromMessage,
+  messageRestartRefusal,
+  MESSAGE_RESTART_STATUSES,
+} from "../jobs/grill-context.js";
 import type { JobEventRepository } from "../jobs/events-repository.js";
 import type { JobMessageRepository } from "../jobs/messages-repository.js";
 import type { NotificationRepository } from "../notifications/repository.js";
@@ -128,6 +134,10 @@ const updateFeatureSchema = z.object({
 
 const createFeatureMessageSchema = z.object({
   content: z.string().trim().min(1).max(8000),
+});
+
+const restartFromMessageSchema = z.object({
+  eventId: z.string().uuid(),
 });
 
 const createDesignSchema = z.object({
@@ -1647,6 +1657,113 @@ export function createProjectsRouter(deps: {
     },
   );
 
+  // ADR 024: rewinds a feature's Spec interview to one transcript turn
+  // ("restart from here").
+  //
+  // The feature re-enters `draft` and a NEW spec_grill run is dispatched —
+  // ADR 012's precedent, a new job row every time, the old one kept as
+  // history — seeded with the conversation *before* the chosen turn. This is
+  // the only per-message control; "resume from here" is deliberately absent
+  // because a live session is already steered by ADR 006's mid-run reply, and
+  // this route refuses to run underneath one.
+  router.post(
+    "/:projectId/features/:featureId/restart-from-message",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      if (!featureId) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      const parsed = parseBody(restartFromMessageSchema, req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error });
+        return;
+      }
+
+      const feature = await deps.features.findById(project.id, featureId);
+      if (!feature) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      // The transcript the user was reading is the feature's latest job's, so
+      // the chosen turn must belong to *that* run — an id from an earlier run
+      // of the same feature would seed a context whose surrounding turns are
+      // not the ones on screen.
+      const latestJob = await deps.jobs.findLatestJob(featureId);
+      const activeJob = await deps.jobs.findActiveSpecGrillJob(featureId);
+      const gate = {
+        status: feature.status,
+        latestJobKind: latestJob?.kind ?? null,
+        hasActiveGrillJob: activeJob !== null,
+      };
+      if (!canRestartFromMessage(gate)) {
+        res.status(409).json({ error: messageRestartRefusal(gate) });
+        return;
+      }
+
+      const events = latestJob ? await deps.jobEvents.listByJob(latestJob.id) : [];
+      const seed = buildGrillRestartSeed(events, parsed.data.eventId);
+      if (!seed) {
+        res.status(404).json({
+          error: "That message is not part of the current grill transcript",
+        });
+        return;
+      }
+
+      const modelConfigError = await assertModelConfigResolvable(
+        project,
+        "spec_grill",
+        feature.id,
+      );
+      if (modelConfigError) {
+        res.status(400).json({ error: modelConfigError });
+        return;
+      }
+
+      // Guarded on the allowed set, so a feature that moved on between the
+      // checks above and here is refused rather than silently rewound.
+      const rewound = await deps.features.resetForMessageRestart(
+        featureId,
+        MESSAGE_RESTART_STATUSES,
+      );
+      if (!rewound) {
+        res.status(409).json({ error: "Feature is not in a restartable state" });
+        return;
+      }
+
+      await dispatchJob(deps.jobs, {
+        projectId: project.id,
+        kind: "spec_grill",
+        featureId: rewound.id,
+        specContext: seed,
+        restartedFromEventId: parsed.data.eventId,
+      });
+
+      await deps.audit.record(res, {
+        organizationId: project.organizationId,
+        projectId: project.id,
+        actorUserId: req.currentUser!.id,
+        action: AUDIT_ACTIONS.featureGrillRestartedFromMessage,
+        targetType: "feature",
+        targetId: rewound.id,
+        // The turn is the whole point of this action — without it the row says
+        // a grill was rewound but not how far.
+        metadata: { title: rewound.title, restartedFromEventId: parsed.data.eventId },
+      });
+
+      res.status(201).json(toPublicFeature(rewound));
+    },
+  );
+
   // Re-dispatches a feature_build job for a feature whose build failed,
   // keeping the already-approved ADR intact (features.retryBuild) instead
   // of re-running the interview like retry-grill does — the counterpart to
@@ -1995,12 +2112,28 @@ export function createProjectsRouter(deps: {
 
     const job = await deps.jobs.findLatestJob(featureId);
     if (!job) {
-      res.json({ jobStatus: null, lastError: null, events: [] });
+      res.json({
+        jobStatus: null,
+        lastError: null,
+        jobKind: null,
+        restartedFromEventId: null,
+        events: [],
+      });
       return;
     }
 
     const events = await deps.jobEvents.listByJob(job.id);
-    res.json({ jobStatus: job.status, lastError: job.lastError, events });
+    // jobKind lets the caller tell whether this transcript is a grill at all
+    // (ADR 024's per-message restart only applies to one);
+    // restartedFromEventId says this run is a rewind of an earlier one, so the
+    // page can explain why its transcript starts mid-conversation.
+    res.json({
+      jobStatus: job.status,
+      lastError: job.lastError,
+      jobKind: job.kind,
+      restartedFromEventId: job.restartedFromEventId,
+      events,
+    });
   });
 
   router.get("/:projectId/tests", requireAuth, async (req, res) => {

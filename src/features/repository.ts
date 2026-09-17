@@ -423,6 +423,39 @@ export class FeatureRepository {
     return result.rows[0] ? mapFeature(result.rows[0]) : null;
   }
 
+  /**
+   * ADR 024: rewinds a feature to `draft` for a per-message grill restart,
+   * where the new run's seed is the earlier transcript truncated at the turn
+   * the user chose.
+   *
+   * Distinct from `resetForRetry` and `restartFromCancelled` rather than a
+   * widening of either: those each encode exactly one predecessor state (a
+   * failed grill, a cancelled run), while a rewind is legitimate from several.
+   * The allowed set is passed in and enforced in SQL — the guarded-UPDATE
+   * pattern ADR 011 established — so `WHERE status = ANY(...)` is what stops
+   * two concurrent restarts, or a restart racing a build, from both
+   * transitioning the same feature. A null return means the feature had
+   * already moved on and the caller must not dispatch.
+   */
+  async resetForMessageRestart(
+    featureId: string,
+    allowedStatuses: readonly string[],
+  ): Promise<Feature | null> {
+    const result = await this.db.query<FeatureRow>(
+      `UPDATE features
+       SET status = 'draft',
+           adr_approved = FALSE,
+           awaiting_user_input = FALSE,
+           return_reason = NULL,
+           return_comment = NULL,
+           updated_at = NOW()
+       WHERE id = $1 AND status = ANY($2::text[])
+       RETURNING ${featureColumns}`,
+      [featureId, allowedStatuses],
+    );
+    return result.rows[0] ? mapFeature(result.rows[0]) : null;
+  }
+
   async setAwaitingUserInput(
     featureId: string,
     awaiting: boolean,

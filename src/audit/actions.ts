@@ -34,6 +34,14 @@ export const AUDIT_ACTIONS = {
   featureCancelled: "feature.cancelled",
   featureRestarted: "feature.restarted",
   featureGrillRetried: "feature.grill_retried",
+  /**
+   * ADR 024: the Spec interview was rewound to an earlier transcript turn and
+   * re-run from there. Recorded separately from `feature.grill_retried` (which
+   * re-runs the interview from scratch) because the two discard very different
+   * amounts of work — a rewind keeps the turns before the chosen message — and
+   * an audit reader needs to tell them apart.
+   */
+  featureGrillRestartedFromMessage: "feature.grill_restarted_from_message",
   featureBuildRetried: "feature.build_retried",
   featureResumed: "feature.resumed",
 

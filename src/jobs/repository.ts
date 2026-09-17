@@ -21,13 +21,14 @@ interface JobRow {
   started_at: Date | null;
   completed_at: Date | null;
   target_revision: number | null;
+  restarted_from_event_id: string | null;
 }
 
 const jobColumns = `
     id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
     design_name, design_slug, design_description, spec_context,
     design_id, status, last_error, created_at, started_at, completed_at,
-    target_revision
+    target_revision, restarted_from_event_id
 `;
 
 function mapJob(row: JobRow): Job {
@@ -51,6 +52,7 @@ function mapJob(row: JobRow): Job {
     startedAt: row.started_at,
     completedAt: row.completed_at,
     targetRevision: row.target_revision,
+    restartedFromEventId: row.restarted_from_event_id,
   };
 }
 
@@ -70,13 +72,15 @@ export class JobRepository {
     designDescription?: string;
     specContext?: Record<string, unknown>;
     targetRevision?: number;
+    /** ADR 024: the transcript turn this run's seed was rewound to, when it is a per-message restart. */
+    restartedFromEventId?: string;
   }): Promise<Job> {
     const result = await this.db.query<JobRow>(
       `INSERT INTO jobs
          (project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
           design_name, design_slug, design_description, spec_context, status,
-          target_revision)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12)
+          target_revision, restarted_from_event_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13)
        RETURNING ${jobColumns}`,
       [
         input.projectId,
@@ -91,6 +95,7 @@ export class JobRepository {
         input.designDescription ?? null,
         input.specContext ?? null,
         input.targetRevision ?? null,
+        input.restartedFromEventId ?? null,
       ],
     );
     return mapJob(result.rows[0]);

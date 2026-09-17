@@ -20,6 +20,8 @@ export async function dispatchJob(
     specContext?: Record<string, unknown>;
     /** ADR 022: the Helm revision a `rollback` job should target. */
     targetRevision?: number;
+    /** ADR 024: set only by a per-message grill restart — the turn its seed was rewound to. */
+    restartedFromEventId?: string;
   },
 ) {
   return jobs.create(input);

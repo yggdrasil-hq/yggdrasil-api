@@ -18,6 +18,7 @@ import {
   type ModelConfigResolutionDeps,
 } from "../secrets/model-config.js";
 import type { JobUsageRepository } from "../usage/repository.js";
+import { summarizeGrillTranscript } from "./grill-context.js";
 
 const actionItemSchema = z.object({
   type: z.enum(["secret_request", "design_grill", "subtask_feature", "test_request"]),
@@ -618,34 +619,6 @@ async function advanceAfterTesting(
     kind: "agentic_review",
     featureId,
   });
-}
-
-const MAX_GRILL_CONTEXT_CHARS = 12_000;
-
-function summarizeGrillTranscript(
-  events: Array<{
-    type: string;
-    question: string | null;
-    message: string | null;
-  }>,
-): string {
-  const lines = events.flatMap((event) => {
-    if (event.type === "agent_text" && event.message) {
-      return [`Agent: ${event.message}`];
-    }
-    if (event.type === "ask_user" && event.question) {
-      return [`Agent question: ${event.question}`];
-    }
-    if (event.type === "user_message" && event.message) {
-      return [`User: ${event.message}`];
-    }
-    return [];
-  });
-  const transcript = lines.join("\n\n");
-  if (transcript.length <= MAX_GRILL_CONTEXT_CHARS) {
-    return transcript;
-  }
-  return `[Earlier grill transcript truncated]\n${transcript.slice(-MAX_GRILL_CONTEXT_CHARS)}`;
 }
 
 function formatActionItemReason(

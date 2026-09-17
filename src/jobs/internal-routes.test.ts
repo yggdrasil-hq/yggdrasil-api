@@ -44,6 +44,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     designDescription: null,
     specContext: null,
     targetRevision: null,
+    restartedFromEventId: null,
     ...overrides,
   };
 }
