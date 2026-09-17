@@ -7,9 +7,16 @@ import type { FeatureActionItemRepository } from "../features/action-items-repos
 import type { FeatureRepository } from "../features/repository.js";
 import type { JobEventRepository } from "./events-repository.js";
 import type { JobRepository } from "./repository.js";
+import type { JobKind } from "./types.js";
 import type { ProjectRepository } from "../projects/repository.js";
 import type { TestRepository } from "../tests/repository.js";
 import type { TestRunReportRepository } from "../tests/reports-repository.js";
+import { AGENT_JOB_KINDS, type AgentJobKind, type ModelConfigSource } from "../model-config/types.js";
+import {
+  resolveModelConfigSource,
+  type ModelConfigResolutionDeps,
+} from "../secrets/model-config.js";
+import type { JobUsageRepository } from "../usage/repository.js";
 
 const actionItemSchema = z.object({
   type: z.enum(["secret_request", "design_grill", "subtask_feature", "test_request"]),
@@ -131,6 +138,23 @@ const requestedActionItemSchema = z.object({
 });
 
 /**
+ * ADR 023: the accounting block the Orchestrator reads from Pi's own
+ * get_session_stats at the end of a job's session. Non-negative throughout —
+ * Pi cannot legitimately report negative usage, so a negative value is a bug
+ * upstream and is rejected rather than stored.
+ */
+const jobUsageSchema = z.object({
+  modelId: z.string().trim().max(256).optional(),
+  inputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  cacheReadTokens: z.number().int().nonnegative(),
+  cacheWriteTokens: z.number().int().nonnegative(),
+  totalTokens: z.number().int().nonnegative(),
+  costUsd: z.number().nonnegative().nullable().optional(),
+  durationMs: z.number().int().nonnegative().nullable().optional(),
+});
+
+/**
  * Accepts curated events the Orchestrator relays from a running job's Pi
  * RPC session (ADR 006 items 7-8) and persists them — the only place job
  * events enter the API. Read-side (WebSocket relay to the Web app,
@@ -144,8 +168,68 @@ export function createJobsInternalRouter(deps: {
   tests: TestRepository;
   testRunReports: TestRunReportRepository;
   projects: ProjectRepository;
+  usage: JobUsageRepository;
+  modelConfig: ModelConfigResolutionDeps;
 }): Router {
   const router = Router();
+
+  /**
+   * ADR 023: records a finished job's token/cost accounting.
+   *
+   * Scope is derived entirely from the stored job, never taken from the
+   * request body: the caller is the Orchestrator reporting on a job it just
+   * ran, so letting it name the project or the tier would make the usage table
+   * assertable from outside rather than observed. The body carries only the
+   * accounting itself.
+   *
+   * Not written to the audit trail: ADR 028 item 7 already scopes out
+   * `/internal/*` Orchestrator-driven writes, each of which is a job outcome
+   * the API itself just orchestrated rather than a human action.
+   */
+  router.post(
+    "/jobs/:jobId/usage",
+    requireInternalApiToken,
+    async (req, res) => {
+      const jobId = routeParam(req.params.jobId);
+      if (!isUuid(jobId)) {
+        res.status(404).json({ error: "Job not found" });
+        return;
+      }
+
+      const parsed = jobUsageSchema.safeParse(req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error.issues[0]?.message ?? "Invalid usage" });
+        return;
+      }
+
+      const job = await deps.jobs.findById(jobId);
+      if (!job) {
+        res.status(404).json({ error: "Job not found" });
+        return;
+      }
+
+      const attribution = await resolveUsageAttribution(deps, job);
+
+      const usage = await deps.usage.upsert({
+        jobId: job.id,
+        projectId: job.projectId,
+        jobKind: job.kind,
+        modelId: parsed.data.modelId ?? null,
+        modelConfigSource: attribution.source,
+        providerName: attribution.providerName,
+        inputTokens: parsed.data.inputTokens,
+        outputTokens: parsed.data.outputTokens,
+        cacheReadTokens: parsed.data.cacheReadTokens,
+        cacheWriteTokens: parsed.data.cacheWriteTokens,
+        totalTokens: parsed.data.totalTokens,
+        costUsd: parsed.data.costUsd ?? null,
+        durationMs: parsed.data.durationMs ?? null,
+      });
+
+      res.status(201).json({ id: usage.jobId });
+    },
+  );
+
 
   router.post(
     "/jobs/:jobId/events",
@@ -552,4 +636,62 @@ function formatActionItemReason(
   return items
     .map((item) => `${item.type}: ${item.description}`)
     .join("\n");
+}
+
+/**
+ * ADR 023: which model config tier and provider served a job, resolved from
+ * the API's own catalog rather than reported by the Orchestrator — the
+ * Orchestrator never learns provider names, and never handles a key on this
+ * path (resolveModelConfigSource decrypts nothing).
+ *
+ * The provider is only knowable for the three catalog tiers: the two custom
+ * tiers point at a bring-your-own endpoint that no catalog row describes, so
+ * those are recorded with a null provider rather than a guessed one, and a
+ * provider's own quota/billing-cycle reset is unknowable to Yggdrasil in every
+ * case.
+ *
+ * Best-effort: an attribution lookup that fails still stores the job's real
+ * token counts. Losing the tier label is a smaller loss than losing the
+ * measurement.
+ */
+async function resolveUsageAttribution(
+  deps: {
+    projects: ProjectRepository;
+    modelConfig: ModelConfigResolutionDeps;
+  },
+  job: { projectId: string; kind: JobKind; featureId: string | null },
+): Promise<{ source: ModelConfigSource | null; providerName: string | null }> {
+  if (!isAgentJobKind(job.kind)) {
+    return { source: null, providerName: null };
+  }
+  try {
+    const project = await deps.projects.findById(job.projectId);
+    if (!project) {
+      return { source: null, providerName: null };
+    }
+    const { source, modelId } = await resolveModelConfigSource(deps.modelConfig, {
+      projectId: job.projectId,
+      organizationId: project.organizationId,
+      jobKind: job.kind,
+      featureId: job.featureId,
+    });
+    const model = modelId
+      ? await deps.modelConfig.models.findById(project.organizationId, modelId)
+      : null;
+    return { source, providerName: model?.providerName ?? null };
+  } catch (error) {
+    console.error(`failed to resolve usage attribution for project ${job.projectId}:`, error);
+    return { source: null, providerName: null };
+  }
+}
+
+/**
+ * Narrows a stored job kind to the five agent-driven kinds ADR 018 resolves a
+ * model config for. `deploy` and `script_test_run` run no Pi session, so they
+ * never report usage at all; this guard means a report arriving for one (a
+ * bug, or a future non-agent kind that does consume tokens) records its counts
+ * with no tier attributed rather than a misleading one.
+ */
+function isAgentJobKind(kind: JobKind): kind is AgentJobKind {
+  return (AGENT_JOB_KINDS as readonly string[]).includes(kind);
 }
