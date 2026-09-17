@@ -24,6 +24,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     githubAccessWarning: false,
     modelConfigWarning: false,
     agenticReviewEnabled: true,
+    uploadedExtensionsEnabled: false,
     hasDesignSurface: true,
     repositories: [
       { id: "repo_1", githubOwner: "acme", githubRepo: "web", isPrimary: true, sortOrder: 0 },
@@ -169,6 +170,7 @@ function buildApp(opts: BuildAppOptions) {
     create: vi.fn(async () => opts.project),
     markReady: vi.fn(async () => undefined),
     setAgenticReviewEnabled: vi.fn(async () => undefined),
+    setUploadedExtensionsEnabled: vi.fn(async () => undefined),
     delete: vi.fn(async () => true),
   };
   const features = {
@@ -1859,5 +1861,72 @@ describe("GET /projects/:projectId/tests/:testId/runs/:jobId", () => {
     );
 
     expect(res.status).toBe(401);
+  });
+});
+
+// ADR 025 item 7: the per-project opt-in for uploaded extensions. Separate
+// from the agentic-review toggle above because it decides whether code an org
+// admin uploaded runs inside this project's job containers.
+describe("PATCH /:projectId/uploaded-extensions-enabled (ADR 025)", () => {
+  it("flips the opt-in on, returns the updated project, and records an audit entry", async () => {
+    const { app, projects, audit } = buildApp({ project: makeProject() });
+
+    const res = await authedRequest(app)
+      .patch("/projects/11111111-1111-4111-8111-111111111111/uploaded-extensions-enabled")
+      .send({ uploadedExtensionsEnabled: true });
+
+    expect(res.status).toBe(200);
+    expect(projects.setUploadedExtensionsEnabled).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      true,
+    );
+    // Its own action, not a generic project.updated: a trail reader should be
+    // able to find "when did this project start loading uploaded code" without
+    // opening every project mutation.
+    const recorded = audit.record.mock.calls.map(
+      (call) => call[1] as { action: string; metadata?: Record<string, unknown> },
+    );
+    expect(recorded).toContainEqual(
+      expect.objectContaining({
+        action: "project.uploaded_extensions_changed",
+        metadata: expect.objectContaining({ uploadedExtensionsEnabled: true }),
+      }),
+    );
+  });
+
+  it("can turn the opt-in back off", async () => {
+    const { app, projects } = buildApp({ project: makeProject() });
+
+    const res = await authedRequest(app)
+      .patch("/projects/11111111-1111-4111-8111-111111111111/uploaded-extensions-enabled")
+      .send({ uploadedExtensionsEnabled: false });
+
+    expect(res.status).toBe(200);
+    expect(projects.setUploadedExtensionsEnabled).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      false,
+    );
+  });
+
+  it("400s on a non-boolean payload without mutating", async () => {
+    const { app, projects } = buildApp({ project: makeProject() });
+
+    const res = await authedRequest(app)
+      .patch("/projects/11111111-1111-4111-8111-111111111111/uploaded-extensions-enabled")
+      .send({ uploadedExtensionsEnabled: "yes" });
+
+    expect(res.status).toBe(400);
+    expect(projects.setUploadedExtensionsEnabled).not.toHaveBeenCalled();
+  });
+
+  it("404s a project the caller does not own", async () => {
+    const { app, projects } = buildApp({ project: makeProject() });
+
+    const res = await authedRequest(app)
+      .patch("/projects/99999999-9999-4999-8999-999999999999/uploaded-extensions-enabled")
+      .send({ uploadedExtensionsEnabled: true });
+
+    expect(res.status).toBe(404);
+    expect(projects.setUploadedExtensionsEnabled).not.toHaveBeenCalled();
   });
 });

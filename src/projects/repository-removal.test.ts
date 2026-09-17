@@ -19,6 +19,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     githubAccessWarning: false,
     modelConfigWarning: false,
     agenticReviewEnabled: true,
+    uploadedExtensionsEnabled: false,
     hasDesignSurface: true,
     repositories: [
       {

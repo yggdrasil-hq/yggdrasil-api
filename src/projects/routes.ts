@@ -941,9 +941,56 @@ export function createProjectsRouter(deps: {
     res.json(await toPublicProjectWithRemovalMeta(updated));
   });
 
-  router.delete("/:projectId", requireAuth, async (req, res) => {
+  // ADR 025 item 7: per-project opt-in for uploaded Pi extensions. Separate
+  // route from the `/:projectId` PATCH above rather than another field on it,
+  // because the two toggles have very different weight: the agentic-review
+  // gate changes how a build is reviewed, this one decides whether code an
+  // admin uploaded runs inside the project's job containers. Same
+  // project-membership gate as every other project setting (ADR 018 item 6) —
+  // the *upload* is the org-admin action, this is the project owner opting in.
+  router.patch("/:projectId/uploaded-extensions-enabled", requireAuth, async (req, res) => {
     const project = await getOwnedProject(req, routeParam(req.params.projectId));
     if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const parsed = parseBody(
+      z.object({
+        uploadedExtensionsEnabled: z.boolean(),
+      }),
+      req.body,
+    );
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    await deps.projects.setUploadedExtensionsEnabled(
+      project.id,
+      parsed.data.uploadedExtensionsEnabled,
+    );
+
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.projectUploadedExtensionsChanged,
+      targetType: "project",
+      targetId: project.id,
+      metadata: { uploadedExtensionsEnabled: parsed.data.uploadedExtensionsEnabled },
+    });
+
+    const updated = await deps.projects.findByIdForUser(project.id, req.currentUser!.id);
+    if (!updated) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    res.json(await toPublicProjectWithRemovalMeta(updated));
+  });
+
+  router.delete("/:projectId", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));    if (!project) {
       res.status(404).json({ error: "Project not found" });
       return;
     }
