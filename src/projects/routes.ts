@@ -35,7 +35,7 @@ import { isUuid } from "../shared/uuid.js";
 import { slugify } from "../shared/slug.js";
 import type { GithubInstallationRepository } from "../github/installation-repository.js";
 import { MODEL_CONFIG_KEYS, resolveModelConfigForJob, resolveOrgModelConfig } from "../secrets/model-config.js";
-import type { ModelConfigBundle } from "../secrets/model-config.js";
+import type { ModelConfigBundle, ModelConfigResolutionDeps } from "../secrets/model-config.js";
 import type { SecretRepository } from "../secrets/repository.js";
 import type { OrgSecretRepository } from "../organizations/org-secrets-repository.js";
 import type { OrganizationRepository } from "../organizations/repository.js";
@@ -43,6 +43,8 @@ import type { OrgProviderRepository } from "../model-config/provider-repository.
 import type { OrgModelRepository } from "../model-config/model-repository.js";
 import type { JobModelDefaultRepository } from "../model-config/job-default-repository.js";
 import type { ProjectModelOverrideRepository } from "../model-config/project-override-repository.js";
+import type { FeatureJobModelOverrideRepository } from "../model-config/feature-override-repository.js";
+import type { FeatureModelSecretRepository } from "../secrets/feature-model-repository.js";
 import type { AgentJobKind } from "../model-config/types.js";
 import { AUDIT_ACTIONS } from "../audit/actions.js";
 import type { AuditRecorder } from "../audit/record.js";
@@ -172,10 +174,22 @@ export function createProjectsRouter(deps: {
   models: OrgModelRepository;
   jobDefaults: JobModelDefaultRepository;
   projectOverrides: ProjectModelOverrideRepository;
+  featureOverrides: FeatureJobModelOverrideRepository;
+  featureSecrets: FeatureModelSecretRepository;
   audit: AuditRecorder;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
+
+  const modelConfigDeps = (): ModelConfigResolutionDeps => ({
+    secrets: deps.secrets,
+    featureSecrets: deps.featureSecrets,
+    providers: deps.providers,
+    models: deps.models,
+    jobDefaults: deps.jobDefaults,
+    projectOverrides: deps.projectOverrides,
+    featureOverrides: deps.featureOverrides,
+  });
 
   async function getOwnedProject(req: Parameters<typeof requireAuth>[0], projectId: string) {
     if (!isUuid(projectId)) {
@@ -233,21 +247,36 @@ export function createProjectsRouter(deps: {
 
   /**
    * Gate enforced at every job-dispatch site (ADR 007, per-job-kind since
-   * ADR 018): resolves live for the job kind about to be dispatched, and
-   * refuses to dispatch if nothing resolves. Distinct from
-   * `assertGitHubAccess` — model config and repo access are independent
-   * prerequisites.
+   * ADR 018, feature-tier aware since the ADR 018 amendment / issue #5):
+   * resolves live for the job kind about to be dispatched — through the
+   * feature, project, and organization tiers — and refuses to dispatch if
+   * nothing resolves. Distinct from `assertGitHubAccess` — model config and
+   * repo access are independent prerequisites.
+   *
+   * `featureId` is passed by the feature-scoped dispatch sites (start build,
+   * retry build, retry grill, restart, resume) and omitted where no feature
+   * exists yet (feature creation) or where the job doesn't belong to one (a
+   * `design_grill` session, which is project-scoped even when started from a
+   * feature's Action Item — ADR 014).
    */
   async function assertModelConfigResolvable(
     project: Project,
     jobKind: AgentJobKind,
+    featureId?: string | null,
   ): Promise<string | null> {
-    const resolved = await resolveModelConfigForJob(deps, project.id, project.organizationId, jobKind);
+    const resolved = await resolveModelConfigForJob(
+      modelConfigDeps(),
+      project.id,
+      project.organizationId,
+      jobKind,
+      featureId,
+    );
     if (resolved) {
       return null;
     }
-    return "No model configuration is set for this project or its organization. " +
-      "Set one in Organization settings, or configure this project directly on its settings page.";
+    const featureHint = featureId ? ", or configure this feature" : "";
+    return "No model configuration is set for this feature, project, or its organization. " +
+      `Set one in Organization settings, or configure this project${featureHint} directly on its settings page.`;
   }
 
   /**
@@ -1033,7 +1062,7 @@ export function createProjectsRouter(deps: {
         return;
       }
 
-      const modelConfigError = await assertModelConfigResolvable(project, "feature_build");
+      const modelConfigError = await assertModelConfigResolvable(project, "feature_build", feature.id);
       if (modelConfigError) {
         res.status(400).json({ error: modelConfigError });
         return;
@@ -1163,6 +1192,9 @@ export function createProjectsRouter(deps: {
       res.status(409).json({ error: accessError });
       return;
     }
+    // No feature id: a design session is project-scoped (ADR 014), even when
+    // it was started from one feature's Action Item — its job row carries no
+    // feature_id, and the feature tier therefore doesn't apply to it.
     const modelConfigError = await assertModelConfigResolvable(project, "design_grill");
     if (modelConfigError) {
       res.status(400).json({ error: modelConfigError });
@@ -1347,7 +1379,7 @@ export function createProjectsRouter(deps: {
         return;
       }
 
-      const modelConfigError = await assertModelConfigResolvable(project, "spec_grill");
+      const modelConfigError = await assertModelConfigResolvable(project, "spec_grill", featureId);
       if (modelConfigError) {
         res.status(400).json({ error: modelConfigError });
         return;
@@ -1418,7 +1450,7 @@ export function createProjectsRouter(deps: {
         return;
       }
 
-      const modelConfigError = await assertModelConfigResolvable(project, "spec_grill");
+      const modelConfigError = await assertModelConfigResolvable(project, "spec_grill", feature.id);
       if (modelConfigError) {
         res.status(400).json({ error: modelConfigError });
         return;
@@ -1491,7 +1523,7 @@ export function createProjectsRouter(deps: {
         return;
       }
 
-      const modelConfigError = await assertModelConfigResolvable(project, "feature_build");
+      const modelConfigError = await assertModelConfigResolvable(project, "feature_build", feature.id);
       if (modelConfigError) {
         res.status(400).json({ error: modelConfigError });
         return;
@@ -1735,7 +1767,7 @@ export function createProjectsRouter(deps: {
       res.status(409).json({ error: accessError });
       return;
     }
-    const modelConfigError = await assertModelConfigResolvable(project, "feature_build");
+    const modelConfigError = await assertModelConfigResolvable(project, "feature_build", featureId);
     if (modelConfigError) {
       res.status(400).json({ error: modelConfigError });
       return;
