@@ -1,5 +1,5 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
-import { Router, type Request } from "express";
+import { Router, type Request, type Response } from "express";
 import express from "express";
 import { config, isGitHubAppConfigured } from "../config.js";
 import type { FeatureActionItemRepository } from "../features/action-items-repository.js";
@@ -9,6 +9,9 @@ import type { JobRepository } from "../jobs/repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
 import { GithubInstallationRepository } from "./installation-repository.js";
 import { syncInstallationFromGitHub } from "./sync-installation.js";
+import { AUDIT_ACTIONS } from "../audit/actions.js";
+import type { AuditActionName } from "../audit/actions.js";
+import type { AuditRecorder } from "../audit/record.js";
 
 function verifyWebhookSignature(payload: string, signatureHeader: string | undefined): boolean {
   if (!signatureHeader?.startsWith("sha256=")) {
@@ -168,8 +171,38 @@ export function createGitHubWebhookRouter(deps: {
   jobs: JobRepository;
   features: FeatureRepository;
   actionItems: FeatureActionItemRepository;
+  audit: AuditRecorder;
 }): Router {
   const router = Router();
+
+  /**
+   * Records one installation-level audit event per organization that has a
+   * project on this installation (ADR 028). A GitHub App installation is
+   * deliberately decoupled from Organizations (ADR 016 item 3), so an
+   * installation has no org of its own — and audit_events.organization_id is
+   * NOT NULL. An installation with no linked project yet therefore produces
+   * no audit row; that gap is recorded in ADR 028 rather than papered over.
+   */
+  async function recordInstallationEvent(
+    res: Response,
+    installationId: string,
+    action: AuditActionName,
+    metadata: Record<string, unknown>,
+  ): Promise<void> {
+    const organizationIds = await deps.projects.listOrganizationIdsForInstallation(
+      installationId,
+    );
+    for (const organizationId of organizationIds) {
+      await deps.audit.record(res, {
+        organizationId,
+        actorKind: "webhook",
+        action,
+        targetType: "github_installation",
+        targetId: installationId,
+        metadata,
+      });
+    }
+  }
 
   router.post(
     "/github",
@@ -209,9 +242,21 @@ export function createGitHubWebhookRouter(deps: {
             const record = await deps.installations.findByGithubInstallationId(installationId);
             if (record) {
               await deps.installations.setProjectsAccessWarningForInstallation(record.id, true);
+              await recordInstallationEvent(res, record.id, AUDIT_ACTIONS.githubInstallationUpdated, {
+                action: data.action,
+                accountLogin: record.accountLogin,
+              });
             }
           } else if (data.action === "created" || data.action === "unsuspend") {
-            await syncInstallationFromGitHub(deps.installations, installationId, null);
+            const record = await syncInstallationFromGitHub(
+              deps.installations,
+              installationId,
+              null,
+            );
+            await recordInstallationEvent(res, record.id, AUDIT_ACTIONS.githubInstallationUpdated, {
+              action: data.action,
+              accountLogin: data.installation?.account?.login ?? null,
+            });
           }
         }
 
@@ -250,8 +295,16 @@ export function createGitHubWebhookRouter(deps: {
                 repo.full_name,
               );
             }
+            await recordInstallationEvent(res, record.id, AUDIT_ACTIONS.githubRepositoriesUpdated, {
+              action: data.action,
+              repositories: data.repositories_removed.map((repo) => repo.full_name),
+            });
           } else {
             await deps.installations.clearProjectAccessWarningsIfReposGranted(record.id);
+            await recordInstallationEvent(res, record.id, AUDIT_ACTIONS.githubRepositoriesUpdated, {
+              action: data.action,
+              repositories: (data.repositories_added ?? []).map((repo) => repo.full_name),
+            });
           }
         }
 

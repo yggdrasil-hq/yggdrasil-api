@@ -9,6 +9,9 @@ import { GithubTokenRepository } from "./token-repository.js";
 import { UserGithubAccessRepository } from "./user-github-access-repository.js";
 import { syncInstallationFromGitHub } from "./sync-installation.js";
 import { reconcileUserInstallations } from "./reconcile-user-installations.js";
+import type { ProjectRepository } from "../projects/repository.js";
+import { AUDIT_ACTIONS } from "../audit/actions.js";
+import type { AuditRecorder } from "../audit/record.js";
 
 const SYNC_STALE_MS = 60 * 60 * 1000; // 1 hour
 
@@ -19,6 +22,8 @@ export function createGitHubAppRouter(deps: {
   installStates: InstallStateRepository;
   githubTokens: GithubTokenRepository;
   userGithubAccess: UserGithubAccessRepository;
+  projects: ProjectRepository;
+  audit: AuditRecorder;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -224,6 +229,23 @@ export function createGitHubAppRouter(deps: {
           req.currentUser!.id,
         );
         const repos = await deps.installations.listRepositories(installation.id);
+        // A GitHub App installation is deliberately decoupled from
+        // Organizations (ADR 016 item 3), so an install-level action has no
+        // org of its own: it is recorded once per org that actually has a
+        // project on this installation, and not at all when it has none.
+        const organizationIds = await deps.projects.listOrganizationIdsForInstallation(
+          installation.id,
+        );
+        for (const organizationId of organizationIds) {
+          await deps.audit.record(res, {
+            organizationId,
+            actorUserId: req.currentUser!.id,
+            action: AUDIT_ACTIONS.githubReposSynced,
+            targetType: "github_installation",
+            targetId: installation.id,
+            metadata: { accountLogin: installation.accountLogin },
+          });
+        }
         res.json(
           repos.map((repo) => {
             const [owner, name] = repo.repoFullName.split("/");

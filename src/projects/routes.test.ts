@@ -208,6 +208,9 @@ function buildApp(opts: BuildAppOptions) {
   const testRunReports = {
     listByFeature: vi.fn(async () => []),
   };
+  const audit = {
+    record: vi.fn(async (_res: unknown, _input: { action: string }) => undefined),
+  };
   const tests = {
     create: vi.fn(async (input: {
       projectId: string;
@@ -247,10 +250,11 @@ function buildApp(opts: BuildAppOptions) {
       models: models as never,
       jobDefaults: jobDefaults as never,
       projectOverrides: projectOverrides as never,
+      audit: audit as never,
     }),
   );
 
-  return { app, secrets, orgSecrets, features, jobs, projects, actionItems, testRunReports, tests };
+  return { app, secrets, orgSecrets, features, jobs, projects, actionItems, testRunReports, tests, audit };
 }
 
 const SESSION_COOKIE = "yggdrasil_session=sess_1";
@@ -314,6 +318,52 @@ describe("model configuration gate (ADR 007)", () => {
         .send(createBody({ name: "New project" }));
 
       expect(res.status).toBe(201);
+    });
+
+    it("records project.created in the org's audit trail (ADR 028)", async () => {
+      const project = makeProject({ status: "initializing" });
+      const { app, audit } = buildApp({
+        project,
+        orgSecrets: { MODEL_BASE_URL: "u", MODEL_API_KEY: "k", MODEL_ID: "m" },
+        personalOrg: { id: "org_1", status: "ready" },
+      });
+
+      const res = await authedRequest(app)
+        .post("/projects")
+        .send(createBody({ name: "New project" }));
+
+      expect(res.status).toBe(201);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          organizationId: project.organizationId,
+          projectId: project.id,
+          actorUserId: OWNER_ID,
+          action: "project.created",
+          targetType: "project",
+          targetId: project.id,
+        }),
+      );
+    });
+
+    it("records a failed chart scaffold without failing project creation", async () => {
+      // No github installation record => scaffoldChart is skipped entirely,
+      // which is the failure branch this asserts on (a real scaffold failure
+      // is covered by chart-scaffold.test.ts).
+      const project = makeProject({ status: "initializing" });
+      const { app, audit } = buildApp({
+        project,
+        orgSecrets: { MODEL_BASE_URL: "u", MODEL_API_KEY: "k", MODEL_ID: "m" },
+        personalOrg: { id: "org_1", status: "ready" },
+      });
+
+      const res = await authedRequest(app).post("/projects").send(createBody());
+
+      expect(res.status).toBe(201);
+      const recorded = audit.record.mock.calls.map(
+        ([, input]) => (input as { action: string }).action,
+      );
+      expect(recorded).toContain("project.created");
     });
 
     it("succeeds and persists no project secrets when the org's config resolves", async () => {

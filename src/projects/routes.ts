@@ -44,6 +44,8 @@ import type { OrgModelRepository } from "../model-config/model-repository.js";
 import type { JobModelDefaultRepository } from "../model-config/job-default-repository.js";
 import type { ProjectModelOverrideRepository } from "../model-config/project-override-repository.js";
 import type { AgentJobKind } from "../model-config/types.js";
+import { AUDIT_ACTIONS } from "../audit/actions.js";
+import type { AuditRecorder } from "../audit/record.js";
 
 function parseBody<T>(schema: z.ZodType<T>, body: unknown):
   | { success: true; data: T }
@@ -170,6 +172,7 @@ export function createProjectsRouter(deps: {
   models: OrgModelRepository;
   jobDefaults: JobModelDefaultRepository;
   projectOverrides: ProjectModelOverrideRepository;
+  audit: AuditRecorder;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -395,6 +398,22 @@ export function createProjectsRouter(deps: {
       repositories: parsed.data.repositories,
     });
 
+    await deps.audit.record(res, {
+      organizationId: org.id,
+      projectId: project.id,
+      actorUserId: user.id,
+      action: AUDIT_ACTIONS.projectCreated,
+      targetType: "project",
+      targetId: project.id,
+      metadata: {
+        name: project.name,
+        slug: project.slug,
+        repositories: parsed.data.repositories.map(
+          (repo) => `${repo.githubOwner}/${repo.githubRepo}`,
+        ),
+      },
+    });
+
     if (requestedModelConfig) {
       for (const key of MODEL_CONFIG_KEYS) {
         await deps.secrets.upsert(project.id, key, requestedModelConfig[key]);
@@ -436,6 +455,14 @@ export function createProjectsRouter(deps: {
           title: `Couldn't scaffold Helm chart for ${project.name}`,
           body: "Deploys will use a placeholder chart until this is resolved.",
           linkPath: `/projects/${project.id}`,
+        });
+        await deps.audit.record(res, {
+          organizationId: org.id,
+          projectId: project.id,
+          actorUserId: user.id,
+          action: AUDIT_ACTIONS.projectChartScaffoldFailed,
+          targetType: "project",
+          targetId: project.id,
         });
       }
     }
@@ -518,6 +545,18 @@ export function createProjectsRouter(deps: {
       return;
     }
 
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.projectRepositoryLinked,
+      targetType: "project",
+      targetId: project.id,
+      metadata: {
+        repository: `${parsed.data.githubOwner}/${parsed.data.githubRepo}`,
+      },
+    });
+
     res.status(201).json(await toPublicProjectWithRemovalMeta(updated));
   });
 
@@ -560,6 +599,16 @@ export function createProjectsRouter(deps: {
       return;
     }
 
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.projectRepositoryUnlinked,
+      targetType: "project",
+      targetId: project.id,
+      metadata: { repositoryId },
+    });
+
     res.json(await toPublicProjectWithRemovalMeta(updated));
   });
 
@@ -593,6 +642,16 @@ export function createProjectsRouter(deps: {
       res.status(404).json({ error: "Project not found" });
       return;
     }
+
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.projectMarkedReady,
+      targetType: "project",
+      targetId: project.id,
+      metadata: { name: project.name },
+    });
 
     res.json(await toPublicProjectWithRemovalMeta(updated));
   });
@@ -683,6 +742,16 @@ export function createProjectsRouter(deps: {
       parsed.data.agenticReviewEnabled,
     );
 
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.projectUpdated,
+      targetType: "project",
+      targetId: project.id,
+      metadata: { agenticReviewEnabled: parsed.data.agenticReviewEnabled },
+    });
+
     const updated = await deps.projects.findByIdForUser(project.id, req.currentUser!.id);
     if (!updated) {
       res.status(404).json({ error: "Project not found" });
@@ -719,6 +788,16 @@ export function createProjectsRouter(deps: {
     }
 
     await deps.projects.delete(project.id);
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      // The project row is gone (project_id is ON DELETE SET NULL), so this
+      // event keeps the name in metadata as the only remaining record of
+      // what was deleted.
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.projectDeleted,
+      targetType: "project",
+      metadata: { name: project.name, slug: project.slug },
+    });
     res.status(204).send();
   });
 
@@ -809,6 +888,16 @@ export function createProjectsRouter(deps: {
       kind: "feature_created",
       title: `Spec grill started: ${feature.title}`,
       linkPath: `/projects/${project.id}/features/${feature.id}`,
+    });
+
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: user.id,
+      action: AUDIT_ACTIONS.featureCreated,
+      targetType: "feature",
+      targetId: feature.id,
+      metadata: { title: feature.title, featureType: feature.featureType },
     });
 
     res.status(201).json(toPublicFeature(feature));
@@ -911,6 +1000,15 @@ export function createProjectsRouter(deps: {
         body: "Start build when ready.",
         linkPath: `/projects/${project.id}/features/${feature.id}`,
       });
+      await deps.audit.record(res, {
+        organizationId: project.organizationId,
+        projectId: project.id,
+        actorUserId: user.id,
+        action: AUDIT_ACTIONS.featureAdrApproved,
+        targetType: "feature",
+        targetId: feature.id,
+        metadata: { title: feature.title },
+      });
     }
 
     if (parsed.data.startBuild) {
@@ -961,6 +1059,15 @@ export function createProjectsRouter(deps: {
         kind: "build_started",
         title: `Build started: ${feature.title}`,
         linkPath: `/projects/${project.id}/features/${feature.id}`,
+      });
+      await deps.audit.record(res, {
+        organizationId: project.organizationId,
+        projectId: project.id,
+        actorUserId: user.id,
+        action: AUDIT_ACTIONS.featureBuildStarted,
+        targetType: "feature",
+        targetId: feature.id,
+        metadata: { title: feature.title },
       });
     }
 
@@ -1208,6 +1315,16 @@ export function createProjectsRouter(deps: {
 
     await deps.jobs.cancelActiveForFeature(featureId);
 
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.featureCancelled,
+      targetType: "feature",
+      targetId: featureId,
+      metadata: { title: cancelled.title },
+    });
+
     res.status(200).json(toPublicFeature(cancelled));
   });
 
@@ -1246,6 +1363,16 @@ export function createProjectsRouter(deps: {
         projectId: project.id,
         kind: "spec_grill",
         featureId: restarted.id,
+      });
+
+      await deps.audit.record(res, {
+        organizationId: project.organizationId,
+        projectId: project.id,
+        actorUserId: req.currentUser!.id,
+        action: AUDIT_ACTIONS.featureRestarted,
+        targetType: "feature",
+        targetId: restarted.id,
+        metadata: { title: restarted.title },
       });
 
       res.status(201).json(toPublicFeature(restarted));
@@ -1302,6 +1429,16 @@ export function createProjectsRouter(deps: {
         projectId: project.id,
         kind: "spec_grill",
         featureId: feature.id,
+      });
+
+      await deps.audit.record(res, {
+        organizationId: project.organizationId,
+        projectId: project.id,
+        actorUserId: req.currentUser!.id,
+        action: AUDIT_ACTIONS.featureGrillRetried,
+        targetType: "feature",
+        targetId: feature.id,
+        metadata: { title: feature.title },
       });
 
       res.status(201).json({});
@@ -1370,6 +1507,16 @@ export function createProjectsRouter(deps: {
         projectId: project.id,
         kind: "feature_build",
         featureId: updated.id,
+      });
+
+      await deps.audit.record(res, {
+        organizationId: project.organizationId,
+        projectId: project.id,
+        actorUserId: req.currentUser!.id,
+        action: AUDIT_ACTIONS.featureBuildRetried,
+        targetType: "feature",
+        targetId: updated.id,
+        metadata: { title: updated.title },
       });
 
       res.status(201).json({});
@@ -1604,6 +1751,16 @@ export function createProjectsRouter(deps: {
       projectId: project.id,
       kind: "feature_build",
       featureId: updated.id,
+    });
+
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.featureResumed,
+      targetType: "feature",
+      targetId: updated.id,
+      metadata: { title: updated.title, returnReason: updated.returnReason },
     });
     res.status(201).json(toPublicFeature(updated));
   });

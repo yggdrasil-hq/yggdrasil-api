@@ -12,6 +12,8 @@ import type { JobModelDefaultRepository } from "./job-default-repository.js";
 import { AGENT_JOB_KINDS, DEFAULT_PROVIDER_BASE_URLS, PROVIDER_TYPES } from "./types.js";
 import type { AgentJobKind, ProviderType } from "./types.js";
 import { testProviderConnection } from "./connection-test.js";
+import { AUDIT_ACTIONS } from "../audit/actions.js";
+import type { AuditRecorder } from "../audit/record.js";
 
 const jobKindSchema = z.enum(AGENT_JOB_KINDS);
 
@@ -67,6 +69,7 @@ export function createModelConfigRouter(deps: {
   providers: OrgProviderRepository;
   models: OrgModelRepository;
   jobDefaults: JobModelDefaultRepository;
+  audit: AuditRecorder;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -127,6 +130,15 @@ export function createModelConfigRouter(deps: {
       baseUrl,
       apiKey: parsed.data.apiKey,
     });
+    // Provider name/type only — the API key is a credential (ADR 028 item 5).
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.modelProviderCreated,
+      targetType: "model_provider",
+      targetId: provider.id,
+      metadata: { name: provider.name, providerType: provider.providerType },
+    });
     res.status(201).json(provider);
   });
 
@@ -156,6 +168,14 @@ export function createModelConfigRouter(deps: {
       res.status(404).json({ error: "Provider not found" });
       return;
     }
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.modelProviderUpdated,
+      targetType: "model_provider",
+      targetId: provider.id,
+      metadata: { name: provider.name },
+    });
     res.json(provider);
   });
 
@@ -240,6 +260,15 @@ export function createModelConfigRouter(deps: {
     }
     try {
       const deleted = await deps.providers.delete(orgId, providerId);
+      if (deleted) {
+        await deps.audit.record(res, {
+          organizationId: orgId,
+          actorUserId: req.currentUser!.id,
+          action: AUDIT_ACTIONS.modelProviderDeleted,
+          targetType: "model_provider",
+          targetId: providerId,
+        });
+      }
       res.status(deleted ? 204 : 404).send();
     } catch {
       res.status(409).json({ error: "Provider has models in its catalog — remove those first" });
@@ -290,6 +319,14 @@ export function createModelConfigRouter(deps: {
       displayName: parsed.data.displayName,
       modelId: parsed.data.modelId,
     });
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.modelCreated,
+      targetType: "model",
+      targetId: model.id,
+      metadata: { displayName: model.displayName, modelId: model.modelId },
+    });
     res.status(201).json(model);
   });
 
@@ -322,6 +359,14 @@ export function createModelConfigRouter(deps: {
       res.status(404).json({ error: "Model not found" });
       return;
     }
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.modelUpdated,
+      targetType: "model",
+      targetId: model.id,
+      metadata: { displayName: model.displayName },
+    });
     res.json(model);
   });
 
@@ -343,6 +388,15 @@ export function createModelConfigRouter(deps: {
     }
     try {
       const deleted = await deps.models.delete(orgId, modelId);
+      if (deleted) {
+        await deps.audit.record(res, {
+          organizationId: orgId,
+          actorUserId: req.currentUser!.id,
+          action: AUDIT_ACTIONS.modelDeleted,
+          targetType: "model",
+          targetId: modelId,
+        });
+      }
       res.status(deleted ? 204 : 404).send();
     } catch {
       res.status(409).json({
@@ -399,6 +453,14 @@ export function createModelConfigRouter(deps: {
       jobKindParsed.data as AgentJobKind,
       parsed.data.modelId,
     );
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.jobModelDefaultSet,
+      targetType: "job_model_default",
+      targetId: model.id,
+      metadata: { jobKind: jobKindParsed.data, displayName: model.displayName },
+    });
     res.status(200).json(jobDefault);
   });
 
@@ -419,6 +481,15 @@ export function createModelConfigRouter(deps: {
       return;
     }
     const cleared = await deps.jobDefaults.clear(orgId, jobKindParsed.data as AgentJobKind);
+    if (cleared) {
+      await deps.audit.record(res, {
+        organizationId: orgId,
+        actorUserId: req.currentUser!.id,
+        action: AUDIT_ACTIONS.jobModelDefaultCleared,
+        targetType: "job_model_default",
+        metadata: { jobKind: jobKindParsed.data },
+      });
+    }
     res.status(cleared ? 204 : 404).send();
   });
 

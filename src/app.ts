@@ -3,6 +3,10 @@ import cors from "cors";
 import express, { type Express } from "express";
 import type pg from "pg";
 import { config } from "./config.js";
+import { AuditEventRepository } from "./audit/repository.js";
+import { PostgresAuditRecorder } from "./audit/record.js";
+import { auditContextMiddleware } from "./audit/request-context.js";
+import { createAuditRouter } from "./audit/routes.js";
 import { createAuthRouter, createSettingsRouter } from "./auth/routes.js";
 import { SessionService } from "./auth/sessions.js";
 import { FeatureRepository } from "./features/repository.js";
@@ -56,6 +60,10 @@ export function createApp(deps?: AppDependencies): Express {
   // reject Access-Control-Allow-Origin: "*" alongside credentialed requests.
   app.use(cors({ origin: config.corsOrigin, credentials: true }));
   app.use(cookieParser());
+  // ADR 028: captures ip/user-agent for the audit trail before any router
+  // runs. App-wide (not per-router) because both authenticated routes and
+  // the GitHub webhook router record events.
+  app.use(auditContextMiddleware);
 
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", service: "yggdrasil-api" });
@@ -71,6 +79,8 @@ export function createApp(deps?: AppDependencies): Express {
   const jobs = new JobRepository(deps.pool);
   const features = new FeatureRepository(deps.pool);
   const featureActionItems = new FeatureActionItemRepository(deps.pool);
+  const auditEvents = new AuditEventRepository(deps.pool);
+  const audit = new PostgresAuditRecorder(auditEvents);
   app.use(
     "/webhooks",
     createGitHubWebhookRouter({
@@ -79,6 +89,7 @@ export function createApp(deps?: AppDependencies): Express {
       jobs,
       features,
       actionItems: featureActionItems,
+      audit,
     }),
   );
 
@@ -112,7 +123,11 @@ export function createApp(deps?: AppDependencies): Express {
   app.use("/settings", createSettingsRouter({ users, sessions }));
   app.use(
     "/organizations",
-    createOrganizationsRouter({ users, sessions, organizations, clusters: orgClusters, orgSecrets }),
+    createOrganizationsRouter({ users, sessions, organizations, clusters: orgClusters, orgSecrets, audit }),
+  );
+  app.use(
+    "/organizations",
+    createAuditRouter({ users, sessions, organizations, audit: auditEvents }),
   );
   app.use(
     "/organizations",
@@ -123,6 +138,7 @@ export function createApp(deps?: AppDependencies): Express {
       providers: modelProviders,
       models: orgModels,
       jobDefaults: jobModelDefaults,
+      audit,
     }),
   );
   app.use(
@@ -134,6 +150,8 @@ export function createApp(deps?: AppDependencies): Express {
       installStates,
       githubTokens,
       userGithubAccess,
+      projects,
+      audit,
     }),
   );
   app.use(
@@ -158,6 +176,7 @@ export function createApp(deps?: AppDependencies): Express {
       models: orgModels,
       jobDefaults: jobModelDefaults,
       projectOverrides: projectModelOverrides,
+      audit,
     }),
   );
   app.use(
@@ -166,7 +185,7 @@ export function createApp(deps?: AppDependencies): Express {
   );
   app.use(
     "/projects",
-    createSecretsRouter({ users, sessions, projects, secrets, orgSecrets }),
+    createSecretsRouter({ users, sessions, projects, secrets, orgSecrets, audit }),
   );
   app.use(
     "/projects",
@@ -176,6 +195,7 @@ export function createApp(deps?: AppDependencies): Express {
       projects,
       models: orgModels,
       projectOverrides: projectModelOverrides,
+      audit,
     }),
   );
   app.use(

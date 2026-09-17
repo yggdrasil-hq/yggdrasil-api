@@ -178,6 +178,23 @@ export class ProjectRepository {
     return projects;
   }
 
+  /**
+   * The organizations with at least one project linked to this GitHub App
+   * installation (ADR 005). Used by the audit trail (ADR 028) to scope
+   * installation-level events — which have no organization of their own,
+   * since ADR 016 item 3 deliberately decouples installs from orgs — to the
+   * orgs the change actually affects.
+   */
+  async listOrganizationIdsForInstallation(installationId: string): Promise<string[]> {
+    const result = await this.db.query<{ organization_id: string }>(
+      `SELECT DISTINCT organization_id
+       FROM projects
+       WHERE installation_id = $1`,
+      [installationId],
+    );
+    return result.rows.map((row) => row.organization_id);
+  }
+
   async create(input: {
     organizationId: string;
     ownerUserId: string;

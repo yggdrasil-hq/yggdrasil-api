@@ -10,6 +10,8 @@ import type { OrgModelRepository } from "./model-repository.js";
 import type { ProjectModelOverrideRepository } from "./project-override-repository.js";
 import { AGENT_JOB_KINDS } from "./types.js";
 import type { AgentJobKind } from "./types.js";
+import { AUDIT_ACTIONS } from "../audit/actions.js";
+import type { AuditRecorder } from "../audit/record.js";
 
 const jobKindSchema = z.enum(AGENT_JOB_KINDS);
 
@@ -28,6 +30,7 @@ export function createProjectModelOverridesRouter(deps: {
   projects: ProjectRepository;
   models: OrgModelRepository;
   projectOverrides: ProjectModelOverrideRepository;
+  audit: AuditRecorder;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -75,6 +78,15 @@ export function createProjectModelOverridesRouter(deps: {
       jobKindParsed.data as AgentJobKind,
       parsed.data.modelId,
     );
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.projectModelOverrideSet,
+      targetType: "project_model_override",
+      targetId: model.id,
+      metadata: { jobKind: jobKindParsed.data, displayName: model.displayName },
+    });
     res.status(200).json(override);
   });
 
@@ -90,6 +102,16 @@ export function createProjectModelOverridesRouter(deps: {
       return;
     }
     const cleared = await deps.projectOverrides.clear(project.id, jobKindParsed.data as AgentJobKind);
+    if (cleared) {
+      await deps.audit.record(res, {
+        organizationId: project.organizationId,
+        projectId: project.id,
+        actorUserId: req.currentUser!.id,
+        action: AUDIT_ACTIONS.projectModelOverrideCleared,
+        targetType: "project_model_override",
+        metadata: { jobKind: jobKindParsed.data },
+      });
+    }
     res.status(cleared ? 204 : 404).send();
   });
 

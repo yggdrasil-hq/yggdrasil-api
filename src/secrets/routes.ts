@@ -9,6 +9,8 @@ import { isUuid } from "../shared/uuid.js";
 import { MODEL_CONFIG_KEYS, extractModelConfigBundle } from "./model-config.js";
 import type { SecretRepository } from "./repository.js";
 import type { OrgSecretRepository } from "../organizations/org-secrets-repository.js";
+import { AUDIT_ACTIONS } from "../audit/actions.js";
+import type { AuditRecorder } from "../audit/record.js";
 
 const upsertSecretSchema = z.object({
   key: z.string().trim().min(1).max(128),
@@ -21,6 +23,7 @@ export function createSecretsRouter(deps: {
   projects: ProjectRepository;
   secrets: SecretRepository;
   orgSecrets: OrgSecretRepository;
+  audit: AuditRecorder;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -67,6 +70,18 @@ export function createSecretsRouter(deps: {
       }
     }
 
+    // The key name only: the trail is readable by every org admin and kept
+    // forever, so secret values never go into metadata (ADR 028 item 5).
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.projectSecretUpdated,
+      targetType: "project_secret",
+      targetId: secret.id,
+      metadata: { key: parsed.data.key },
+    });
+
     res.status(200).json(secret);
   });
 
@@ -88,6 +103,15 @@ export function createSecretsRouter(deps: {
       res.status(404).json({ error: "Secret not found" });
       return;
     }
+
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.projectSecretDeleted,
+      targetType: "project_secret",
+      targetId: secretId,
+    });
 
     res.status(204).send();
   });

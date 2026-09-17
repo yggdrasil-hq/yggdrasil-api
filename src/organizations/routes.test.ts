@@ -91,6 +91,10 @@ function buildApp(overrides: {
     decryptAllForOrganization: vi.fn(async () => ({})),
   };
 
+  const audit = {
+    record: vi.fn(async (_res: unknown, _input: Record<string, unknown>) => undefined),
+  };
+
   app.use(
     "/organizations",
     createOrganizationsRouter({
@@ -99,10 +103,11 @@ function buildApp(overrides: {
       organizations: organizations as never,
       clusters: clusters as never,
       orgSecrets: orgSecrets as never,
+      audit: audit as never,
     }),
   );
 
-  return { app, organizations, clusters, orgSecrets };
+  return { app, organizations, clusters, orgSecrets, audit };
 }
 
 const SESSION_COOKIE = "yggdrasil_session=sess_1";
@@ -306,6 +311,64 @@ describe("organizations router (ADR 016 track A1)", () => {
         .send({ key: "K", value: "v" });
       expect(res.status).toBe(403);
       expect(orgSecrets.upsert).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("audit trail (ADR 028)", () => {
+    it("records org.created with the creator as actor, scoped to the new org", async () => {
+      const { app, audit } = buildApp({ role: "admin" });
+      const res = await authedRequest(app)
+        .post("/organizations")
+        .send({ name: "Acme Retail" });
+      expect(res.status).toBe(201);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          organizationId: ORG_ID,
+          actorUserId: USER_ID,
+          action: "org.created",
+        }),
+      );
+    });
+
+    it("records org.role_changed against the target user, not the actor", async () => {
+      const { app, audit } = buildApp({ role: "admin" });
+      const res = await authedRequest(app)
+        .patch(`/organizations/${ORG_ID}/members/${OTHER_USER_ID}`)
+        .send({ role: "tester" });
+      expect(res.status).toBe(200);
+      expect(audit.record).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          organizationId: ORG_ID,
+          actorUserId: USER_ID,
+          action: "org.role_changed",
+          targetId: OTHER_USER_ID,
+          metadata: { role: "tester" },
+        }),
+      );
+    });
+
+    it("records only the key name, never the value", async () => {
+      const { app, audit } = buildApp({ role: "admin" });
+      await authedRequest(app)
+        .put(`/organizations/${ORG_ID}/secrets`)
+        .send({ key: "DATABASE_URL", value: "postgres://leaked-value" });
+      const [, input] = audit.record.mock.calls.at(-1) as [
+        unknown,
+        { metadata: Record<string, unknown> },
+      ];
+      expect(input.metadata).toEqual({ key: "DATABASE_URL" });
+      expect(JSON.stringify(input.metadata)).not.toContain("leaked-value");
+    });
+
+    it("records nothing when the mutation is rejected", async () => {
+      const { app, audit } = buildApp({ role: "developer" });
+      const res = await authedRequest(app)
+        .post(`/organizations/${ORG_ID}/invites`)
+        .send({ role: "tester" });
+      expect(res.status).toBe(403);
+      expect(audit.record).not.toHaveBeenCalled();
     });
   });
 });

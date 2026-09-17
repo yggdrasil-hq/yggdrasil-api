@@ -11,6 +11,8 @@ import type { OrgSecretRepository } from "./org-secrets-repository.js";
 import { ORG_ROLES, ROLE_DISPLAY_NAMES, toPublicOrganization } from "./types.js";
 import type { OrgRole } from "./types.js";
 import { testClusterConnection } from "./cluster-connection-test.js";
+import { AUDIT_ACTIONS } from "../audit/actions.js";
+import type { AuditRecorder } from "../audit/record.js";
 
 const roleSchema = z.enum(ORG_ROLES);
 
@@ -38,6 +40,7 @@ export function createOrganizationsRouter(deps: {
   organizations: OrganizationRepository;
   clusters: OrganizationClusterRepository;
   orgSecrets: OrgSecretRepository;
+  audit: AuditRecorder;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -89,6 +92,14 @@ export function createOrganizationsRouter(deps: {
       isPersonal: false,
       creatorUserId: req.currentUser!.id,
     });
+    await deps.audit.record(res, {
+      organizationId: org.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.orgCreated,
+      targetType: "organization",
+      targetId: org.id,
+      metadata: { name: org.name, slug: org.slug },
+    });
     res.status(201).json(toPublicOrganization(org, "admin"));
   });
 
@@ -134,6 +145,14 @@ export function createOrganizationsRouter(deps: {
       res.status(404).json({ error: "Organization not found" });
       return;
     }
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.orgUpdated,
+      targetType: "organization",
+      targetId: orgId,
+      metadata: { name: org.name },
+    });
     res.json(toPublicOrganization(org, role));
   });
 
@@ -190,6 +209,14 @@ export function createOrganizationsRouter(deps: {
       res.status(404).json({ error: "Member not found" });
       return;
     }
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.orgRoleChanged,
+      targetType: "member",
+      targetId: targetUserId,
+      metadata: { role: parsed.data.role },
+    });
     res.status(200).send();
   });
 
@@ -230,6 +257,13 @@ export function createOrganizationsRouter(deps: {
       res.status(404).json({ error: "Member not found" });
       return;
     }
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.orgMemberRemoved,
+      targetType: "member",
+      targetId: targetUserId,
+    });
     res.status(204).send();
   });
 
@@ -271,6 +305,15 @@ export function createOrganizationsRouter(deps: {
       role: parsed.data.role,
       createdByUserId: req.currentUser!.id,
     });
+    // The invite token is the whole credential — it must not reach the trail.
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.orgInviteCreated,
+      targetType: "invite",
+      targetId: invite.id,
+      metadata: { role: parsed.data.role },
+    });
     res.status(201).json(invite);
   });
 
@@ -292,6 +335,13 @@ export function createOrganizationsRouter(deps: {
       res.status(404).json({ error: "Invite not found" });
       return;
     }
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.orgInviteRevoked,
+      targetType: "invite",
+      targetId: isUuid(inviteId) ? inviteId : null,
+    });
     res.status(204).send();
   });
 
@@ -315,6 +365,16 @@ export function createOrganizationsRouter(deps: {
     if (!org) {
       res.status(404).json({ error: "Organization not found" });
       return;
+    }
+    if (!existing) {
+      await deps.audit.record(res, {
+        organizationId: invite.organizationId,
+        actorUserId: req.currentUser!.id,
+        action: AUDIT_ACTIONS.orgMemberJoined,
+        targetType: "member",
+        targetId: req.currentUser!.id,
+        metadata: { role, via: "invite_link" },
+      });
     }
     res.status(existing ? 200 : 201).json({ organization: toPublicOrganization(org, role) });
   });
@@ -363,6 +423,14 @@ export function createOrganizationsRouter(deps: {
 
     const cluster = await deps.clusters.upsert(orgId, parsed.data.kubeconfig);
     await deps.organizations.setStatus(orgId, "ready");
+    // Kubeconfig contents never reach the trail — only that a cluster was set.
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.orgClusterSet,
+      targetType: "organization_cluster",
+      targetId: cluster.id,
+    });
     res.status(200).json({ cluster });
   });
 
@@ -413,6 +481,12 @@ export function createOrganizationsRouter(deps: {
     const deleted = await deps.clusters.delete(orgId);
     if (deleted) {
       await deps.organizations.setStatus(orgId, "pending_cluster");
+      await deps.audit.record(res, {
+        organizationId: orgId,
+        actorUserId: req.currentUser!.id,
+        action: AUDIT_ACTIONS.orgClusterRemoved,
+        targetType: "organization_cluster",
+      });
     }
     res.status(deleted ? 204 : 404).send();
   });
@@ -458,6 +532,15 @@ export function createOrganizationsRouter(deps: {
       return;
     }
     const secret = await deps.orgSecrets.upsert(orgId, parsed.data.key, parsed.data.value);
+    // Key name only — every org admin can read this trail (ADR 028 item 5).
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.orgSecretSet,
+      targetType: "organization_secret",
+      targetId: secret.id,
+      metadata: { key: parsed.data.key },
+    });
     res.status(200).json(secret);
   });
 
@@ -482,6 +565,13 @@ export function createOrganizationsRouter(deps: {
       res.status(404).json({ error: "Secret not found" });
       return;
     }
+    await deps.audit.record(res, {
+      organizationId: orgId,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.orgSecretDeleted,
+      targetType: "organization_secret",
+      targetId: secretId,
+    });
     res.status(204).send();
   });
 
