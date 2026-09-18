@@ -1,3 +1,8 @@
+// Issue #45: side-effect import, and it must come first: it patches Express's
+// route registration so a rejected promise in an async handler reaches the error
+// middleware below instead of hanging the request. Before any router module,
+// because the patch has to be in place before a Router is constructed.
+import "./shared/async-handlers.js";
 import cookieParser from "cookie-parser";
 import cors from "cors";
 import express, { type Express } from "express";
