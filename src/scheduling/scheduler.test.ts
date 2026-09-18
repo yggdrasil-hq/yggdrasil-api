@@ -76,6 +76,7 @@ function candidate(overrides: Partial<DueCandidate> = {}): DueCandidate {
     createdAt: new Date(Date.UTC(2026, 8, 1)),
     projectModelConfigWarning: false,
     projectGithubAccessWarning: false,
+    scheduleTimeZone: null,
     ...overrides,
   };
 }

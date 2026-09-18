@@ -7,12 +7,19 @@
  * computed here and unit-tested exhaustively in `cron.test.ts`, rather than
  * being entangled with the claim/dispatch transaction in `scheduler.ts`.
  *
- * **Every schedule is evaluated in UTC.** There is no per-project timezone
- * concept anywhere in the product, so inventing one here would mean guessing;
- * UTC is also the one choice that makes DST structurally impossible rather
- * than merely unlikely (a UTC day is always 86,400 seconds). The documented
- * consequence is that `TEST_SCHEDULE_PRESETS.daily9am` means 09:00 **UTC**, and
- * a per-project timezone is a follow-up, not an oversight.
+ * **Schedules are evaluated in UTC unless a project names a zone** (issue #31).
+ * `previousOccurrence` below stays UTC-only and pure — it is the fallback, and
+ * its tests are the ones the zone-aware path defers to for `"UTC"` — while
+ * `previousOccurrenceInTimeZone` walks *local calendar days* for a project that
+ * has set one. The documented consequence for every project that has not is
+ * unchanged: `TEST_SCHEDULE_PRESETS.daily9am` means 09:00 **UTC**.
+ *
+ * **Why a named zone rather than a stored offset.** An offset is the trap ADR 026
+ * named: `+05:30` applied year-round reproduces the drift the issue complains
+ * about, because "every night at 2am" moves when the zone's own offset changes.
+ * A zone name lets each occurrence be resolved in that zone, so 2am stays 2am
+ * through both transitions. See `timezone.ts` for the resolution and its DST
+ * answers.
  *
  * Supported syntax is the classic 5-field Vixie subset the product actually
  * accepts (`isValidCronExpression` in `tests/types.ts` only checks that there
@@ -21,6 +28,13 @@
  * those elements. Numeric only — no `jan`/`mon` names, no `@daily` aliases, no
  * seconds field.
  */
+
+import {
+  addWallClockDays,
+  calendarDateIn,
+  resolveWallTime,
+  timeZoneOrUtc,
+} from "./timezone.js";
 
 const MINUTE_MS = 60_000;
 const HOUR_MS = 60 * MINUTE_MS;
@@ -216,6 +230,83 @@ export function previousOccurrence(
 }
 
 /**
+ * The most recent instant **at or before** `at` that `expression` matches,
+ * evaluated in `timeZone`, or null when there is none within
+ * `MAX_LOOKBACK_DAYS`.
+ *
+ * **`"UTC"` delegates to `previousOccurrence` above**, deliberately: UTC is the
+ * pre-#31 behaviour for every project that has not set a zone, and routing it
+ * through the (slower) local-day walk would mean the common path no longer
+ * exercises the code its exhaustive tests cover. One implementation per frame of
+ * reference, and the UTC one is the one with the tests.
+ *
+ * **The walk is over local calendar days, not 24-hour steps.** A local day is 23
+ * or 25 hours across a transition, so stepping by `DAY_MS` from a fixed origin
+ * would drift by an hour on one side of it — the assumption the UTC-only version
+ * is entitled to make and this one is not.
+ *
+ * **Matching happens on the local calendar date**, so "the second Tuesday at
+ * 09:00" means that locally. `dayMatches` is reused by handing it a date built
+ * through `Date.UTC` from the local date parts: a UTC-constructed date has no DST
+ * hook, so its `getUTCDay()` is that calendar date's true weekday regardless of
+ * the zone.
+ *
+ * **A wall time that does not exist is skipped**, per ADR 026: a daily suite
+ * misses one run on the forward-transition day and self-heals at the next
+ * occurrence, rather than the run being silently moved to a time nobody asked
+ * for. An ambiguous (fall-back) wall time takes the earlier instant.
+ */
+export function previousOccurrenceInTimeZone(
+  expression: string,
+  at: Date,
+  timeZone: string,
+  maxLookbackDays: number = MAX_LOOKBACK_DAYS,
+): Date | null {
+  const fields = parseCron(expression);
+  if (!fields) return null;
+
+  const atMs = at.getTime();
+  if (Number.isNaN(atMs)) return null;
+
+  const zone = timeZoneOrUtc(timeZone);
+  if (zone === "UTC") return previousOccurrence(expression, at, maxLookbackDays);
+
+  const startDate = calendarDateIn(at, zone);
+
+  for (let offset = 0; offset <= maxLookbackDays; offset += 1) {
+    const date = addWallClockDays({ ...startDate, hour: 0, minute: 0 }, -offset);
+
+    if (!fields.months.has(date.month)) continue;
+    if (!dayMatches(fields, utcDateForCalendar(date))) continue;
+
+    // Latest candidate first, so an earlier day returns on its first resolution.
+    // "Today" is the only day that can scan the whole grid, because only there is
+    // `atMs` an upper bound; on any earlier day the first candidate is the answer.
+    for (const hour of fields.hoursDesc) {
+      for (const minute of fields.minutesDesc) {
+        const resolved = resolveWallTime({ ...date, hour, minute }, zone);
+
+        // Spring forward: this wall time does not happen today. Skipping the
+        // candidate is ADR 026's answer, and it must not abort the day — a
+        // different hour on the same day may well be valid.
+        if (resolved.kind === "nonexistent") continue;
+
+        const instantMs = resolved.instant.getTime();
+        if (instantMs > atMs) continue;
+        return resolved.instant;
+      }
+    }
+  }
+
+  return null;
+}
+
+/** A `Date` whose UTC parts are the given calendar date, for the weekday check. */
+function utcDateForCalendar(date: { year: number; month: number; day: number }): Date {
+  return new Date(Date.UTC(date.year, date.month - 1, date.day));
+}
+
+/**
  * The shortest gap between two consecutive occurrences of `expression` at or
  * before `at`, in milliseconds, or null when there is not enough of a
  * schedule inside `MAX_LOOKBACK_DAYS` to measure one.
@@ -275,14 +366,33 @@ export function minimumIntervalMs(
  * **once**, not once per window missed. A test suite is a verification action,
  * not an event log — replaying six missed hours six times would burn compute
  * and say nothing the single run does not.
+ *
+ * The comparison is between two **instants**, so it is unaffected by the zone:
+ * `previousOccurrenceInTimeZone` answers "when, in absolute time", and the
+ * reference is an absolute time. Which zone the schedule was written in changes
+ * *which* instant is found, never how they compare.
  */
 export function isDueForSchedule(input: {
   expression: string;
   lastRunAt: Date | null;
   createdAt: Date;
   now: Date;
+  /**
+   * Issue #31: the project's own zone, as a stored IANA name. Optional and
+   * defaulting to UTC, so every existing caller — and every project that has not
+   * set one — behaves exactly as before.
+   *
+   * An unusable value resolves to UTC rather than throwing: a bad setting must
+   * degrade one project to the old behaviour, not stop the scheduler from
+   * evaluating every other project's tests (`timeZoneOrUtc`).
+   */
+  timeZone?: string | null;
 }): boolean {
-  const previous = previousOccurrence(input.expression, input.now);
+  const previous = previousOccurrenceInTimeZone(
+    input.expression,
+    input.now,
+    input.timeZone ?? "UTC",
+  );
   if (!previous) return false;
   const reference = input.lastRunAt ?? input.createdAt;
   return previous.getTime() > reference.getTime();

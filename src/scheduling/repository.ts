@@ -28,6 +28,15 @@ export interface DueCandidate {
    */
   projectModelConfigWarning: boolean;
   projectGithubAccessWarning: boolean;
+  /**
+   * Issue #31 part 1: the zone this project's schedule is interpreted in, as a
+   * stored IANA name, or `null` when the project has not set one.
+   *
+   * Passed straight through to `isDueForSchedule`, which resolves an unusable
+   * value to UTC rather than throwing — a bad setting must degrade one project,
+   * not abort the tick for every project.
+   */
+  scheduleTimeZone: string | null;
 }
 
 interface CandidateRow {
@@ -38,6 +47,7 @@ interface CandidateRow {
   created_at: Date;
   model_config_warning: boolean;
   github_access_warning: boolean;
+  schedule_time_zone: string | null;
 }
 
 export class TestScheduleRepository {
@@ -53,6 +63,11 @@ export class TestScheduleRepository {
    * it costs a few wasted comparisons, whereas narrowing it would silently
    * skip a run.
    *
+   * The project's `settings->>'timezone'` comes along because the due-check needs
+   * it and this already joins `projects`; reading it here rather than in a second
+   * query per candidate keeps the tick's query count bounded by the candidate
+   * set rather than doubling it (issue #31).
+   *
    * `FOR UPDATE OF t SKIP LOCKED` is what makes several API replicas safe, by
    * the same precedent as the job queue (ADR 003 §18): the locks are held for
    * the caller's transaction, so a second replica ticking concurrently skips
@@ -63,7 +78,8 @@ export class TestScheduleRepository {
   async listCandidates(now: Date, limit: number): Promise<DueCandidate[]> {
     const result = await this.db.query<CandidateRow>(
       `SELECT t.id, t.project_id, t.schedule_cron, t.last_run_at, t.created_at,
-              p.model_config_warning, p.github_access_warning
+              p.model_config_warning, p.github_access_warning,
+              p.settings->>'timezone' AS schedule_time_zone
        FROM tests t
        JOIN projects p ON p.id = t.project_id
        WHERE t.enabled = TRUE
@@ -82,6 +98,7 @@ export class TestScheduleRepository {
       createdAt: row.created_at,
       projectModelConfigWarning: row.model_config_warning,
       projectGithubAccessWarning: row.github_access_warning,
+      scheduleTimeZone: row.schedule_time_zone,
     }));
   }
 
