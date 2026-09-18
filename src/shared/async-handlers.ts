@@ -149,15 +149,39 @@ for (const method of HTTP_METHODS) {
  *
  * Its arguments may be `(handler)`, `(path, handler)`, `(router)`, or
  * `(path, router, handler)` — a mounted `Router` is a function too, and wrapping
- * one would replace it with a plain handler and break the mount. Thus the
- * `isRouter` check: Express marks router instances with `handle` + `set`.
+ * one would replace it with a plain handler. Thus the `isRouter` check below.
+ *
+ * **Issue #68: this check used to require `.set`, and Express 4 Routers do not
+ * have one.** The original comment claimed "Express marks router instances with
+ * `handle` + `set`", which is simply false for Express 4 — `set` is an *app*
+ * method, not a router one. So `isRouter` returned false for every mounted
+ * router, every one was wrapped, and the check never did anything. Verified:
+ *
+ * ```
+ * const r = require("express/lib/router")({});
+ * typeof r.handle  // "function"
+ * typeof r.use     // "function"
+ * typeof r.set     // "undefined"
+ * ```
+ *
+ * Consequences were latent rather than visible, which is why it survived a
+ * review and a green suite: routing still works, because a wrapper calling
+ * `router(req, res, next)` is functionally equivalent. What is lost is
+ * `layer.handle` identity — Express's own introspection no longer sees the
+ * router, so anything walking the stack (including a test asserting every route
+ * is reachable) found 1 of 147 routes.
  */
-type PossiblyRouter = { handle?: unknown; set?: unknown };
+type PossiblyRouter = { handle?: unknown; use?: unknown };
 
 function isRouter(value: unknown): boolean {
   if (typeof value !== "function") return false;
   const candidate = value as PossiblyRouter;
-  return typeof candidate.handle === "function" && typeof candidate.set === "function";
+  // `handle` and `use` are both functions on a Router and neither exists on a
+  // plain middleware, so the pair identifies one without relying on a private
+  // marker Express does not define.
+  return (
+    typeof candidate.handle === "function" && typeof candidate.use === "function"
+  );
 }
 
 const originalUse = Router.use as (...args: unknown[]) => unknown;
