@@ -84,6 +84,8 @@ function buildApp(deps: {
   approveReview?: (featureId: string) => Promise<null>;
   setReturned?: (featureId: string, reason: string, comment: string) => Promise<null>;
   listEnabledTests?: ReturnType<typeof vi.fn>;
+  /** Issue #63: kinds the installation reports it cannot run. */
+  unrunnableKinds?: string[];
   hasActiveFeatureTestRuns?: ReturnType<typeof vi.fn>;
   listFeatureTestRuns?: ReturnType<typeof vi.fn>;
   upsertStep?: ReturnType<typeof vi.fn>;
@@ -226,6 +228,9 @@ function buildApp(deps: {
         listByFeature: deps.listReportExecutions ?? vi.fn(async () => []),
       } as never,
       projects: { findById: projectFindById } as never,
+      capabilities: {
+        unrunnable: vi.fn(async () => new Set<string>(deps.unrunnableKinds ?? [])),
+      } as never,
       designs: {
         finalize: deps.finalizeDesign ?? vi.fn(async () => undefined),
       } as never,
@@ -820,6 +825,66 @@ describe("POST /internal/jobs/:jobId/events", () => {
       testGroup: "integration",
       ref: "yggdrasil/feature-feature_42",
     }));
+  });
+
+  /*
+   * Issue #63. Two dispatches of one kind, so one capability decides both: an
+   * install with no `script_test_run` image cannot execute either probe, and
+   * dispatching them anyway is what creates two doomed job rows and, since #53,
+   * a feature marked `failed` at Testing for a *setting* rather than a defect.
+   */
+  it("does not dispatch a script probe the installation cannot run", async () => {
+    const setTesting = vi.fn(async () => ({ id: "feature_42" }));
+    const jobsCreate = vi.fn(async () => ({ id: "test_job_1" }));
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42", kind: "feature_build" }),
+      setTesting: setTesting as never,
+      jobsCreate,
+      listEnabledTests: vi.fn(async () => [{ id: "test_1" }]),
+      unrunnableKinds: ["script_test_run"],
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_build_result", status: "success" });
+
+    expect(res.status).toBe(201);
+    // The `test_run` for the enabled Test still goes out — only the probes that
+    // cannot run are withheld.
+    expect(jobsCreate).toHaveBeenCalledTimes(1);
+    expect(jobsCreate).toHaveBeenCalledWith(expect.objectContaining({ kind: "test_run" }));
+    expect(jobsCreate).not.toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "script_test_run" }),
+    );
+  });
+
+  it("dispatches both probes when the installation can run them", async () => {
+    // The default, and unchanged from before #63: unknown capabilities must not
+    // quietly stop dispatching, or an install that never publishes would silently
+    // stop testing script groups.
+    const setTesting = vi.fn(async () => ({ id: "feature_42" }));
+    const jobsCreate = vi.fn(async () => ({ id: "test_job_1" }));
+    const app = buildApp({
+      findById: async () => makeJob({ featureId: "feature_42", kind: "feature_build" }),
+      setTesting: setTesting as never,
+      jobsCreate,
+      listEnabledTests: vi.fn(async () => []),
+      unrunnableKinds: [],
+    });
+
+    await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_build_result", status: "success" });
+
+    expect(jobsCreate).toHaveBeenCalledTimes(2);
+    expect(jobsCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "script_test_run", testGroup: "unit" }),
+    );
+    expect(jobsCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "script_test_run", testGroup: "integration" }),
+    );
   });
 
   it("persists test steps and rejects incomplete final reports", async () => {

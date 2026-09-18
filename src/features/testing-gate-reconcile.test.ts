@@ -35,7 +35,7 @@ function build(candidates: Array<{ id: string; projectId: string }>, options: {
   const setInReview = vi.fn(async () => null);
   const setAgenticReview = vi.fn(async () => ({ id: "feature" }));
 
-  const listTestingWithTerminalRuns = vi.fn(async () => candidates);
+  const listTestingAwaitingDecision = vi.fn(async () => candidates);
   const listByFeature = vi.fn(
     async (featureId: string) => options.runsByFeature?.[featureId] ?? [],
   );
@@ -43,7 +43,7 @@ function build(candidates: Array<{ id: string; projectId: string }>, options: {
   const deps = {
     pool: {},
     features: {
-      listTestingWithTerminalRuns,
+      listTestingAwaitingDecision,
       findById: vi.fn(async (_projectId: string, featureId: string) => ({
         id: featureId,
         projectId: candidates.find((c) => c.id === featureId)?.projectId,
@@ -57,6 +57,12 @@ function build(candidates: Array<{ id: string; projectId: string }>, options: {
     jobs: { create: vi.fn(async () => ({ id: "job_review" })) },
     projects: { findById: vi.fn(async () => ({ agenticReviewEnabled: true })) },
     testRunReports: { listByFeature },
+    // Issue #63: the tick's gate call now needs these two. Defaulted to the
+    // "nothing known, assume capable" values so the pre-existing cases keep
+    // testing what they were written for; the #63 behaviour has its own cases
+    // in testing-gate-runner.test.ts.
+    tests: { listEnabledByProject: vi.fn(async () => [{ id: "test_1" }]) },
+    capabilities: { unrunnable: vi.fn(async () => new Set<string>()) },
   } as unknown as TestingGateSchedulerDeps;
 
   return {
@@ -65,7 +71,7 @@ function build(candidates: Array<{ id: string; projectId: string }>, options: {
     updateStatus,
     setInReview,
     setAgenticReview,
-    listTestingWithTerminalRuns,
+    listTestingAwaitingDecision,
     listByFeature,
   };
 }
@@ -195,18 +201,18 @@ describe("runTestingGateTick", () => {
   });
 
   it("bounds how many features one tick looks at", async () => {
-    const { deps, listTestingWithTerminalRuns } = build([]);
+    const { deps, listTestingAwaitingDecision } = build([]);
 
     await runTestingGateTick(deps);
 
-    expect(listTestingWithTerminalRuns).toHaveBeenCalledWith(MAX_TESTING_GATE_CANDIDATES);
+    expect(listTestingAwaitingDecision).toHaveBeenCalledWith(MAX_TESTING_GATE_CANDIDATES);
   });
 
   it("honours an explicit limit", async () => {
-    const { deps, listTestingWithTerminalRuns } = build([]);
+    const { deps, listTestingAwaitingDecision } = build([]);
 
     await runTestingGateTick(deps, 3);
 
-    expect(listTestingWithTerminalRuns).toHaveBeenCalledWith(3);
+    expect(listTestingAwaitingDecision).toHaveBeenCalledWith(3);
   });
 });

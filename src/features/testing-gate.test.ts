@@ -67,6 +67,45 @@ describe("decideTestingOutcome", () => {
     expect(decideTestingOutcome([])).toEqual({ state: "not_run" });
   });
 
+  /*
+   * Issue #63. The empty run list means two different things and they must not
+   * be collapsed: "nothing has reported yet" is a wait, and "nothing could have
+   * reported, on this installation" is an advance. Treating the second as the
+   * first wedges the feature in `testing` forever — which is what #40 removed,
+   * reachable by a new route once probes stop being dispatched.
+   */
+  it("advances, with a reason, when no run could have been produced", () => {
+    const decision = decideTestingOutcome([], { nothingToVerify: true });
+
+    expect(decision.state).toBe("advance");
+    expect(decision.reason).toContain("nothing to verify");
+  });
+
+  it("carries no reason when advancing after a genuine pass", () => {
+    // The two advances are different claims; only the "nothing to verify" one
+    // explains itself, so a reader can tell them apart in the log.
+    expect(decideTestingOutcome([run({ report: report(0) })]).reason).toBeUndefined();
+  });
+
+  it("still waits when the empty run list is not explained by the installation", () => {
+    // The default is false, so an install that has not reported its capabilities
+    // is treated as capable and the feature waits rather than advancing.
+    expect(decideTestingOutcome([], { nothingToVerify: false })).toEqual({
+      state: "not_run",
+    });
+  });
+
+  it("ignores nothingToVerify once runs exist", () => {
+    // It is only ever a statement about why the list is *empty*; a real reported
+    // failure outranks it, so a feature with a failing test is still returned.
+    expect(
+      decideTestingOutcome([run({ report: report(1) })], { nothingToVerify: true }).state,
+    ).toBe("returned");
+    expect(
+      decideTestingOutcome([run({ status: "running" })], { nothingToVerify: true }).state,
+    ).toBe("in_progress");
+  });
+
   it("waits while any run is still going", () => {
     expect(
       decideTestingOutcome([

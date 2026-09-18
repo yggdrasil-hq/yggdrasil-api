@@ -21,6 +21,7 @@ import type { JobUsageRepository } from "../usage/repository.js";
 import { NOOP_LIVE_PUBLISHER, type LivePublisher } from "../live/deltas.js";
 import { config } from "../config.js";
 import { summarizeGrillTranscript } from "./grill-context.js";
+import { UNKNOWN_CAPABILITIES, type JobKindCapabilities } from "./capabilities.js";
 import { evaluateTestingGate } from "../features/testing-gate-runner.js";
 
 const actionItemSchema = z.object({
@@ -221,6 +222,13 @@ export function createJobsInternalRouter(deps: {
    * override; production takes `config.live.deltaBytesPerJob`.
    */
   deltaBytesPerJob?: number;
+  /**
+   * Issue #63: what the installation can actually run, so a probe kind with no
+   * image is not dispatched. Optional and defaulting to the null object, so
+   * every existing caller — and every install whose Orchestrator does not
+   * publish capabilities — keeps dispatching exactly as before.
+   */
+  capabilities?: JobKindCapabilities;
 }): Router {
   const router = Router();
   const live = deps.live ?? NOOP_LIVE_PUBLISHER;
@@ -485,6 +493,8 @@ async function syncFeatureState(
     testRunReports: TestRunReportRepository;
     projects: ProjectRepository;
     designs: DesignRepository;
+    /** Issue #63: so a script probe the installation cannot run is not dispatched. */
+    capabilities?: JobKindCapabilities;
   },
   jobId: string,
   event: z.infer<typeof jobEventSchema>,
@@ -615,15 +625,26 @@ async function syncFeatureState(
           // Dispatch both probes here; the runner reports a missing script as
           // an empty, skipped group, so the API never needs to parse a repo or
           // maintain a second project-level setting.
-          for (const testGroup of ["unit", "integration"] as const) {
-            await deps.jobs.create({
-              projectId: job.projectId,
-              kind: "script_test_run",
-              featureId: job.featureId,
-              testGroup,
-              ref,
-              trigger: "feature",
-            });
+          //
+          // Issue #63: unless the installation cannot run the kind at all. An
+          // install with no `script_test_run` image cannot execute either probe,
+          // so dispatching them creates two job rows that can only fail — and,
+          // since #53, that failure is what marks a feature `failed` at Testing
+          // for a reason which is a *setting*, not a defect in the code. The
+          // read defaults to "runnable" when the Orchestrator has not reported,
+          // which keeps this behaviour-identical on every install until it does.
+          const unrunnable = await readUnrunnableKinds(deps.capabilities, job.projectId);
+          if (!unrunnable.has("script_test_run")) {
+            for (const testGroup of ["unit", "integration"] as const) {
+              await deps.jobs.create({
+                projectId: job.projectId,
+                kind: "script_test_run",
+                featureId: job.featureId,
+                testGroup,
+                ref,
+                trigger: "feature",
+              });
+            }
           }
         } catch (error) {
           await deps.features.updateStatus(job.featureId, "failed");
@@ -797,4 +818,32 @@ async function resolveUsageAttribution(
  */
 function isAgentJobKind(kind: JobKind): kind is AgentJobKind {
   return (AGENT_JOB_KINDS as readonly string[]).includes(kind);
+}
+
+/**
+ * Issue #63: the job kinds this installation has reported it cannot run.
+ *
+ * A failed read answers "nothing is known to be unrunnable" rather than
+ * propagating, for the same reason the gate's own capability read does: this runs
+ * inside a job-event handler, and a thrown error here would fail the *build* — a
+ * feature that built successfully marked failed because a capability lookup had a
+ * bad moment. Dispatching a probe that turns out to be skippable is the
+ * recoverable direction (it is reported, and #53 made the gate fail on it);
+ * failing a good build is not.
+ */
+async function readUnrunnableKinds(
+  configured: JobKindCapabilities | undefined,
+  projectId: string,
+): Promise<ReadonlySet<string>> {
+  const capabilities = configured ?? UNKNOWN_CAPABILITIES;
+  try {
+    return await capabilities.unrunnable();
+  } catch (error) {
+    console.error(
+      `failed to read installation capabilities for project ${projectId}; ` +
+        `dispatching test probes as if every kind were runnable:`,
+      error,
+    );
+    return new Set<string>();
+  }
 }

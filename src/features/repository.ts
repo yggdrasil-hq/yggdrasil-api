@@ -78,29 +78,36 @@ export class FeatureRepository {
   }
 
   /**
-   * Features sitting in `testing` whose test runs have all reached a terminal
-   * state, oldest-updated first, bounded. Issue #40's reconcile tick's
-   * candidate query.
+   * Features sitting in `testing` with no run still in flight, oldest-updated
+   * first, bounded. Issue #40's reconcile tick's candidate query.
    *
-   * A pre-filter, not the decision: it deliberately does not reproduce the
-   * "runs belonging to the current testing attempt" window that
+   * **It deliberately includes features with no runs at all** (issue #63). It
+   * used to require that at least one test run existed, which made the
+   * empty-run-list case unreachable by the tick — and that case is exactly the
+   * one #63 says must not be left alone, because a feature whose only testing
+   * would have been the script probes gets no runs on an install that cannot run
+   * them. With the `EXISTS` requirement, such a feature was offered to nobody:
+   * the event path cannot fire (nothing reports), and the tick would not
+   * consider it. So it waited in `testing` forever — the wedge #40 removed,
+   * reachable by a second route.
+   *
+   * A pre-filter, not the decision: it does not reproduce the "runs belonging to
+   * the current testing attempt" window that
    * `TestRunReportRepository.listByFeature` applies. Over-selecting is harmless
-   * because the gate re-reads the feature and re-derives its runs, and a
-   * decision is only ever applied to a feature still in `testing`; under-
-   * selecting would be the bug, since it would leave a feature stuck.
+   * because the gate re-reads the feature and re-derives its runs, and a decision
+   * is only ever applied to a feature still in `testing`; under-selecting is the
+   * bug, since it leaves a feature stuck.
+   *
+   * The bound matters more now that the set is larger: it is still a handful of
+   * `test_run`/`script_test_run` rows per feature, not a scan of the table.
    */
-  async listTestingWithTerminalRuns(
+  async listTestingAwaitingDecision(
     limit = 50,
   ): Promise<Array<{ id: string; projectId: string }>> {
     const result = await this.db.query<{ id: string; project_id: string }>(
       `SELECT f.id, f.project_id
        FROM features f
        WHERE f.status = 'testing'
-         AND EXISTS (
-           SELECT 1 FROM jobs r
-           WHERE r.feature_id = f.id
-             AND r.kind IN ('test_run', 'script_test_run')
-         )
          AND NOT EXISTS (
            SELECT 1 FROM jobs r
            WHERE r.feature_id = f.id

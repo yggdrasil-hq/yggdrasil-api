@@ -3,6 +3,8 @@ import type { FeatureRepository } from "./repository.js";
 import type { JobRepository } from "../jobs/repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
 import { TestRunReportRepository } from "../tests/reports-repository.js";
+import { TestRepository } from "../tests/repository.js";
+import { JobKindCapabilityRepository } from "../jobs/capabilities.js";
 import { evaluateTestingGate, type TestingGateDeps } from "./testing-gate-runner.js";
 
 /**
@@ -51,7 +53,7 @@ export async function runTestingGateTick(
   deps: TestingGateSchedulerDeps,
   limit: number = MAX_TESTING_GATE_CANDIDATES,
 ): Promise<TestingGateTickResult> {
-  const candidates = await deps.features.listTestingWithTerminalRuns(limit);
+  const candidates = await deps.features.listTestingAwaitingDecision(limit);
   const result: TestingGateTickResult = { candidates: candidates.length, applied: 0 };
 
   for (const candidate of candidates) {
@@ -87,13 +89,24 @@ export async function runTestingGateTick(
  * swallowed, and the timer does not hold the process open on shutdown.
  */
 export function startTestingGateReconcile(
-  deps: { pool: pg.Pool } & Omit<TestingGateSchedulerDeps, "testRunReports">,
+  deps: {
+    pool: pg.Pool;
+    features: TestingGateDeps["features"];
+    jobs: TestingGateDeps["jobs"];
+    projects: TestingGateDeps["projects"];
+  },
   intervalMs: number,
   log: (message: string) => void = console.error,
 ): () => void {
+  // The two dependencies the tick builds for itself from the pool: both are
+  // pool-backed readers with no other wiring, so a caller does not have to
+  // construct them — and `capabilities` in particular would otherwise be easy to
+  // forget, silently reverting the gate to "assume capable" forever.
   const withReports: TestingGateSchedulerDeps = {
     ...deps,
     testRunReports: new TestRunReportRepository(deps.pool),
+    tests: new TestRepository(deps.pool),
+    capabilities: new JobKindCapabilityRepository(deps.pool),
   };
 
   let running = false;
