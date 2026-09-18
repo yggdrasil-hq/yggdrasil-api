@@ -8,6 +8,24 @@ export interface TestRunStep {
   createdAt: Date;
 }
 
+/**
+ * Issue #53: why a group was skipped, as a closed enum rather than prose.
+ *
+ * The two causes are different facts and only one of them is a problem:
+ *
+ * - `no_script` — the repository has no `test-unit.sh`/`test-integration.sh`, so
+ *   the group is off by the project's own choice (ADR 015 item 10). There was
+ *   nothing to verify, and a feature with only these runs may advance.
+ * - `runner_unavailable` — the installation could not run the group at all (no
+ *   `script_test_run` image configured, issue #44). Nothing was verified and the
+ *   install is incomplete, so advancing would mean a review over unverified work.
+ *
+ * Null means "the runner did not say", which the gate treats as it did before
+ * this existed — see `decideTestingOutcome`. The field is therefore additive: a
+ * producer that does not send it changes no outcome.
+ */
+export type TestRunSkipReason = "no_script" | "runner_unavailable";
+
 export interface TestRunReport {
   jobId: string;
   testId: string | null;
@@ -19,6 +37,8 @@ export interface TestRunReport {
   failingTests: string[];
   summary: string;
   recordingPath: string | null;
+  /** Set only when the group did not run; null when it did, or nobody said. */
+  skipReason: TestRunSkipReason | null;
   createdAt: Date;
   steps: TestRunStep[];
 }
@@ -51,6 +71,12 @@ export interface PublicTestRunReport {
   failingTests: string[];
   summary: string;
   recordingPath: string | null;
+  /**
+   * Issue #53: why the group did not run, when the runner said. The Testing tab
+   * distinguishes "this project has no unit tests" from "this install could not
+   * run them", which read identically as a bare `skipped: 1` row.
+   */
+  skipReason: TestRunSkipReason | null;
   createdAt: string;
   steps: Array<{
     name: string;
@@ -73,6 +99,7 @@ export function toPublicTestRunReport(report: TestRunReport): PublicTestRunRepor
     failingTests: report.failingTests,
     summary: report.summary,
     recordingPath: report.recordingPath,
+    skipReason: report.skipReason,
     createdAt: report.createdAt.toISOString(),
     steps: report.steps.map((step) => ({
       name: step.name,

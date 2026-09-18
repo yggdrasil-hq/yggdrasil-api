@@ -2,6 +2,7 @@ import type pg from "pg";
 import type {
   TestRunExecution,
   TestRunReport,
+  TestRunSkipReason,
   TestRunStep,
   TestStepStatus,
 } from "./report-types.js";
@@ -19,6 +20,7 @@ interface ReportRow {
   failing_tests: string[];
   summary: string;
   recording_path: string | null;
+  skip_reason: TestRunSkipReason | null;
   created_at: Date;
 }
 
@@ -75,6 +77,7 @@ function mapReport(row: ReportRow, steps: TestRunStep[]): TestRunReport {
     failingTests: row.failing_tests ?? [],
     summary: row.summary,
     recordingPath: row.recording_path,
+    skipReason: row.skip_reason,
     createdAt: row.created_at,
     steps,
   };
@@ -117,11 +120,13 @@ export class TestRunReportRepository {
     failingTests?: string[];
     summary: string;
     recordingPath?: string;
+    /** Issue #53: set only when the group did not run — see TestRunSkipReason. */
+    skipReason?: TestRunSkipReason;
   }): Promise<void> {
     await this.db.query(
       `INSERT INTO test_run_reports
-         (job_id, passed, failed, skipped, total, coverage_percent, failing_tests, summary, recording_path)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         (job_id, passed, failed, skipped, total, coverage_percent, failing_tests, summary, recording_path, skip_reason)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (job_id) DO UPDATE SET
          passed = EXCLUDED.passed,
          failed = EXCLUDED.failed,
@@ -130,7 +135,8 @@ export class TestRunReportRepository {
          coverage_percent = EXCLUDED.coverage_percent,
          failing_tests = EXCLUDED.failing_tests,
          summary = EXCLUDED.summary,
-         recording_path = EXCLUDED.recording_path`,
+         recording_path = EXCLUDED.recording_path,
+         skip_reason = EXCLUDED.skip_reason`,
       [
         input.jobId,
         input.passed,
@@ -141,6 +147,7 @@ export class TestRunReportRepository {
         JSON.stringify(input.failingTests ?? []),
         input.summary,
         input.recordingPath ?? null,
+        input.skipReason ?? null,
       ],
     );
   }
@@ -149,7 +156,7 @@ export class TestRunReportRepository {
     const reportResult = await this.db.query<ReportRow>(
       `SELECT r.job_id, j.test_id, r.passed, r.failed, r.skipped, r.total,
               r.coverage_percent, r.failing_tests, r.summary, r.recording_path,
-              r.created_at
+              r.skip_reason, r.created_at
        FROM test_run_reports r
        JOIN jobs j ON j.id = r.job_id
        WHERE r.job_id = $1`,
@@ -277,7 +284,7 @@ export class TestRunReportRepository {
     const [reportResult, stepResult] = await Promise.all([
       this.db.query<ReportRow>(
         `SELECT job_id, passed, failed, skipped, total, coverage_percent,
-                failing_tests, summary, recording_path, created_at
+                failing_tests, summary, recording_path, skip_reason, created_at
          FROM test_run_reports
          WHERE job_id = ANY($1::uuid[])`,
         [jobIds],
