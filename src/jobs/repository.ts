@@ -1,6 +1,6 @@
 import type pg from "pg";
 import type { Queryable } from "../db/pool.js";
-import type { Job, JobKind, JobStatus } from "./types.js";
+import type { Job, JobKind, JobStatus, JobTriggerSource } from "./types.js";
 
 interface JobRow {
   id: string;
@@ -10,7 +10,7 @@ interface JobRow {
   test_id: string | null;
   test_group: "unit" | "integration" | null;
   ref: string | null;
-  trigger_source: "feature" | "schedule" | null;
+  trigger_source: JobTriggerSource | null;
   design_name: string | null;
   design_slug: string | null;
   design_description: string | null;
@@ -67,7 +67,7 @@ export class JobRepository {
     testId?: string;
     testGroup?: "unit" | "integration";
     ref?: string;
-    trigger?: "feature" | "schedule" | "manual";
+    trigger?: JobTriggerSource;
     designName?: string;
     designSlug?: string;
     designDescription?: string;

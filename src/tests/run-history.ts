@@ -1,4 +1,4 @@
-import type { JobStatus } from "../jobs/types.js";
+import type { JobStatus, JobTriggerSource } from "../jobs/types.js";
 import type { TestRunReport, TestRunStep } from "./report-types.js";
 
 /**
@@ -22,7 +22,7 @@ export interface TestRunHistoryEntry {
   jobId: string;
   testId: string;
   status: JobStatus;
-  trigger: "feature" | "schedule" | null;
+  trigger: JobTriggerSource | null;
   testGroup: "unit" | "integration" | null;
   ref: string | null;
   createdAt: Date;
@@ -36,7 +36,7 @@ export interface PublicTestRunHistoryEntry {
   jobId: string;
   testId: string;
   status: JobStatus;
-  trigger: "feature" | "schedule" | null;
+  trigger: JobTriggerSource | null;
   testGroup: "unit" | "integration" | null;
   ref: string | null;
   createdAt: string;
