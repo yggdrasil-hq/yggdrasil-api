@@ -26,7 +26,14 @@ describe("handlePushEvent", () => {
     await handlePushEvent(makePayload(), { projects: projects as never, jobs: jobs as never });
 
     expect(projects.findByPrimaryRepository).toHaveBeenCalledWith("acme", "web");
-    expect(dispatch).toHaveBeenCalledWith({ projectId: "proj_1", kind: "deploy" });
+    // Issue #26: the pushed ref is normalized to a branch name and recorded on
+    // the job, so the deploy ledger answers "which commit was deployed" instead
+    // of always showing a null.
+    expect(dispatch).toHaveBeenCalledWith({
+      projectId: "proj_1",
+      kind: "deploy",
+      ref: "main",
+    });
   });
 
   it("ignores pushes to branches other than main", async () => {
@@ -134,7 +141,11 @@ describe("handlePullRequestEvent", () => {
 
     expect(updateStatus).toHaveBeenCalledWith("feat_1", "merged");
     expect(markReady).toHaveBeenCalledWith("proj_1");
-    expect(jobs.create).toHaveBeenCalledWith({ projectId: "proj_1", kind: "deploy" });
+    expect(jobs.create).toHaveBeenCalledWith({
+      projectId: "proj_1",
+      kind: "deploy",
+      ref: "main",
+    });
   });
 
   it("resolves a parent's subtask Action Item when a subtask feature merges (ADR 015 item 5)", async () => {
