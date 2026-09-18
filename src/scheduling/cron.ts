@@ -216,6 +216,51 @@ export function previousOccurrence(
 }
 
 /**
+ * The shortest gap between two consecutive occurrences of `expression` at or
+ * before `at`, in milliseconds, or null when there is not enough of a
+ * schedule inside `MAX_LOOKBACK_DAYS` to measure one.
+ *
+ * Exists so `meetsMinimumInterval` can enforce the product's "minimum interval
+ * is 1 hour" rule against the schedule the parser will actually run, rather
+ * than against a pattern guess. Pattern-matching the string cannot work:
+ * `* 10 * * *` and `* * * * 1` both look harmless and both fire every minute.
+ *
+ * Measured over `samples` consecutive occurrences rather than just the last
+ * two, because a schedule's gap is not constant — `0 0 1,15 * *` has a short
+ * gap in some months and a long one in others — and the rule is about the
+ * *minimum* interval, so one sampled pair is not enough to see the short one.
+ * The scan is bounded by `MAX_LOOKBACK_DAYS` and stops early once occurrences
+ * run out, so a yearly schedule costs the same as an hourly one.
+ */
+export function minimumIntervalMs(
+  expression: string,
+  at: Date,
+  samples = 4,
+): number | null {
+  let cursorMs = at.getTime();
+  let previousMs: number | null = null;
+  let minimum: number | null = null;
+
+  for (let index = 0; index < samples; index += 1) {
+    const occurrence = previousOccurrence(expression, new Date(cursorMs));
+    if (!occurrence) break;
+
+    const occurrenceMs = occurrence.getTime();
+    if (previousMs !== null) {
+      const gap = previousMs - occurrenceMs;
+      if (minimum === null || gap < minimum) minimum = gap;
+    }
+
+    previousMs = occurrenceMs;
+    // `previousOccurrence` is inclusive, so step back a minute to get the one
+    // before it.
+    cursorMs = occurrenceMs - MINUTE_MS;
+  }
+
+  return minimum;
+}
+
+/**
  * Whether a test's schedule has come due.
  *
  * `reference` is the last time this schedule fired, falling back to when the

@@ -205,3 +205,59 @@ describe("ProjectDeployRepository.hasRevision", () => {
     expect(await repository.hasRevision(PROJECT_ID, 99)).toBe(false);
   });
 });
+
+describe("ProjectDeployRepository.record idempotency", () => {
+  /*
+   * Issue #26: the Orchestrator retries a lost deploy report, and the one case
+   * a retry cannot tell apart from a fresh attempt is "the insert landed but the
+   * response didn't". Without the unique index on job_id (migration 043) that
+   * would write a second ledger row for the same revision; with it, the second
+   * write is a no-op and the caller still gets the stored row.
+   */
+  it("returns the stored row when the same job's outcome is reported twice", async () => {
+    const { pool, query } = fakePool((sql) => {
+      if (sql.includes("INSERT INTO project_deploys")) return { rows: [] };
+      return { rows: [deployRow()] };
+    });
+    const repository = new ProjectDeployRepository(pool);
+
+    const deploy = await repository.record({
+      projectId: PROJECT_ID,
+      jobId: JOB_ID,
+      kind: "deploy",
+      helmRevision: 4,
+      status: "completed",
+      ref: "main",
+    });
+
+    expect(deploy.helmRevision).toBe(4);
+    expect(query.mock.calls[0][0]).toMatch(
+      /ON CONFLICT \(job_id\) WHERE job_id IS NOT NULL DO NOTHING/,
+    );
+    expect(query.mock.calls[1][0]).toMatch(/WHERE job_id = \$1/);
+    expect(query.mock.calls[1][1]).toEqual([JOB_ID]);
+  });
+});
+
+describe("ProjectDeployRepository.refForRevision", () => {
+  it("returns the ref that revision was deployed from", async () => {
+    const { pool, query } = fakePool(() => ({ rows: [{ ref: "main" }] }));
+    const repository = new ProjectDeployRepository(pool);
+
+    expect(await repository.refForRevision(PROJECT_ID, 3)).toBe("main");
+
+    const [sql, values] = query.mock.calls[0];
+    expect(sql).toMatch(/helm_revision = \$2/);
+    expect(sql).toMatch(/status = 'completed'/);
+    expect(values).toEqual([PROJECT_ID, 3]);
+  });
+
+  it("is null for a revision that recorded no ref", async () => {
+    // Every row written before issue #26 has a NULL ref, so a rollback to one
+    // of them must not invent a ref.
+    const { pool } = fakePool(() => ({ rows: [{ ref: null }] }));
+    const repository = new ProjectDeployRepository(pool);
+
+    expect(await repository.refForRevision(PROJECT_ID, 1)).toBeNull();
+  });
+});

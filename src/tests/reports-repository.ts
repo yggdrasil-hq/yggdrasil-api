@@ -167,8 +167,10 @@ export class TestRunReportRepository {
       test_id: string | null;
       test_group: "unit" | "integration" | null;
       status: TestRunExecution["status"];
+      last_error: string | null;
+      completed_at: Date | null;
     }>(
-      `SELECT id, test_id, test_group, status
+      `SELECT id, test_id, test_group, status, last_error, completed_at
        FROM jobs j
        WHERE j.feature_id = $1
          AND j.kind IN ('test_run', 'script_test_run')
@@ -191,6 +193,8 @@ export class TestRunReportRepository {
         status: job.status,
         report,
         steps,
+        lastError: job.last_error,
+        completedAt: job.completed_at,
       };
     }));
   }

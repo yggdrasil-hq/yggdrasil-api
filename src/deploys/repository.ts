@@ -52,6 +52,18 @@ function mapDeploy(row: ProjectDeployRow): ProjectDeploy {
 export class ProjectDeployRepository {
   constructor(private readonly db: pg.Pool) {}
 
+  /**
+   * Writes one terminal outcome to the ledger, idempotently.
+   *
+   * `job_id` is unique (migration 043), so a report that is delivered twice —
+   * the Orchestrator retries a lost one (#26), and "the write landed but the
+   * response didn't" is precisely what a retry cannot distinguish — records one
+   * row rather than two. A deploy job reaches exactly one terminal state and
+   * reports it once, so the second delivery is always the same fact restated.
+   *
+   * Returns the stored row either way, so the caller cannot tell a fresh write
+   * from a duplicate delivery: both mean "this outcome is in the ledger".
+   */
   async record(input: {
     projectId: string;
     jobId: string;
@@ -68,6 +80,7 @@ export class ProjectDeployRepository {
          (project_id, job_id, kind, helm_revision, target_revision,
           status, last_error, ref)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (job_id) WHERE job_id IS NOT NULL DO NOTHING
        RETURNING ${deployColumns}`,
       [
         input.projectId,
@@ -80,7 +93,34 @@ export class ProjectDeployRepository {
         input.ref ?? null,
       ],
     );
-    return mapDeploy(result.rows[0]);
+    if (result.rows[0]) return mapDeploy(result.rows[0]);
+
+    const existing = await this.db.query<ProjectDeployRow>(
+      `SELECT ${deployColumns} FROM project_deploys WHERE job_id = $1`,
+      [input.jobId],
+    );
+    return mapDeploy(existing.rows[0]);
+  }
+
+  /**
+   * The git ref recorded for a revision this project produced, or null.
+   *
+   * Used by the rollback route, where the job carries no ref of its own: a
+   * rollback applies no new commit, so the only honest answer to "which commit
+   * is deployed" afterwards is the one the target revision was deployed from.
+   */
+  async refForRevision(projectId: string, revision: number): Promise<string | null> {
+    const result = await this.db.query<{ ref: string | null }>(
+      `SELECT ref
+       FROM project_deploys
+       WHERE project_id = $1
+         AND helm_revision = $2
+         AND status = 'completed'
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      [projectId, revision],
+    );
+    return result.rows[0]?.ref ?? null;
   }
 
   /**

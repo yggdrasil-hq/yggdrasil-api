@@ -15,6 +15,7 @@ import { ProjectRepository } from "./projects/repository.js";
 import { JobRecordingRepository } from "./recordings/repository.js";
 import { startRecordingSweep } from "./recordings/sweep.js";
 import { startScheduler } from "./scheduling/scheduler.js";
+import { startTestingGateReconcile } from "./features/testing-gate-reconcile.js";
 import { UserRepository } from "./users/repository.js";
 
 async function main(): Promise<void> {
@@ -70,6 +71,25 @@ async function main(): Promise<void> {
   if (config.scheduler.enabled) {
     startScheduler(
       { pool, jobs: new JobRepository(pool) },
+      config.scheduler.intervalMs,
+      (message) => console.error(message),
+    );
+  }
+
+  // Issue #40: the Testing stage's second trigger. The ordinary one is the last
+  // runner to submit its report; this resolves the case where nothing ever does,
+  // which otherwise leaves a feature wedged in `testing` with no event to wake
+  // it. On the same interval as the scheduler below it — both are "check the
+  // database for work that time has made actionable" — and idempotent across
+  // replicas for the same reason (see features/testing-gate-reconcile.ts).
+  if (config.scheduler.enabled) {
+    startTestingGateReconcile(
+      {
+        pool,
+        features: new FeatureRepository(pool),
+        jobs: new JobRepository(pool),
+        projects: new ProjectRepository(pool),
+      },
       config.scheduler.intervalMs,
       (message) => console.error(message),
     );

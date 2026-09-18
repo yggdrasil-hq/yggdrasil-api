@@ -139,6 +139,8 @@ interface BuildAppOptions {
   currentRevision?: number | null;
   rollbackTargets?: unknown[];
   knownRevisions?: number[];
+  /** Issue #26: the ref recorded for the revision a rollback targets. */
+  refForRevision?: string | null;
   /** ADR 024 state: the latest job (whose events form the transcript) and its events. */
   latestJob?: unknown;
   transcriptEvents?: unknown[];
@@ -283,6 +285,9 @@ function buildApp(opts: BuildAppOptions) {
     hasRevision: vi.fn(async (_projectId: string, revision: number) =>
       (opts.knownRevisions ?? []).includes(revision),
     ),
+    // Issue #26: a rollback job carries the ref of the revision it targets,
+    // since it applies no new commit of its own.
+    refForRevision: vi.fn(async () => opts.refForRevision ?? null),
   };
   const tests = {
     // ADR 026's history routes resolve the test through the project before
@@ -784,7 +789,13 @@ describe("POST /:projectId/complete-init (ADR 013 addendum)", () => {
 
     expect(res.status).toBe(200);
     expect(projects.markReady).toHaveBeenCalledWith(project.id);
-    expect(jobs.create).toHaveBeenCalledWith({ projectId: project.id, kind: "deploy" });
+    // Issue #26: the first deploy records which ref it is of, same as every
+    // later one.
+    expect(jobs.create).toHaveBeenCalledWith({
+      projectId: project.id,
+      kind: "deploy",
+      ref: "main",
+    });
   });
 
   it("409s and dispatches nothing when the project is already ready", async () => {
@@ -848,8 +859,53 @@ describe("POST /:projectId/deploy", () => {
     const res = await authedRequest(app).post(`/projects/${project.id}/deploy`);
 
     expect(res.status).toBe(201);
-    expect(jobs.create).toHaveBeenCalledWith({ projectId: project.id, kind: "deploy" });
+    // Issue #26: the primary deployment is always the default branch's content,
+    // so the job records `main` rather than leaving the ledger's ref column
+    // permanently null.
+    expect(jobs.create).toHaveBeenCalledWith({
+      projectId: project.id,
+      kind: "deploy",
+      ref: "main",
+    });
   });
+
+  // The asymmetry with rollback was the thing that read wrong (issue #26):
+  // the routine manual deploy has an actor and is audited. A push-driven deploy
+  // still is not — it has no actor and would add a row per push to main.
+  it("audits the manual trigger with its actor, unlike a push-driven deploy", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, audit } = buildApp({ project, latestDeployJob: null });
+
+    await authedRequest(app).post(`/projects/${project.id}/deploy`);
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "deploy.triggered",
+        projectId: project.id,
+        actorUserId: OWNER_ID,
+      }),
+    );
+  });
+
+  // The route's pre-check cannot see a concurrent request's insert. The
+  // database can (migration 043's partial unique index), and the loser of that
+  // race has to be told so rather than surfacing a 500.
+  it("409s when another request wins the in-flight race", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs } = buildApp({ project, latestDeployJob: null });
+    jobs.create.mockRejectedValueOnce(
+      Object.assign(new Error("duplicate key value violates unique constraint"), {
+        code: "23505",
+        constraint: "idx_jobs_one_active_deploy_per_project",
+      }),
+    );
+
+    const res = await authedRequest(app).post(`/projects/${project.id}/deploy`);
+
+    expect(res.status).toBe(409);
+  });
+
 
   it("409s when the project isn't ready yet", async () => {
     const project = makeProject({ status: "initializing" });
@@ -958,6 +1014,8 @@ describe("POST /:projectId/rollback (ADR 022)", () => {
       projectId: project.id,
       kind: "rollback",
       targetRevision: 9,
+      // No ref recorded for revision 9 in this setup, so the job carries none.
+      ref: undefined,
     });
     expect(audit.record).toHaveBeenCalledWith(
       expect.anything(),
@@ -966,6 +1024,25 @@ describe("POST /:projectId/rollback (ADR 022)", () => {
         projectId: project.id,
         metadata: expect.objectContaining({ revision: 12, targetRevision: 9 }),
       }),
+    );
+  });
+
+  // Issue #26: a rollback applies no new commit of its own, so the only honest
+  // answer to "which commit is deployed" once it finishes is the ref the target
+  // revision was deployed from.
+  it("carries the targeted revision's ref onto the rollback job", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs } = buildApp({
+      project,
+      currentRevision: 12,
+      knownRevisions: [9, 12],
+      refForRevision: "main",
+    });
+
+    await authedRequest(app).post(`/projects/${project.id}/rollback`).send({ revision: 9 });
+
+    expect(jobs.create).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "rollback", targetRevision: 9, ref: "main" }),
     );
   });
 

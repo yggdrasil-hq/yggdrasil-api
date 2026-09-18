@@ -3,6 +3,8 @@ set -eu
 
 mkdir -p test-results
 
+npx tsc --noEmit
+
 npx vitest run --reporter=default --reporter=json --outputFile=test-results/vitest.json
 status=$?
 
