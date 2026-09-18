@@ -113,40 +113,77 @@ export const AUDIT_DEFAULT_LIMIT = 50;
 export const AUDIT_MAX_LIMIT = 200;
 
 /**
+ * The alias every caller of `buildAuditWhere` must give `audit_events`.
+ *
+ * **This exists because the predicates used to be unqualified, and that is not
+ * a style question — it was a 500 on every audit read (issue #61).**
+ *
+ * `listForOrganization` runs one clause against two queries: a `COUNT(*)` with
+ * no join, and a page query that `LEFT JOIN`s `projects` and `users`. Both
+ * tables have an `organization_id` column and all three have `created_at`, so
+ * `organization_id = $1` resolved in the count query and was **ambiguous** in
+ * the page query (`42702`). The count query succeeding is not enough to save the
+ * request — the two run in `Promise.all`, so the page query's rejection failed
+ * the whole thing. Every audit list request 500'd, always, and no unit test
+ * noticed because they assert the generated string rather than executing it.
+ *
+ * The alias is named once here rather than typed as a literal `e.` in each
+ * condition, and `repository.ts` interpolates nothing — instead a test asserts
+ * the queries alias `audit_events` to this same name, so the clause and the
+ * `FROM` cannot drift apart silently. `EVENT_COLUMNS` already used `e.`-prefixed
+ * names, so this is the convention this module already had; it just was not
+ * applied to the predicates.
+ */
+export const AUDIT_EVENTS_ALIAS = "e";
+
+/**
  * Builds the WHERE clause shared by the list and count queries, so the two
  * can never drift apart. Values are positional ($n) starting after the
- * always-present organization id. Pure — this is the filter logic the
- * repository test covers without a database.
+ * always-present organization id.
+ *
+ * **Every column is alias-qualified.** Callers must alias `audit_events` to
+ * `AUDIT_EVENTS_ALIAS`; see that constant for why this is load-bearing rather
+ * than cosmetic. `project_id`, `actor_user_id` and `action` exist only on
+ * `audit_events` today and would resolve unqualified, but they are qualified
+ * anyway: a column added to a joined table later must not be able to turn a
+ * working filter into a 500, and the inconsistency is how the two that *are*
+ * ambiguous got missed.
+ *
+ * Pure — the filter logic the repository test covers without a database — but
+ * note that purity is exactly why the unit tests could not catch #61. The
+ * execution check is `scripts/verify/issue-61-audit-query.mts` and the
+ * Postgres-backed cases in `audit/repository.test.ts`.
  */
 export function buildAuditWhere(
   organizationId: string,
   filters: AuditListFilters,
 ): { clause: string; values: unknown[] } {
+  const a = AUDIT_EVENTS_ALIAS;
   const values: unknown[] = [organizationId];
-  const conditions = ["organization_id = $1"];
+  const conditions = [`${a}.organization_id = $1`];
 
   if (filters.projectId) {
     values.push(filters.projectId);
-    conditions.push(`project_id = $${values.length}`);
+    conditions.push(`${a}.project_id = $${values.length}`);
   }
   if (filters.actorUserId) {
     values.push(filters.actorUserId);
-    conditions.push(`actor_user_id = $${values.length}`);
+    conditions.push(`${a}.actor_user_id = $${values.length}`);
   }
   if (filters.action) {
     // Prefix match: 'project' matches 'project.created' and
     // 'project.repository_linked' alike. `%`/`_` in the input are escaped so
     // a caller can't widen their own filter with LIKE wildcards.
     values.push(`${escapeLikePattern(filters.action)}%`);
-    conditions.push(`action LIKE $${values.length} ESCAPE '\\'`);
+    conditions.push(`${a}.action LIKE $${values.length} ESCAPE '\\'`);
   }
   if (filters.from) {
     values.push(filters.from);
-    conditions.push(`created_at >= $${values.length}`);
+    conditions.push(`${a}.created_at >= $${values.length}`);
   }
   if (filters.to) {
     values.push(filters.to);
-    conditions.push(`created_at <= $${values.length}`);
+    conditions.push(`${a}.created_at <= $${values.length}`);
   }
 
   return { clause: conditions.join(" AND "), values };
