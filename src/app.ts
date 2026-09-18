@@ -62,7 +62,10 @@ import { JobModelDefaultRepository } from "./model-config/job-default-repository
 import { ProjectModelOverrideRepository } from "./model-config/project-override-repository.js";
 import { FeatureJobModelOverrideRepository } from "./model-config/feature-override-repository.js";
 import { JobUsageRepository } from "./usage/repository.js";
-import { createUsageRouter } from "./usage/routes.js";
+import {
+  createOrganizationUsageRouter,
+  createProjectUsageRouter,
+} from "./usage/routes.js";
 import { AllocationRepository } from "./allocations/repository.js";
 import { createAllocationsRouter } from "./allocations/routes.js";
 import { createAllocationsInternalRouter } from "./allocations/internal-routes.js";
@@ -186,16 +189,21 @@ export function createApp(deps?: AppDependencies): Express {
     createAuditRouter({ users, sessions, organizations, audit: auditEvents }),
   );
   // ADR 023: token/cost consumption reporting, org- and project-scoped reads.
-  // Mounted on both prefixes because the project-level routes live under
-  // `/projects`; each route carries its own full path (see usage/routes.ts).
-  app.use(
-    "/organizations",
-    createUsageRouter({ users, sessions, organizations, projects, usage: jobUsage }),
-  );
-  app.use(
-    "/projects",
-    createUsageRouter({ users, sessions, organizations, projects, usage: jobUsage }),
-  );
+  //
+  // Two routers, one per scope, each registered with relative paths — the shape
+  // every other router here uses (issue #56). This previously mounted a *single*
+  // router which carried its own full paths at both prefixes, so Express joined
+  // the prefix onto an already-absolute path: every documented endpoint was
+  // served at a doubled path and all four 404'd in a real deployment. The
+  // comment above the old wiring described that arrangement as deliberate, which
+  // is what made it invisible.
+  //
+  // The wiring itself is now asserted by `src/app.routing.test.ts`, because the
+  // route-level tests mounted this router at root and therefore could not see
+  // the mismatch.
+  const usageDeps = { users, sessions, organizations, projects, usage: jobUsage };
+  app.use("/organizations", createOrganizationUsageRouter(usageDeps));
+  app.use("/projects", createProjectUsageRouter(usageDeps));
   app.use(
     "/organizations",
     createModelConfigRouter({
