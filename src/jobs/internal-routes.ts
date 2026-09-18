@@ -93,6 +93,17 @@ const jobEventSchema = z.object({
   coveragePercent: z.number().min(0).max(100).optional(),
   failingTests: z.array(z.string()).optional(),
   recordingPath: z.string().optional(),
+  /**
+   * Issue #53: why a group did not run. A closed enum rather than a sentence in
+   * `summary`, because the gate has to act on this and prose is not something to
+   * branch on — see the migration's comment for the two failures that argument
+   * rests on.
+   *
+   * Optional, and its absence means "the runner did not say": a producer that
+   * does not send it changes no outcome, which is what lets the API land ahead
+   * of the Orchestrator and the `script_test_run` entrypoint.
+   */
+  skipReason: z.enum(["no_script", "runner_unavailable"]).optional(),
   snapshot: designSnapshotSchema.optional(),
   hasDesignSurface: z.boolean().optional(),
 }).superRefine((event, ctx) => {
@@ -656,6 +667,7 @@ async function syncFeatureState(
         failingTests: event.failingTests,
         summary: event.summary,
         recordingPath: event.recordingPath,
+        skipReason: event.skipReason,
       });
       // Issue #40: the gate decides whether the *runs* are done, not whether
       // every one of them submitted a report. The old check bailed while any run

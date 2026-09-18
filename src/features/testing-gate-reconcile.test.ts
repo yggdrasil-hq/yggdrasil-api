@@ -158,6 +158,7 @@ describe("runTestingGateTick", () => {
         failingTests: ["auth rejects an expired token"],
         summary: "One unit test failed.",
         recordingPath: null,
+        skipReason: null,
         createdAt: new Date(),
         steps: [],
       },

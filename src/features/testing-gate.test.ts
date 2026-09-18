@@ -34,9 +34,31 @@ function report(failed: number, overrides: Record<string, unknown> = {}) {
     failingTests: failed > 0 ? ["renders the hero"] : [],
     summary: failed > 0 ? "1 of 10 assertions did not hold" : "",
     recordingPath: null,
+    skipReason: null,
     createdAt: new Date("2026-09-18T10:00:00.000Z"),
     steps: [],
     ...overrides,
+  };
+}
+
+/**
+ * The report the Orchestrator synthesizes for a group this installation cannot
+ * run (issue #44), and the one the entrypoint writes for a group the project has
+ * no script for. They differ only in `skipReason` — which is exactly the point of
+ * issue #53: the counts are identical, so the enum is what carries the meaning.
+ */
+function skippedGroup(skipReason: "no_script" | "runner_unavailable" | null) {
+  return {
+    passed: 0,
+    failed: 0,
+    skipped: 1,
+    total: 1,
+    failingTests: [],
+    summary:
+      skipReason === "runner_unavailable"
+        ? "Skipped (unit): this installation has no script_test_run image configured (set SCRIPT_TEST_RUN_IMAGE on the Orchestrator). No verification was performed for this group."
+        : "No test-unit.sh found; test group disabled.",
+    skipReason,
   };
 }
 
@@ -168,5 +190,120 @@ describe("testGroupLabel", () => {
     expect(testGroupLabel("unit")).toBe("Unit tests");
     expect(testGroupLabel("integration")).toBe("Integration tests");
     expect(testGroupLabel(null)).toBe("Agentic tests");
+  });
+});
+
+/*
+ * Issue #53. Before this, a group skipped because the *installation* could not
+ * run it counted as verified — so a feature whose only runs were skipped probes
+ * advanced to Agentic Review having checked nothing. The two causes of a skip
+ * produce byte-identical counts, which is why every test below pairs the two
+ * against each other: a change that made one behave like the other would still
+ * pass a test that only asserted one of them.
+ */
+describe("decideTestingOutcome — a skipped group (issue #53)", () => {
+  it("advances when the project has no script for the group", () => {
+    // ADR 015 item 10: script presence *is* the toggle, so there was nothing to
+    // verify and nothing to worry about.
+    expect(
+      decideTestingOutcome([
+        run({ report: report(0, skippedGroup("no_script")) }),
+      ]),
+    ).toEqual({ state: "advance" });
+  });
+
+  it("errors when the installation could not run the group", () => {
+    const decision = decideTestingOutcome([
+      run({ report: report(0, skippedGroup("runner_unavailable")) }),
+    ]);
+
+    expect(decision.state).toBe("errored");
+  });
+
+  // The regression this issue is about: the identical counts must not decide it.
+  it("distinguishes the two causes from identical counts", () => {
+    const noScript = decideTestingOutcome([
+      run({ report: report(0, skippedGroup("no_script")) }),
+    ]);
+    const noRunner = decideTestingOutcome([
+      run({ report: report(0, skippedGroup("runner_unavailable")) }),
+    ]);
+
+    expect(noScript.state).toBe("advance");
+    expect(noRunner.state).toBe("errored");
+  });
+
+  it("names the group and carries the reason an operator can act on", () => {
+    const decision = decideTestingOutcome([
+      run({ report: report(0, skippedGroup("runner_unavailable")) }),
+    ]);
+
+    // The reason is the report's own summary, written by the side that saw the
+    // cause — so it names the setting rather than restating "skipped".
+    expect(decision.reason).toContain("script_test_run image");
+    expect(decision.reason).toContain("SCRIPT_TEST_RUN_IMAGE");
+  });
+
+  it("falls back to naming the group when the report gave no summary", () => {
+    const decision = decideTestingOutcome([
+      run({
+        testGroup: "integration",
+        report: report(0, {
+          passed: 0,
+          skipped: 1,
+          total: 1,
+          summary: "",
+          skipReason: "runner_unavailable",
+        }),
+      }),
+    ]);
+
+    expect(decision.reason).toBe("Integration tests could not run");
+  });
+
+  // Absence is the pre-#53 shape and must keep behaving as it did, or the API
+  // change would silently change the outcome of every report already stored.
+  it("treats an unstated reason as it treated every skip before the field existed", () => {
+    expect(
+      decideTestingOutcome([run({ report: report(0, skippedGroup(null)) })]),
+    ).toEqual({ state: "advance" });
+  });
+
+  it("does not let an install-caused skip mask a real test failure", () => {
+    // The agentic group ran and a test failed. That is evidence about the code
+    // and is the one outcome worth acting on, so it wins over "we could not run
+    // the unit group" — including when the skip is the earlier run of the two.
+    const decision = decideTestingOutcome([
+      run({ testGroup: "unit", report: report(0, skippedGroup("runner_unavailable")) }),
+      run({ testGroup: "integration", report: report(3) }),
+    ]);
+
+    expect(decision.state).toBe("returned");
+    expect(decision.reason).toContain("Integration tests");
+  });
+
+  it("does not advance when every group was skipped because of the install", () => {
+    // The exact shape the bug produced: two probes, both skipped, nothing else.
+    expect(
+      decideTestingOutcome([
+        run({ testGroup: "unit", report: report(0, skippedGroup("runner_unavailable")) }),
+        run({
+          testGroup: "integration",
+          report: report(0, skippedGroup("runner_unavailable")),
+        }),
+      ]).state,
+    ).toBe("errored");
+  });
+
+  // A crashed run and an unrunnable group are both "testing could not be
+  // completed"; the install cause is reported because it names a setting.
+  it("prefers the install cause over a run that ended without reporting", () => {
+    const decision = decideTestingOutcome([
+      run({ status: "failed", testGroup: "integration", lastError: "pod crashed" }),
+      run({ testGroup: "unit", report: report(0, skippedGroup("runner_unavailable")) }),
+    ]);
+
+    expect(decision.state).toBe("errored");
+    expect(decision.reason).toContain("script_test_run image");
   });
 });

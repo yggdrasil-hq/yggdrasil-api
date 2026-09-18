@@ -941,6 +941,87 @@ describe("POST /internal/jobs/:jobId/events", () => {
     expect(setReturned).not.toHaveBeenCalled();
   });
 
+  /*
+   * Issue #53: the field that lets the gate tell "this project has no unit
+   * tests" from "this install cannot run unit tests". Asserted here because it
+   * crosses the wire — the Orchestrator sends it, the zod schema has to accept
+   * it, and a rejection would be silent (the report still stores, just without
+   * the reason), which is the failure mode that made the issue worth filing.
+   */
+  it("carries a skip reason from the wire onto the report", async () => {
+    const upsertReport = vi.fn(async () => undefined);
+    const app = buildApp({
+      upsertReport,
+      findById: async () => makeJob({
+        kind: "script_test_run",
+        featureId: "feature_42",
+        testGroup: "unit",
+      }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "submit_test_report",
+        passed: 0,
+        failed: 0,
+        skipped: 1,
+        total: 1,
+        summary: "Skipped (unit): this installation has no script_test_run image configured.",
+        skipReason: "runner_unavailable",
+      });
+
+    expect(res.status).toBe(201);
+    expect(upsertReport).toHaveBeenCalledWith(
+      expect.objectContaining({ skipReason: "runner_unavailable" }),
+    );
+  });
+
+  it("rejects an unknown skip reason rather than storing it", async () => {
+    // The enum is closed on purpose: a typo'd value must fail loudly here, not
+    // become a row the gate silently ignores and advances past.
+    const upsertReport = vi.fn(async () => undefined);
+    const app = buildApp({
+      upsertReport,
+      findById: async () => makeJob({ kind: "script_test_run", featureId: "feature_42" }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "submit_test_report",
+        passed: 0,
+        failed: 0,
+        summary: "no",
+        skipReason: "image_missing",
+      });
+
+    expect(res.status).toBe(400);
+    expect(upsertReport).not.toHaveBeenCalled();
+  });
+
+  // A producer that has not been updated yet must keep working unchanged — the
+  // property that lets the API land ahead of the Orchestrator.
+  it("accepts a report with no skip reason at all", async () => {
+    const upsertReport = vi.fn(async () => undefined);
+    const app = buildApp({
+      upsertReport,
+      findById: async () => makeJob({ kind: "script_test_run", featureId: "feature_42" }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_test_report", passed: 1, failed: 0, summary: "fine" });
+
+    expect(res.status).toBe(201);
+    expect(upsertReport).toHaveBeenCalledWith(
+      expect.objectContaining({ skipReason: undefined }),
+    );
+  });
+
   it("accepts a canonical report from a script test job", async () => {
     const upsertReport = vi.fn(async () => undefined);
     const app = buildApp({

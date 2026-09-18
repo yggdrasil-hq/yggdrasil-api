@@ -1,0 +1,63 @@
+-- Issue #53 part 2: a test group that was skipped because the *installation*
+-- could not run it must not count as verified.
+--
+-- ## The bug this closes
+--
+-- `decideTestingOutcome` (features/testing-gate.ts, added by #40) advances a
+-- feature to review when every run has a report and no report recorded a
+-- failure. A skipped group submits `passed: 0, failed: 0, skipped: 1, total: 1`,
+-- so a feature whose only runs are skipped probes was advancing to Agentic
+-- Review **having verified nothing**.
+--
+-- ## Why a column rather than reading the summary
+--
+-- The two causes of a skip are already different facts, and the report's
+-- `summary` is the only field carrying them today:
+--
+--   * `"No test-unit.sh found; test group disabled."` — the repository has no
+--     script, so the group is off by the project's own choice (ADR 015 item 10).
+--     There was nothing to verify, and advancing is correct.
+--   * `"Skipped (unit): this installation has no script_test_run image
+--     configured (...)"` — the install is incomplete. Nothing was verified and
+--     advancing means a review happens over unverified work.
+--
+-- Parsing that prose is the wrong mechanism, for three reasons that have already
+-- bitten this codebase:
+--
+--   1. Issue #21 was *caused* by pattern-matching a string where the meaningful
+--      value should have been measured. The same shape of mistake.
+--   2. #44 rewrote this exact sentence. Any matcher keyed on its words would
+--      have broken silently — no test fails, the feature just starts advancing
+--      again — which is the worst way for this to fail.
+--   3. The web app's load-failure copy (`lib/features/load-errors.ts`) keys on
+--      the HTTP status rather than the message for the same reason.
+--
+-- And it cannot be inferred from the counts, which is the tempting shortcut:
+-- a project's own `test-unit.sh` may legitimately report `total: 1, skipped: 1`
+-- (one test, framework-skipped), which is indistinguishable from the install
+-- case by numbers alone. A closed enum in a column is typo-proof and versionable;
+-- a prose convention is neither.
+--
+-- ## Why nullable, with no backfill
+--
+-- Absent means "the runner did not say", and the gate treats that as it does
+-- today — so this migration is inert until a producer sends the field, and it
+-- cannot change the outcome of any run that already exists. That is deliberate:
+-- the producers are the Orchestrator (which synthesizes the skip report) and the
+-- `script_test_run` entrypoint, both outside this repo, so the column has to
+-- land before either can start sending it.
+--
+-- `no_script` is accepted and stored explicitly even though it is the default
+-- behaviour, so the two causes are distinguishable in the data rather than by
+-- absence — a reader asking "was this skipped for a reason, or did nobody say?"
+-- gets an answer.
+ALTER TABLE test_run_reports
+  ADD COLUMN IF NOT EXISTS skip_reason VARCHAR(32);
+
+-- Re-added unconditionally rather than IF NOT EXISTS-guarded: a CHECK's name is
+-- what a later migration would widen, and `ADD CONSTRAINT` has no IF NOT EXISTS
+-- form. Dropping first makes the migration re-runnable, matching how the
+-- job_events type check is widened in 012/018/020/021.
+ALTER TABLE test_run_reports DROP CONSTRAINT IF EXISTS test_run_reports_skip_reason_check;
+ALTER TABLE test_run_reports ADD CONSTRAINT test_run_reports_skip_reason_check
+  CHECK (skip_reason IS NULL OR skip_reason IN ('no_script', 'runner_unavailable'));

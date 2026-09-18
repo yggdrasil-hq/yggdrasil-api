@@ -59,6 +59,7 @@ function report(failed: number) {
     failingTests: failed > 0 ? ["auth rejects an expired token"] : [],
     summary: failed > 0 ? "One unit test failed" : "",
     recordingPath: null,
+    skipReason: null,
     createdAt: new Date(),
     steps: [],
   };
