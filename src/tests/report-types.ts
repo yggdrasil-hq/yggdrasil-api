@@ -30,6 +30,14 @@ export interface TestRunExecution {
   status: "pending" | "running" | "completed" | "failed" | "cancelled";
   report: TestRunReport | null;
   steps: TestRunStep[];
+  /**
+   * The job's failure message, when it has one. Issue #40: a run can fail
+   * without ever producing a report, and that message is the only thing that
+   * says why — without it a failed row reads "failed" and nothing else.
+   */
+  lastError: string | null;
+  /** When the run finished, so a failed row can be dated like a reported one. */
+  completedAt: Date | null;
 }
 
 export interface PublicTestRunReport {
@@ -76,7 +84,21 @@ export function toPublicTestRunReport(report: TestRunReport): PublicTestRunRepor
   };
 }
 
-export function toPublicTestRunExecution(execution: TestRunExecution) {
+export interface PublicTestRunExecution {
+  jobId: string;
+  testId: string | null;
+  testGroup: "unit" | "integration" | null;
+  status: TestRunExecution["status"];
+  report: PublicTestRunReport | null;
+  steps: PublicTestRunReport["steps"];
+  /** Issue #40: why a run failed when it failed without reporting. */
+  lastError: string | null;
+  completedAt: string | null;
+}
+
+export function toPublicTestRunExecution(
+  execution: TestRunExecution,
+): PublicTestRunExecution {
   return {
     jobId: execution.jobId,
     testId: execution.testId,
@@ -92,5 +114,7 @@ export function toPublicTestRunExecution(execution: TestRunExecution) {
       screenshotPath: step.screenshotPath,
       createdAt: step.createdAt.toISOString(),
     })),
+    lastError: execution.lastError,
+    completedAt: execution.completedAt?.toISOString() ?? null,
   };
 }
