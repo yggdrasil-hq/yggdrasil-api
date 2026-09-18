@@ -104,6 +104,12 @@ function buildApp(deps: {
   deltaBytesPerCall?: number;
   /** Issue #24: replace the byte counter outright. */
   recordRelayedDeltaBytes?: ReturnType<typeof vi.fn>;
+  /**
+   * Issue #24: the per-job delta ceiling this router enforces. Passed through to
+   * the router so the boundary can be driven from a test without a config
+   * override.
+   */
+  deltaBytesPerJob?: number;
   /** The catalog default for a job kind, which is how usage attribution finds a provider. */
   jobDefaultModelId?: string | null;
   catalogModel?: { providerName?: string } | null;
