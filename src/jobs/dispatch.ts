@@ -1,5 +1,5 @@
 import type { JobRepository } from "./repository.js";
-import type { JobKind } from "./types.js";
+import type { JobKind, JobTriggerSource } from "./types.js";
 
 /**
  * Stub dispatcher — persists a job row. Orchestrator HTTP integration is TODO.
@@ -14,7 +14,7 @@ export async function dispatchJob(
     testGroup?: "unit" | "integration";
     ref?: string;
     /** How the job came to exist — `manual` is a person pressing "Run now" (issue #31). */
-    trigger?: "feature" | "schedule" | "manual";
+    trigger?: JobTriggerSource;
     designName?: string;
     designSlug?: string;
     designDescription?: string;

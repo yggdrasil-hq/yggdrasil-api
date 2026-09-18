@@ -6,7 +6,7 @@ import type {
   TestRunStep,
   TestStepStatus,
 } from "./report-types.js";
-import type { JobStatus } from "../jobs/types.js";
+import type { JobStatus, JobTriggerSource } from "../jobs/types.js";
 import type { TestRunHistoryEntry } from "./run-history.js";
 
 interface ReportRow {
@@ -42,7 +42,7 @@ interface HistoryJobRow {
   test_id: string | null;
   test_group: "unit" | "integration" | null;
   status: JobStatus;
-  trigger_source: "feature" | "schedule" | null;
+  trigger_source: JobTriggerSource | null;
   ref: string | null;
   created_at: Date;
   started_at: Date | null;

@@ -9,6 +9,37 @@ export type JobKind =
   | "rollback";
 export type JobStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 
+/**
+ * How a job came to exist, as `jobs.trigger_source`'s CHECK allows it
+ * (migration 049).
+ *
+ * **One source of truth, because there were five declarations and three of them
+ * were wrong** (issue #75). `"manual"` was added to the database in 049 and to
+ * three of the five TypeScript declarations; the other three still said
+ * `"feature" | "schedule" | null`, so a manually-triggered run came back as a
+ * value its own response type said could not occur. A client author reading the
+ * declaration writes the generic fallback branch and never learns a manual run
+ * is possible — which is precisely what happened to the Web app, which had to
+ * widen its type by hand.
+ *
+ * TypeScript cannot catch that drift, because the value arrives from a `pg` row
+ * typed to the narrower union: nothing forces a row type to agree with the
+ * entity it maps to. Hence one constant, and `trigger-source.test.ts` asserting
+ * it against the migration's own CHECK — the half TypeScript can never see.
+ */
+export const JOB_TRIGGER_SOURCES = ["feature", "schedule", "manual"] as const;
+
+/**
+ * The trigger source of a job, or null when the kind has none.
+ *
+ * `null` means "not applicable" (every `deploy`, `spec_grill` and
+ * `agentic_review` row), which is a different fact from `"manual"` — "a human
+ * asked". Migration 049 spells that distinction out, because collapsing them
+ * would leave "why did this run happen?" unanswerable for the one run somebody
+ * deliberately started.
+ */
+export type JobTriggerSource = (typeof JOB_TRIGGER_SOURCES)[number];
+
 export interface Job {
   id: string;
   projectId: string;
@@ -21,8 +52,10 @@ export interface Job {
    * How the job came to exist. `manual` is a person pressing "Run now" on a Test
    * (issue #31) — deliberately not folded into `schedule`, which would attribute
    * a deliberate run to the scheduler in the history the field exists to explain.
+   *
+   * Null means the kind has no trigger source at all; see `JOB_TRIGGER_SOURCES`.
    */
-  trigger: "feature" | "schedule" | "manual" | null;
+  trigger: JobTriggerSource | null;
   designName: string | null;
   designSlug: string | null;
   designDescription: string | null;
