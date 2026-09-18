@@ -141,6 +141,8 @@ interface BuildAppOptions {
   knownRevisions?: number[];
   /** Issue #26: the ref recorded for the revision a rollback targets. */
   refForRevision?: string | null;
+  /** Issue #31: whether the target test already has a run in flight. */
+  testHasActiveRun?: boolean;
   /** ADR 024 state: the latest job (whose events form the transcript) and its events. */
   latestJob?: unknown;
   transcriptEvents?: unknown[];
@@ -220,6 +222,8 @@ function buildApp(opts: BuildAppOptions) {
     // existing deploy assertion keeps its original meaning.
     findLatestByProjectAndKinds: vi.fn(async () => opts.latestDeployJob ?? null),
     cancelActiveForFeature: vi.fn(async () => undefined),
+    // Issue #31: "Run now" refuses while this test already has a run in flight.
+    hasActiveRunForTest: vi.fn(async () => opts.testHasActiveRun ?? false),
   };
   const notifications = { create: vi.fn(async () => undefined) };
   const installations = {
@@ -1704,6 +1708,141 @@ describe("POST /projects/:projectId/features/:featureId/restart-from-message (AD
 // ADR 026 (issue #16): the standalone Testing product's per-Test run history.
 // Distinct from ADR 015's per-feature Testing tab, which the suite already
 // covers above — these are the project-level reads.
+/*
+ * Issue #31 part 2. A suite could only be triggered by its cron, so a user who
+ * fixed a failing test waited up to a full interval to learn whether the fix
+ * worked. ADR 026 skipped this on purpose — a new mutating endpoint means new
+ * authorization surface *and* an ADR 028 audit row — so both are asserted here,
+ * not just the happy path.
+ */
+describe("POST /projects/:projectId/tests/:testId/run (issue #31)", () => {
+  const TEST_ID = "33333333-3333-4333-8333-333333333333";
+
+  function ready(overrides: Partial<Parameters<typeof buildApp>[0]> = {}) {
+    const project = makeProject({ status: "ready" });
+    const built = buildApp({ project, ...overrides });
+    built.tests.findById.mockResolvedValue({
+      id: TEST_ID,
+      projectId: project.id,
+      name: "Nightly regression",
+    } as never);
+    return { project, ...built };
+  }
+
+  it("dispatches a run now, on the same terms as a scheduled one", async () => {
+    const { app, project, jobs } = ready();
+
+    const res = await authedRequest(app).post(`/projects/${project.id}/tests/${TEST_ID}/run`);
+
+    expect(res.status).toBe(201);
+    expect(res.body.jobId).toBe("job_1");
+    // Same kind, same ref, no feature — a manual run verifies what a scheduled
+    // run verifies, the project's default branch.
+    expect(jobs.create).toHaveBeenCalledWith({
+      projectId: project.id,
+      kind: "test_run",
+      testId: TEST_ID,
+      ref: "main",
+      trigger: "manual",
+    });
+  });
+
+  // The distinction the whole `trigger` field exists for: a run a person started
+  // must not be attributed to the scheduler in the history that shows it.
+  it("records the trigger as manual, not schedule", async () => {
+    const { app, project, jobs } = ready();
+
+    await authedRequest(app).post(`/projects/${project.id}/tests/${TEST_ID}/run`);
+
+    expect(jobs.create).toHaveBeenCalledWith(
+      expect.objectContaining({ trigger: "manual" }),
+    );
+    expect(jobs.create).not.toHaveBeenCalledWith(
+      expect.objectContaining({ trigger: "schedule" }),
+    );
+  });
+
+  // ADR 028: the scheduled dispatch is deliberately unaudited (no actor, one row
+  // per window); a manual one exists because a person decided it should.
+  it("records an audit row naming the actor and the run it produced", async () => {
+    const { app, project, audit } = ready();
+
+    await authedRequest(app).post(`/projects/${project.id}/tests/${TEST_ID}/run`);
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "test.run_triggered",
+        projectId: project.id,
+        actorUserId: OWNER_ID,
+        targetType: "test",
+        targetId: TEST_ID,
+        metadata: expect.objectContaining({ jobId: "job_1", ref: "main" }),
+      }),
+    );
+  });
+
+  // Authorization is the project-membership gate the neighbouring routes use,
+  // not a new capability — a member who may edit a test's schedule and delete the
+  // test may certainly run it. A caller with no access gets the same 404 as
+  // everywhere else, so project existence is not leaked either.
+  it("refuses a caller without access to the project, dispatching nothing", async () => {
+    const { app, jobs, tests } = ready();
+
+    const res = await authedRequest(app).post(
+      `/projects/99999999-9999-4999-8999-999999999999/tests/${TEST_ID}/run`,
+    );
+
+    expect(res.status).toBe(404);
+    expect(tests.findById).not.toHaveBeenCalled();
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("404s for a test that is not in this project", async () => {
+    const project = makeProject({ status: "ready" });
+    const { app, jobs, tests } = buildApp({ project });
+    tests.findById.mockResolvedValue(null);
+
+    const res = await authedRequest(app).post(`/projects/${project.id}/tests/${TEST_ID}/run`);
+
+    expect(res.status).toBe(404);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("409s before initialization completes, like the other test writes", async () => {
+    const project = makeProject({ status: "initializing" });
+    const { app, jobs, tests } = buildApp({ project });
+    tests.findById.mockResolvedValue({ id: TEST_ID } as never);
+
+    const res = await authedRequest(app).post(`/projects/${project.id}/tests/${TEST_ID}/run`);
+
+    expect(res.status).toBe(409);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  // A double-clicked button must not enqueue two identical runs. The scheduler
+  // gets this for free (one dispatch per test per tick); a manual trigger has no
+  // tick to lean on, so the guard is explicit.
+  it("409s when this test already has a run in flight", async () => {
+    const { app, project, jobs } = ready({ testHasActiveRun: true });
+
+    const res = await authedRequest(app).post(`/projects/${project.id}/tests/${TEST_ID}/run`);
+
+    expect(res.status).toBe(409);
+    expect(jobs.create).not.toHaveBeenCalled();
+    // And nothing is audited: the mutation did not happen, and ADR 028 records
+    // successful mutations only.
+  });
+
+  it("does not audit a run that was refused", async () => {
+    const { app, project, audit } = ready({ testHasActiveRun: true });
+
+    await authedRequest(app).post(`/projects/${project.id}/tests/${TEST_ID}/run`);
+
+    expect(audit.record).not.toHaveBeenCalled();
+  });
+});
+
 describe("GET /projects/:projectId/tests/:testId/runs", () => {
   function historyEntry(overrides: Record<string, unknown> = {}) {
     return {

@@ -2366,6 +2366,92 @@ export function createProjectsRouter(deps: {
     res.json(toPublicTest(test));
   });
 
+  /*
+   * Issue #31 (ADR 026 follow-up 4): dispatch this test now, without waiting for
+   * its schedule.
+   *
+   * Why it exists: a suite can otherwise only be triggered by its cron, so a user
+   * who fixes a failing test waits up to a full interval to find out whether the
+   * fix worked — for a daily schedule, that is a day per attempt. ADR 026 skipped
+   * this deliberately, because a new mutating endpoint means new authorization
+   * surface and an ADR 028 audit row, and both are below.
+   *
+   * **Authorization is the project-membership gate**, exactly like the CRUD routes
+   * beside it, not a new capability: a member who may edit a test's schedule and
+   * delete the test may certainly run it. (The `role_capabilities` matrix is still
+   * not wired into enforcement anywhere, so inventing a `test_run` capability here
+   * would create a permission nothing reads — ADR 018 item 7's precedent.)
+   *
+   * **The dispatch is identical to the scheduler's** — same kind, same
+   * `ref: "main"`, no feature — because a manual run verifies the same thing a
+   * scheduled one does: the project's default branch. `trigger: "manual"` is the
+   * only difference, and it is what keeps the run history honest (see migration
+   * 049).
+   */
+  router.post("/:projectId/tests/:testId/run", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const testId = parseFeatureId(routeParam(req.params.testId));
+    if (!testId) {
+      res.status(404).json({ error: "Test not found" });
+      return;
+    }
+
+    const test = await deps.tests.findById(project.id, testId);
+    if (!test) {
+      res.status(404).json({ error: "Test not found" });
+      return;
+    }
+
+    // The same gate the CRUD routes apply, for the same reason: a run needs a
+    // cluster and a resolvable model, and dispatching against a project that has
+    // neither would queue a job that cannot start. `POST /:projectId/tests`
+    // refuses on the same condition.
+    if (project.status !== "ready") {
+      res.status(409).json({
+        error: "Project initialization must complete before running tests",
+      });
+      return;
+    }
+
+    // One run of a test at a time, so a double-clicked button cannot enqueue two
+    // identical runs. 409 rather than a silent no-op: the caller asked for
+    // something that did not happen, and a 201 would claim it did.
+    if (await deps.jobs.hasActiveRunForTest(test.id)) {
+      res.status(409).json({ error: "This test already has a run in progress" });
+      return;
+    }
+
+    const job = await dispatchJob(deps.jobs, {
+      projectId: project.id,
+      kind: "test_run",
+      testId: test.id,
+      ref: "main",
+      trigger: "manual",
+    });
+
+    // Unlike the scheduled dispatch, this one is audited (ADR 028): the schedule
+    // has no actor to name and would add a row per window, whereas a manual run
+    // happened because a person decided it should. `testId` and the job id are
+    // both recorded — the first is what the actor acted on, the second is how to
+    // find the run they produced.
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.testRunTriggered,
+      targetType: "test",
+      targetId: test.id,
+      metadata: { name: test.name, jobId: job.id, ref: "main" },
+    });
+
+    res.status(201).json({ jobId: job.id });
+  });
+
   // ADR 026 (issue #16): a Test entity's own run history — the standalone
   // Testing product's view, as opposed to ADR 015's per-feature Testing tab
   // (`GET /:projectId/features/:featureId/testing`, below), which answers

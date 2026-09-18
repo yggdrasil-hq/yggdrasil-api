@@ -33,6 +33,19 @@ export const AUDIT_ACTIONS = {
    */
   deployRolledBack: "deploy.rolled_back",
 
+  /**
+   * Issue #31, ADR 026 follow-up 4: a person pressed "Run now" on a Test.
+   *
+   * Audited where the *scheduled* dispatch deliberately is not, and the
+   * distinction is the same one ADR 022 §8 draws for deploys: a scheduled run has
+   * no actor to name — the schedule is the actor, and it would add a row per
+   * window — whereas a manual run exists because a specific person decided the
+   * suite should run *now*. "Who started this, and why is it running at 3pm when
+   * it runs at 9am?" is exactly what a trail is for, and the `jobs` row answers
+   * neither question.
+   */
+  testRunTriggered: "test.run_triggered",
+
   // --- Features / the six-stage lifecycle (ADR 015) ---
   featureCreated: "feature.created",
   featureAdrApproved: "feature.adr_approved",
