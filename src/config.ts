@@ -166,6 +166,42 @@ export const config = {
       Number(process.env.RECORDING_SWEEP_INTERVAL_MS) || 15 * 60_000,
     ),
   },
+  /**
+   * Issue #22: per-step test-run screenshots.
+   *
+   * Deliberately a separate block from `recordings` rather than shared values,
+   * even though they annotate the same run and the defaults agree. Screenshots
+   * are three orders of magnitude smaller (a few hundred kB against tens of MB),
+   * so a project may reasonably keep them longer than the video — and the moment
+   * that is true, shared config would be the thing preventing it. The defaults
+   * agree so an operator sees one policy unless they choose otherwise.
+   *
+   * `maxBytes` bounds one file; `maxPerJob` bounds a run. Both are needed, and
+   * the second is not implied by the first: the number of steps is decided by
+   * the `##` headings in the project's own test markdown, so a spec with
+   * thousands of headings would be thousands of files. Bounded per file is not
+   * bounded per run.
+   *
+   * `contentTypes` is the accepted format whitelist and is deliberately not
+   * env-configurable: it is a security boundary (an SVG is a document that can
+   * carry script, and these bytes are served inline from our own origin), not a
+   * tuning knob. It lives here so the route's `express.raw` type filter, the
+   * rejection message and the table's CHECK constraint all read from one list.
+   */
+  screenshots: {
+    enabled: process.env.SCREENSHOTS_ENABLED !== "false",
+    contentTypes: ["image/png", "image/jpeg", "image/webp"],
+    maxBytes: Math.max(0, Math.floor(Number(process.env.SCREENSHOT_MAX_BYTES)) || 2_000_000),
+    maxPerJob: Math.max(0, Math.floor(Number(process.env.SCREENSHOT_MAX_PER_JOB)) || 50),
+    retentionDays: Math.max(
+      1,
+      Math.floor(Number(process.env.SCREENSHOT_RETENTION_DAYS)) || 30,
+    ),
+    sweepIntervalMs: Math.max(
+      1_000,
+      Math.floor(Number(process.env.SCREENSHOT_SWEEP_INTERVAL_MS)) || 15 * 60_000,
+    ),
+  },
   rateLimit: {
     perUsername: { max: 10, windowMs: 15 * 60 * 1000 },
     perIp: { max: 30, windowMs: 15 * 60 * 1000 },
