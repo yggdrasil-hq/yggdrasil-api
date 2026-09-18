@@ -19,6 +19,7 @@ import {
 } from "../secrets/model-config.js";
 import type { JobUsageRepository } from "../usage/repository.js";
 import { NOOP_LIVE_PUBLISHER, type LivePublisher } from "../live/deltas.js";
+import { config } from "../config.js";
 import { summarizeGrillTranscript } from "./grill-context.js";
 import { evaluateTestingGate } from "../features/testing-gate-runner.js";
 
@@ -203,9 +204,16 @@ export function createJobsInternalRouter(deps: {
    * deployment with the relay switched off can simply not pass one.
    */
   live?: LivePublisher;
+  /**
+   * Issue #24: total delta bytes relayed per job before its deltas stop being
+   * relayed. Optional purely so a test can drive the boundary without a config
+   * override; production takes `config.live.deltaBytesPerJob`.
+   */
+  deltaBytesPerJob?: number;
 }): Router {
   const router = Router();
   const live = deps.live ?? NOOP_LIVE_PUBLISHER;
+  const deltaBytesPerJob = deps.deltaBytesPerJob ?? config.live.deltaBytesPerJob;
 
   /**
    * ADR 023: records a finished job's token/cost accounting.
@@ -285,7 +293,7 @@ export function createJobsInternalRouter(deps: {
       // feature's subscribers assertable from outside.
       const delta = jobEventDeltaSchema.safeParse(req.body);
       if (delta.success) {
-        await publishDelta(deps, live, jobId, delta.data.message);
+        await publishDelta(deps, live, jobId, delta.data.message, deltaBytesPerJob);
         // 202, not 201: nothing was created. The caller cannot tell the
         // difference between a relayed delta and a dropped one, and that is
         // intended — deltas are best-effort and an error would report something
@@ -362,17 +370,62 @@ export function createJobsInternalRouter(deps: {
  * A job with no `feature_id` (ADR 014's project-scoped `design_grill`) has no
  * feature topic to route to and is dropped, exactly as the stored-event relay
  * drops one.
+ *
+ * **Issue #24's per-job ceiling lives here**, and this is the only place it can:
+ * it is the ingest for every delta, so it sees the whole of a job's stream
+ * regardless of which replica served the POST.
+ *
+ * What reaching the ceiling does — and deliberately does not — do:
+ *
+ *  - It stops relaying that job's deltas. Nothing is lost by doing so. The
+ *    authoritative `agent_text` for every message arrives over the stored-event
+ *    path and is what the Web app renders a finished bubble from; deltas only
+ *    make it appear sooner. So the ceiling costs immediacy, never content — the
+ *    same trade-off `EventAgentTextDelta` documents.
+ *  - It does **not** close subscribers' sockets, which is where it differs from
+ *    the per-socket frame budget. A runaway is the *producer's* problem: the
+ *    people watching the feature did nothing, and evicting them from live
+ *    updates for a job they are not running would be punishing the wrong party.
+ *  - It does **not** fail the job. The relay is an accelerator, not a control
+ *    plane, and failing a build because its narration got long would be a
+ *    spectacular overreach.
+ *
+ * The crossing is logged exactly once per job, using the `previousBytes` the
+ * atomic update returns rather than an in-memory set of already-warned jobs
+ * (which would grow without bound and would be per-replica, so it would log once
+ * per replica anyway).
  */
 async function publishDelta(
   deps: { jobs: JobRepository },
   live: LivePublisher,
   jobId: string,
   text: string,
+  maxBytesPerJob: number = config.live.deltaBytesPerJob,
 ): Promise<void> {
   try {
-    const job = await deps.jobs.findById(jobId);
-    if (!job || !job.featureId) return;
-    await live.publishDelta({ featureId: job.featureId, jobId, text });
+    const recorded = await deps.jobs.recordRelayedDeltaBytes(
+      jobId,
+      Buffer.byteLength(text),
+    );
+    if (!recorded || !recorded.featureId) return;
+
+    // `0` means the ceiling is switched off, matching the convention
+    // `RECORDING_MAX_BYTES` already sets in this codebase: 0 is a meaningful
+    // instruction (relay everything), not an unset value to be replaced by a
+    // default. Checked before the comparison so a 0 can never be read as "no
+    // bytes permitted".
+    if (maxBytesPerJob > 0 && recorded.totalBytes > maxBytesPerJob) {
+      if (recorded.previousBytes <= maxBytesPerJob) {
+        console.error(
+          `live relay: job ${jobId} exceeded the per-job delta ceiling ` +
+            `(${recorded.totalBytes} bytes > ${maxBytesPerJob}); its deltas are no longer relayed. ` +
+            `Nothing is lost — the authoritative agent_text still arrives over the stored-event path.`,
+        );
+      }
+      return;
+    }
+
+    await live.publishDelta({ featureId: recorded.featureId, jobId, text });
   } catch (error) {
     console.error(`failed to relay event delta for job ${jobId}:`, error);
   }

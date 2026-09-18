@@ -117,6 +117,62 @@ export class JobRepository {
     return result.rows[0] ? mapJob(result.rows[0]) : null;
   }
 
+  /**
+   * Issue #24: records `bytes` of relayed delta text against a job, atomically,
+   * and reports both the running total and the feature the text belongs to.
+   *
+   * Does the work `findById` used to do for the delta path — resolving which
+   * feature the streaming text is for — in the same statement that advances the
+   * counter, so the per-delta query count is unchanged. That is the whole reason
+   * this is an `UPDATE … RETURNING` rather than a read followed by a write.
+   *
+   * `previousBytes` is returned so the caller can log the ceiling crossing
+   * **exactly once per job** without keeping a set of already-warned job ids in
+   * memory (which would grow without bound — the same objection the migration
+   * raises to an in-memory counter). A caller compares `previousBytes <= ceiling
+   * && totalBytes > ceiling` to detect the transition.
+   *
+   * `null` means the job does not exist, which is the same "nothing to relay"
+   * outcome a job with no feature produces (its `featureId` comes back null), so
+   * the caller handles both by returning.
+   *
+   * Both parameters are cast. `$2` appears twice — as an addend and as a
+   * subtrahend — and without the casts Postgres has to deduce one type from a
+   * `bigint` addition and one from a bare arithmetic operand, which is the same
+   * shape as issue #43's `42P08 inconsistent types deduced for parameter`. That
+   * bug hid behind fakes for months; this one would have too.
+   */
+  async recordRelayedDeltaBytes(
+    jobId: string,
+    bytes: number,
+  ): Promise<{ featureId: string | null; totalBytes: number; previousBytes: number } | null> {
+    const result = await this.db.query<{
+      feature_id: string | null;
+      total_bytes: string | number;
+      previous_bytes: string | number;
+    }>(
+      `UPDATE jobs
+       SET delta_bytes = delta_bytes + $2::bigint
+       WHERE id = $1
+       RETURNING feature_id,
+                 delta_bytes AS total_bytes,
+                 (delta_bytes - $2::bigint) AS previous_bytes`,
+      [jobId, bytes],
+    );
+
+    const row = result.rows[0];
+    if (!row) return null;
+    return {
+      featureId: row.feature_id,
+      // pg returns bigint as a string to avoid precision loss above 2^53. These
+      // are byte counts, so the conversion is safe by many orders of magnitude —
+      // but it is done explicitly rather than left to `Number()` coercion
+      // somewhere downstream, where a string would silently change a `>`.
+      totalBytes: Number(row.total_bytes),
+      previousBytes: Number(row.previous_bytes),
+    };
+  }
+
   async findByIdForProject(projectId: string, jobId: string): Promise<Job | null> {
     const result = await this.db.query<JobRow>(
       `SELECT ${jobColumns}

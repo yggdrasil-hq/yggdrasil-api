@@ -8,9 +8,11 @@ import type { ProjectRepository } from "../projects/repository.js";
 import type { UserRepository } from "../users/repository.js";
 import { readCookie } from "./cookies.js";
 import { authorizeSubscription } from "./authorization.js";
+import { FrameBudget, type FrameBudgetOptions } from "./limits.js";
 import type { LiveConnection, LiveHub } from "./hub.js";
 import {
   LIVE_CLOSE_PROTOCOL,
+  LIVE_CLOSE_RATE_LIMITED,
   LIVE_CLOSE_UNAUTHORIZED,
   LIVE_PROTOCOL_VERSION,
   LIVE_SOCKET_PATH,
@@ -37,6 +39,14 @@ export interface LiveSocketDeps {
   hub: LiveHub;
   onError?: (message: string) => void;
   path?: string;
+  /**
+   * Issue #24: budget options every accepted connection gets its own instance
+   * of. Options rather than a shared `FrameBudget`, because a bucket is
+   * per-connection state — sharing one would make the limit a cap on the whole
+   * process's frame rate, which is not what is being bounded. Defaults to the
+   * configured limits; injected by tests.
+   */
+  frameBudget?: FrameBudgetOptions;
 }
 
 export interface LiveSocketServer {
@@ -72,6 +82,10 @@ interface AuthedConnection extends LiveConnection {
  */
 export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
   const report = deps.onError ?? ((message: string) => console.error(message));
+  const frameBudget: FrameBudgetOptions = deps.frameBudget ?? {
+    burst: config.live.frameBurst,
+    perSecond: config.live.framesPerSecond,
+  };
   const wss = new WebSocketServer({
     server: deps.server,
     path: deps.path ?? LIVE_SOCKET_PATH,
@@ -104,6 +118,14 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
     }
 
     let protocolErrors = 0;
+    /**
+     * Issue #24: this connection's own frame budget. See `limits.ts` for why the
+     * limit is consulted here, in `send`, rather than in the hub's fan-out —
+     * briefly, because this is the one path every outbound frame takes, including
+     * the `pong` reply to a client's own `ping`, which is the only frame rate a
+     * client controls outright.
+     */
+    const budget = new FrameBudget(frameBudget);
     const connection: AuthedConnection = {
       // Unique per socket, so two tabs of one user are two connections the hub
       // can clean up independently (ADR 019 item 9). The user id is prefixed
@@ -116,6 +138,23 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
           // dead connection and prunes it, which is what keeps half-closed tabs
           // from accumulating in the fan-out sets.
           throw new Error("socket is not open");
+        }
+        if (!budget.take()) {
+          // Closing, deliberately, rather than skipping the frame — see the long
+          // note on `FrameBudget` for why. The short version: the Web app's REST
+          // poll is a complete state path, so a closed socket costs the user
+          // immediacy and never content, while a silent drop would be
+          // invisible to both the client and the operator.
+          //
+          // The throw matters as much as the close: it is what makes the hub
+          // prune this connection from its topics, so the budget bounds the
+          // *fan-out work* as well as the socket's send cost. Without it, every
+          // later event would still iterate this connection and be refused.
+          report(
+            `live socket ${connection.id} exceeded its frame budget (${frameBudget.perSecond}/s, burst ${frameBudget.burst}); closing`,
+          );
+          reject(socket, "rate limited", LIVE_CLOSE_RATE_LIMITED);
+          throw new Error("frame budget exhausted");
         }
         socket.send(JSON.stringify(frame));
       },

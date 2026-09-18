@@ -7,6 +7,7 @@ import { LiveHub } from "./hub.js";
 import { LIVE_MAX_PROTOCOL_ERRORS, createLiveSocketServer } from "./socket.js";
 import {
   LIVE_CLOSE_PROTOCOL,
+  LIVE_CLOSE_RATE_LIMITED,
   LIVE_CLOSE_UNAUTHORIZED,
   LIVE_PROTOCOL_VERSION,
   LIVE_SOCKET_PATH,
@@ -38,7 +39,11 @@ afterEach(async () => {
  */
 async function withRelay(
   run: (context: { port: number; hub: LiveHub }) => Promise<void>,
-  options: { onError?: (message: string) => void } = {},
+  options: {
+    onError?: (message: string) => void;
+    /** Issue #24: injected so the frame budget's boundary is exercised, not waited on. */
+    frameBudget?: { burst: number; perSecond: number };
+  } = {},
 ) {
   const server = createServer((_req, res) => {
     res.writeHead(404);
@@ -82,6 +87,7 @@ async function withRelay(
     projects: projects as never,
     features: features as never,
     onError: options.onError,
+    frameBudget: options.frameBudget,
   });
 
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -124,6 +130,23 @@ function connect(port: number, cookie?: string): Client {
     closed: () => closeInfo,
     send: (frame) => socket.send(JSON.stringify(frame)),
   };
+}
+
+/**
+ * Connects, waits for the handshake, and subscribes to the fixture feature.
+ *
+ * Two frames pass through the connection's budget before this resolves (`ready`
+ * and `subscribed`), which the frame-budget tests below have to account for —
+ * hence one helper rather than the same three lines repeated, where a forgotten
+ * `subscribe` would make `hub.publish` return 0 for the wrong reason and the
+ * assertion would pass while testing nothing.
+ */
+async function subscribedClient(port: number): Promise<Client> {
+  const client = connect(port, GOOD_COOKIE);
+  await waitFor(() => client.frames.length > 0, "ready");
+  client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+  await waitFor(() => client.frames.some((frame) => frame.type === "subscribed"), "subscribed");
+  return client;
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
@@ -428,5 +451,122 @@ describe("live socket: connection identity", () => {
       expect(frames.some((frame) => frame.type === "subscribed")).toBe(false);
       expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(0);
     });
+  });
+});
+
+/*
+ * Issue #24: the per-socket frame budget. Driven through a real socket rather
+ * than a fake connection object, because the decision under test is what the
+ * *client* experiences — a close with a code it can act on — and because the
+ * budget lives inside `connection.send`, which only the real server path
+ * exercises.
+ *
+ * These are the three boundary cases the issue asks for (under, at, over),
+ * plus the chosen failure behaviour.
+ */
+describe("live socket frame budget (issue #24)", () => {
+  it("delivers up to the budget and then closes with the rate-limit code", async () => {
+    await withRelay(
+      async ({ port, hub }) => {
+        const client = await subscribedClient(port);
+
+        // The bucket starts full at `burst`. `ready` and `subscribed` are the two
+        // frames already spent through it, so exactly `burst - 2` more are served.
+        const burst = 5;
+        for (let i = 0; i < burst - 2; i += 1) {
+          expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame()), `publish ${i + 1}`).toBe(1);
+        }
+
+        // The next one is over budget: it is not delivered, and it closes the
+        // connection rather than being silently skipped.
+        expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(0);
+
+        await waitFor(() => client.closed() !== null, "close");
+        expect(client.closed()?.code).toBe(LIVE_CLOSE_RATE_LIMITED);
+      },
+      { frameBudget: { burst: 5, perSecond: 1 } },
+    );
+  });
+
+  it("counts the frames the budget was spent on, not the publishes that followed", async () => {
+    // The load-bearing consequence of `send` throwing: the hub prunes the
+    // connection, so the budget bounds *fan-out work* as well as send cost.
+    // Without the throw, every later publish would still iterate this socket.
+    await withRelay(
+      async ({ port, hub }) => {
+        const client = await subscribedClient(port);
+
+        // `ready` and `subscribed` spent two of the three tokens; the third
+        // delivers, and the next trips the budget.
+        expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(1);
+        expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(0);
+        await waitFor(() => client.closed() !== null, "close");
+
+        // The pruning is the point: the socket is gone from the topic's
+        // subscriber set, which is what every later publish would otherwise
+        // iterate. A budget that only refused at send time would leave the work
+        // growing with the number of exhausted sockets.
+        expect(hub.subscriberCount(`feature:${FEATURE_ID}`)).toBe(0);
+        expect(hub.connectionCount()).toBe(0);
+      },
+      { frameBudget: { burst: 3, perSecond: 1 } },
+    );
+  });
+
+  it("does not close a socket that stays under budget", async () => {
+    // The budget must be invisible to ordinary use. A sustained rate of 1000/s
+    // with a large burst is far above anything the product produces, so nothing
+    // here should trip it however many frames are published.
+    await withRelay(
+      async ({ port, hub }) => {
+        const client = await subscribedClient(port);
+
+        for (let i = 0; i < 50; i += 1) {
+          expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame()), `publish ${i}`).toBe(1);
+        }
+
+        expect(client.closed()).toBeNull();
+      },
+      { frameBudget: { burst: 500, perSecond: 1000 } },
+    );
+  });
+
+  it("bounds a client's own ping flood, which is the frame rate it controls outright", async () => {
+    // A client can send `ping` as fast as it likes and gets a `pong` for each —
+    // the one outbound frame rate a client fully controls. Budgeting in `send`
+    // rather than in the hub's fan-out is what catches this; a budget in the hub
+    // would never see a pong.
+    await withRelay(
+      async ({ port }) => {
+        const client = connect(port, GOOD_COOKIE);
+        await waitFor(() => client.frames.length > 0, "ready");
+
+        for (let i = 0; i < 20; i += 1) client.send({ type: "ping" });
+
+        await waitFor(() => client.closed() !== null, "close");
+        expect(client.closed()?.code).toBe(LIVE_CLOSE_RATE_LIMITED);
+      },
+      { frameBudget: { burst: 5, perSecond: 1 } },
+    );
+  });
+
+  it("reports the limit it enforced, so an operator can tell which knob to turn", async () => {
+    const reported: string[] = [];
+    await withRelay(
+      async ({ port, hub }) => {
+        const client = await subscribedClient(port);
+
+        // `ready` and `subscribed` spent two of the three; the first publish
+        // delivers and the second trips it.
+        hub.publish(`feature:${FEATURE_ID}`, jobEventFrame());
+        hub.publish(`feature:${FEATURE_ID}`, jobEventFrame());
+        expect(client.closed()).toBeNull();
+        await waitFor(() => client.closed() !== null, "close");
+        await waitFor(() => reported.length > 0, "the report");
+      },
+      { onError: (message) => reported.push(message), frameBudget: { burst: 3, perSecond: 7 } },
+    );
+
+    expect(reported.some((m) => m.includes("frame budget") && m.includes("7/s"))).toBe(true);
   });
 });
