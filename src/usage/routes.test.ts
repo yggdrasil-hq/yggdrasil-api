@@ -2,7 +2,10 @@ import cookieParser from "cookie-parser";
 import express from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
-import { createUsageRouter } from "./routes.js";
+import {
+  createOrganizationUsageRouter,
+  createProjectUsageRouter,
+} from "./routes.js";
 import type { SessionRecord } from "../auth/sessions.js";
 import type { User } from "../users/types.js";
 
@@ -67,29 +70,42 @@ function buildApp(overrides: {
     recentSessions: [],
   }));
 
-  app.use(
-    createUsageRouter({
-      users: { findById: vi.fn(async () => ({ id: USER_ID } as User)) } as never,
-      sessions: {
-        findValid: vi.fn(async () => ({ id: "sess_1", userId: USER_ID } as SessionRecord)),
-        touch: vi.fn(async () => undefined),
-      } as never,
-      organizations: { roleForUser: vi.fn(async () => role) } as never,
-      projects: {
-        findByIdForUser: vi.fn(async () =>
-          overrides.projectAccessible === false
-            ? null
-            : { id: PROJECT_ID, organizationId: ORG_ID },
-        ),
-      } as never,
-      usage: {
-        organizationUsage,
-        organizationAnalytics,
-        projectUsage,
-        projectAnalytics,
-      } as never,
-    }),
-  );
+  // Mounted exactly as `app.ts` does — at the scope prefixes, not at root.
+  //
+  // Issue #56: this used to mount a single router at **root**, which was the one
+  // arrangement that made the routes' then-absolute paths resolve. The app
+  // mounted the same router at `/organizations` and `/projects`, so every route
+  // was served at a doubled path and all four 404'd; these tests passed because
+  // they mounted the one way the paths happened to work. Mirroring the real
+  // mounts is the point — a unit test that wires the router differently from the
+  // application cannot detect a wiring bug, which is all this one was.
+  //
+  // `src/app.routing.test.ts` asserts the same paths against `createApp()`, so
+  // the wiring is covered even if this file drifts again.
+  const usageDeps = {
+    users: { findById: vi.fn(async () => ({ id: USER_ID } as User)) } as never,
+    sessions: {
+      findValid: vi.fn(async () => ({ id: "sess_1", userId: USER_ID } as SessionRecord)),
+      touch: vi.fn(async () => undefined),
+    } as never,
+    organizations: { roleForUser: vi.fn(async () => role) } as never,
+    projects: {
+      findByIdForUser: vi.fn(async () =>
+        overrides.projectAccessible === false
+          ? null
+          : { id: PROJECT_ID, organizationId: ORG_ID },
+      ),
+    } as never,
+    usage: {
+      organizationUsage,
+      organizationAnalytics,
+      projectUsage,
+      projectAnalytics,
+    } as never,
+  };
+
+  app.use("/organizations", createOrganizationUsageRouter(usageDeps));
+  app.use("/projects", createProjectUsageRouter(usageDeps));
 
   return { app, organizationUsage, organizationAnalytics, projectUsage, projectAnalytics };
 }
