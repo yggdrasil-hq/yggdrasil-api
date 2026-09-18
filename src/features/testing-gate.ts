@@ -51,7 +51,16 @@ import type { TestRunExecution } from "../tests/report-types.js";
  */
 
 export type TestingGateState =
-  /** No runs exist at all — nothing to decide on. */
+  /**
+   * No runs exist, and something *could* have produced one — so this is not a
+   * decision, it is a wait. Either the dispatch is in flight (the state between
+   * `setTesting` and the probe rows appearing) or it failed, and in both cases
+   * advancing would move a feature on with nothing having checked it.
+   *
+   * Contrast `advance` reached from an empty run list via `nothingToVerify`,
+   * which is the case issue #63 adds: no runs exist *because none were possible*
+   * on this installation, and there is genuinely nothing to verify.
+   */
   | "not_run"
   /** At least one run is pending or running. */
   | "in_progress"
@@ -68,8 +77,30 @@ export type TestingGateState =
 
 export interface TestingGateDecision {
   state: TestingGateState;
-  /** Present for `returned` and `errored`, absent otherwise. */
+  /**
+   * Why, when the state alone does not say it. Present for `returned` and
+   * `errored`, and for the `advance` that comes from `nothingToVerify` — that
+   * one carries a reason because "advanced with no test runs" is otherwise
+   * indistinguishable in the record from "advanced because everything passed",
+   * and those are very different claims to a reader of the feature's history.
+   */
   reason?: string;
+}
+
+/** Inputs beyond the run list, all defaulted so the pure decision still is. */
+export interface TestingGateInputs {
+  /**
+   * True when this installation could not have produced *any* run for this
+   * feature — no enabled Test entities, and no image for the script groups
+   * (issue #63).
+   *
+   * Defaults to false, which is the pre-#63 behaviour and the safe direction: an
+   * installation that has not reported its capabilities is treated as capable, so
+   * an empty run list stays a wait rather than becoming an advance. Getting this
+   * backwards would advance features on installations where testing simply had not
+   * been dispatched yet.
+   */
+  nothingToVerify?: boolean;
 }
 
 /** Unit / Integration / Agentic — how a group is named in a sentence. */
@@ -170,8 +201,28 @@ function unreportedFailure(run: TestRunExecution): string | null {
  * the reason names the earliest failure rather than whichever the database
  * happened to return last.
  */
-export function decideTestingOutcome(runs: TestRunExecution[]): TestingGateDecision {
-  if (runs.length === 0) return { state: "not_run" };
+export function decideTestingOutcome(
+  runs: TestRunExecution[],
+  inputs: TestingGateInputs = {},
+): TestingGateDecision {
+  if (runs.length === 0) {
+    // Issue #63's case, and the reason it had to be distinguished rather than
+    // collapsed: a feature whose only testing would have been the script probes
+    // gets no runs at all on an install that cannot run them, and returning
+    // `not_run` there wedges it in `testing` forever — reintroducing exactly what
+    // #40 removed, by a different route. There is nothing to verify, so it
+    // advances, and it says so.
+    if (inputs.nothingToVerify) {
+      return {
+        state: "advance",
+        reason:
+          "No testing could be run for this feature on this installation — it has no enabled " +
+          "Tests, and this installation cannot run the script test groups — so there was " +
+          "nothing to verify.",
+      };
+    }
+    return { state: "not_run" };
+  }
   if (runs.some(isInFlight)) return { state: "in_progress" };
 
   // Real evidence about the code outranks everything else, including a group

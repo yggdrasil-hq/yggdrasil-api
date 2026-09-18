@@ -38,6 +38,7 @@ import { JobRepository } from "./jobs/repository.js";
 import { JobEventRepository } from "./jobs/events-repository.js";
 import { JobMessageRepository } from "./jobs/messages-repository.js";
 import { createJobsInternalRouter } from "./jobs/internal-routes.js";
+import { JobKindCapabilityRepository } from "./jobs/capabilities.js";
 import { NotificationRepository } from "./notifications/repository.js";
 import { createNotificationsRouter } from "./notifications/routes.js";
 import { createNotificationPreferencesRouter } from "./notifications/preferences-routes.js";
@@ -410,6 +411,10 @@ export function createApp(deps?: AppDependencies): Express {
       designs,
       usage: jobUsage,
       live: deps.live ?? NOOP_LIVE_PUBLISHER,
+      // Issue #63: so `submit_build_result` can skip a script probe the
+      // installation cannot run. Empty until the Orchestrator publishes, which
+      // means every install keeps dispatching exactly as it did before.
+      capabilities: new JobKindCapabilityRepository(deps.pool),
       modelConfig: {
         secrets,
         featureSecrets: featureModelSecrets,

@@ -70,6 +70,12 @@ function build(overrides: {
   runs?: TestRunExecution[];
   agenticReviewEnabled?: boolean;
   setAgenticReview?: ReturnType<typeof vi.fn>;
+  /** Issue #63: kinds the installation has reported it cannot run. */
+  unrunnable?: string[];
+  /** Issue #63: the project's enabled Test entities. */
+  enabledTests?: number;
+  /** Issue #63: force the capability read to reject. */
+  capabilitiesThrow?: boolean;
 } = {}) {
   const setReturned = vi.fn(async () => null);
   const updateStatus = vi.fn(async () => null);
@@ -81,12 +87,25 @@ function build(overrides: {
     agenticReviewEnabled: overrides.agenticReviewEnabled ?? true,
   }));
 
+  const unrunnable = vi.fn(async () => new Set<string>(overrides.unrunnable ?? []));
+  const listEnabledByProject = vi.fn(async () =>
+    Array.from({ length: overrides.enabledTests ?? 0 }, (_, i) => ({ id: `test_${i}` })),
+  );
+
   const deps = {
     features: { findById, setReturned, updateStatus, setInReview, setAgenticReview },
     jobs: { create: jobsCreate, listFeatureTestRuns: vi.fn(async () => []) },
     projects: { findById: projectsFindById },
     testRunReports: {
       listByFeature: vi.fn(async () => overrides.runs ?? []),
+    },
+    tests: { listEnabledByProject },
+    capabilities: {
+      unrunnable: overrides.capabilitiesThrow
+        ? vi.fn(async () => {
+            throw new Error("connection terminated");
+          })
+        : unrunnable,
     },
   } as unknown as TestingGateDeps;
 
@@ -99,6 +118,8 @@ function build(overrides: {
     jobsCreate,
     findById,
     projectsFindById,
+    unrunnable,
+    listEnabledByProject,
   };
 }
 
@@ -221,6 +242,82 @@ describe("evaluateTestingGate", () => {
 
     expect((await evaluateTestingGate(deps, PROJECT_ID, FEATURE_ID)).outcome).toBe("advanced");
     expect(jobsCreate).not.toHaveBeenCalled();
+  });
+
+  /*
+   * Issue #63. The gate has to tell "no runs yet" from "no runs possible", and
+   * it can only do the second with the installation's capabilities plus the
+   * project's enabled Tests. Each case below is one half of that pair, because
+   * needing both is the part that is easy to get wrong in either direction: too
+   * eager advances a feature that could have been tested, too timid trips the
+   * wedge.
+   */
+  it("advances a feature with nothing to verify, and says why", async () => {
+    const { deps, setAgenticReview, unrunnable, listEnabledByProject } = build({
+      runs: [],
+      unrunnable: ["script_test_run"],
+      enabledTests: 0,
+    });
+
+    const result = await evaluateTestingGate(deps, PROJECT_ID, FEATURE_ID);
+
+    expect(result.outcome).toBe("advanced");
+    expect(result.reason).toContain("nothing to verify");
+    expect(setAgenticReview).toHaveBeenCalledWith(FEATURE_ID);
+    // Both halves of the condition were actually consulted.
+    expect(unrunnable).toHaveBeenCalled();
+    expect(listEnabledByProject).toHaveBeenCalledWith(PROJECT_ID);
+  });
+
+  it("waits rather than advancing when the project has an enabled Test", async () => {
+    // One enabled Test means `submit_build_result` dispatches a `test_run`, so a
+    // run was possible and the empty list is a wait — advancing here would skip
+    // a real check.
+    const { deps, setAgenticReview } = build({
+      runs: [],
+      unrunnable: ["script_test_run"],
+      enabledTests: 1,
+    });
+
+    expect((await evaluateTestingGate(deps, PROJECT_ID, FEATURE_ID)).outcome).toBe("not_run");
+    expect(setAgenticReview).not.toHaveBeenCalled();
+  });
+
+  it("waits when the installation can run the script groups", async () => {
+    // Capable ⇒ the probes were dispatched ⇒ an empty list means they have not
+    // reported yet.
+    const { deps, setAgenticReview, listEnabledByProject } = build({
+      runs: [],
+      unrunnable: [],
+      enabledTests: 0,
+    });
+
+    expect((await evaluateTestingGate(deps, PROJECT_ID, FEATURE_ID)).outcome).toBe("not_run");
+    expect(setAgenticReview).not.toHaveBeenCalled();
+    // Short-circuits on the capability read: no reason to ask about Tests when
+    // the probes are runnable.
+    expect(listEnabledByProject).not.toHaveBeenCalled();
+  });
+
+  it("waits when the capability read fails, rather than advancing on an error", async () => {
+    // The failure direction matters: this runs inside the reconcile tick, where
+    // an exception would abandon the whole pass — so it must not become
+    // "nothing to verify", which would advance a feature because a query failed.
+    const { deps, setAgenticReview } = build({ runs: [], capabilitiesThrow: true });
+
+    expect((await evaluateTestingGate(deps, PROJECT_ID, FEATURE_ID)).outcome).toBe("not_run");
+    expect(setAgenticReview).not.toHaveBeenCalled();
+  });
+
+  it("waits when no capabilities are wired at all", async () => {
+    // Every caller before #63, and every deployment whose Orchestrator does not
+    // publish: the null object reports nothing unrunnable, so nothing advances on
+    // a capability that was never reported.
+    const { deps, setAgenticReview } = build({ runs: [], enabledTests: 0 });
+    delete (deps as { capabilities?: unknown }).capabilities;
+
+    expect((await evaluateTestingGate(deps, PROJECT_ID, FEATURE_ID)).outcome).toBe("not_run");
+    expect(setAgenticReview).not.toHaveBeenCalled();
   });
 
   // setAgenticReview is guarded on `testing` and returns null if another path
