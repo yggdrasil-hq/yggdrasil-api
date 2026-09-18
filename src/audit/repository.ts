@@ -1,5 +1,6 @@
 import type pg from "pg";
 import {
+  AUDIT_EVENTS_ALIAS,
   buildAuditWhere,
   type AuditEvent,
   type AuditEventInput,
@@ -28,7 +29,16 @@ interface AuditEventWithNamesRow extends AuditEventRow {
   actor_display_name: string | null;
 }
 
-/** Columns shared by every read, so the two queries can't drift. */
+/**
+ * Columns shared by every read, so the two queries can't drift.
+ *
+ * The `e.` prefix is `AUDIT_EVENTS_ALIAS`, which every query below must use as
+ * the alias for `audit_events` — `buildAuditWhere` qualifies its predicates with
+ * that same name, and the two disagreeing is issue #61: an unqualified
+ * `organization_id` resolved in the join-free count query and was ambiguous in
+ * the joined page query, so every audit read 500'd. The alias is a contract
+ * between this file and `types.ts`, not a local naming choice.
+ */
 const EVENT_COLUMNS = `
   e.id, e.organization_id, e.project_id, e.actor_user_id, e.actor_kind,
   e.action, e.target_type, e.target_id, e.metadata, e.ip, e.created_at
@@ -105,17 +115,17 @@ export class AuditEventRepository {
               p.name AS project_name,
               u.username AS actor_username,
               u.display_name AS actor_display_name
-         FROM audit_events e
-         LEFT JOIN projects p ON p.id = e.project_id
-         LEFT JOIN users u ON u.id = e.actor_user_id
+         FROM audit_events ${AUDIT_EVENTS_ALIAS}
+         LEFT JOIN projects p ON p.id = ${AUDIT_EVENTS_ALIAS}.project_id
+         LEFT JOIN users u ON u.id = ${AUDIT_EVENTS_ALIAS}.actor_user_id
         WHERE ${clause}
-        ORDER BY e.created_at DESC, e.id DESC
+        ORDER BY ${AUDIT_EVENTS_ALIAS}.created_at DESC, ${AUDIT_EVENTS_ALIAS}.id DESC
         LIMIT $${values.length + 1} OFFSET $${values.length + 2}`,
       [...values, options.limit, options.offset],
     );
 
     const countQuery = this.db.query<{ count: string }>(
-      `SELECT COUNT(*)::text AS count FROM audit_events e WHERE ${clause}`,
+      `SELECT COUNT(*)::text AS count FROM audit_events ${AUDIT_EVENTS_ALIAS} WHERE ${clause}`,
       values,
     );
 

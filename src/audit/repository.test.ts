@@ -2,7 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import type pg from "pg";
 import { AuditEventRepository } from "./repository.js";
 import { AUDIT_ACTIONS } from "./actions.js";
-import { AUDIT_DEFAULT_LIMIT, buildAuditWhere, escapeLikePattern } from "./types.js";
+import {
+  AUDIT_DEFAULT_LIMIT,
+  AUDIT_EVENTS_ALIAS,
+  buildAuditWhere,
+  escapeLikePattern,
+} from "./types.js";
 
 const ORG_ID = "22222222-2222-4222-8222-222222222222";
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
@@ -182,7 +187,10 @@ describe("AuditEventRepository.listForOrganization", () => {
     const [listSql, listValues] = query.mock.calls.find(
       ([sql]) => !(sql as string).includes("COUNT(*)"),
     ) as [string, unknown[]];
-    expect(listSql).toContain("organization_id = $1");
+    // `e.`-qualified — see the block comment above the buildAuditWhere suite.
+    // Unqualified, this same string belongs to a query that joins `projects`,
+    // which also has `organization_id`, and Postgres rejects it as ambiguous.
+    expect(listSql).toContain("e.organization_id = $1");
     expect(listSql).toContain("LIMIT $2 OFFSET $3");
     expect(listValues).toEqual([ORG_ID, 25, 50]);
   });
@@ -219,11 +227,14 @@ describe("AuditEventRepository.listForOrganization", () => {
       (sql as string).includes("COUNT(*)"),
     ) as [string, unknown[]];
 
-    expect(listCall[0]).toContain("project_id = $2");
-    expect(listCall[0]).toContain("actor_user_id = $3");
-    expect(listCall[0]).toContain("action LIKE $4");
-    expect(listCall[0]).toContain("created_at >= $5");
-    expect(listCall[0]).toContain("created_at <= $6");
+    expect(listCall[0]).toContain("e.project_id = $2");
+    expect(listCall[0]).toContain("e.actor_user_id = $3");
+    expect(listCall[0]).toContain("e.action LIKE $4");
+    // `created_at` is the one that would still bite after a partial fix: it
+    // exists on all three joined tables, so the date filters break exactly the
+    // way the org filter did.
+    expect(listCall[0]).toContain("e.created_at >= $5");
+    expect(listCall[0]).toContain("e.created_at <= $6");
     expect(listCall[1]).toEqual([...expectedWhereValues, 10, 0]);
 
     // The count query carries the same filters but no pagination.
@@ -244,17 +255,48 @@ describe("AuditEventRepository.listForOrganization", () => {
   });
 });
 
+/*
+ * Issue #61: these assertions used to pin the *unqualified* form
+ * (`"organization_id = $1"`), which is why the suite stayed green while every
+ * audit read 500'd. The predicates are now alias-qualified, so the expected
+ * strings changed — that is the fix, not a weakened assertion, and the comment
+ * is here because a diff like this reads as test-fiddling otherwise.
+ *
+ * What these cases can and cannot prove is worth being explicit about: they
+ * check the clause *string*, and a string assertion is what missed the bug in
+ * the first place. The qualification is only actually verified by executing the
+ * joined query, which the Postgres-backed suite below does.
+ */
 describe("buildAuditWhere", () => {
   it("scopes to the organization alone when no filters are given", () => {
     expect(buildAuditWhere(ORG_ID, {})).toEqual({
-      clause: "organization_id = $1",
+      clause: "e.organization_id = $1",
       values: [ORG_ID],
     });
   });
 
+  it("qualifies every predicate so a joined query cannot be ambiguous", () => {
+    // The durable guard: enumerated rather than spot-checked, so adding an
+    // unqualified predicate later fails here. `AUDIT_EVENTS_ALIAS` is asserted
+    // rather than the literal `e` so renaming the alias does not need this test
+    // edited in lockstep — only *unqualified* columns do.
+    const { clause } = buildAuditWhere(ORG_ID, {
+      projectId: PROJECT_ID,
+      actorUserId: USER_ID,
+      action: "project",
+      from: new Date("2026-09-01T00:00:00.000Z"),
+      to: new Date("2026-09-30T00:00:00.000Z"),
+    });
+
+    for (const predicate of clause.split(" AND ")) {
+      expect(predicate.startsWith(`${AUDIT_EVENTS_ALIAS}.`)).toBe(true);
+    }
+    expect(clause.split(" AND ")).toHaveLength(6);
+  });
+
   it("treats the action filter as a prefix match", () => {
     const { clause, values } = buildAuditWhere(ORG_ID, { action: "org.invite" });
-    expect(clause).toContain("action LIKE $2 ESCAPE");
+    expect(clause).toContain("e.action LIKE $2 ESCAPE");
     expect(values[1]).toBe("org.invite%");
   });
 
@@ -270,7 +312,7 @@ describe("buildAuditWhere", () => {
       actorUserId: OTHER_USER_ID,
     });
     expect(clause).toBe(
-      "organization_id = $1 AND project_id = $2 AND actor_user_id = $3",
+      "e.organization_id = $1 AND e.project_id = $2 AND e.actor_user_id = $3",
     );
   });
 });
