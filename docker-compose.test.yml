@@ -26,6 +26,13 @@ services:
       dockerfile: deploy/Dockerfile.test
     volumes:
       - ./test-results:/app/test-results
+    # Issue #30: the object-storage contract tests in src/storage/client.test.ts
+    # talk to this MinIO, so the service has to be started before them. No
+    # healthcheck, deliberately: the MinIO image does not reliably ship an HTTP
+    # client binary, so a shell-based check would either always pass or always
+    # fail depending on the tag. The test polls `ensureBucket` instead — the same
+    # operation it is about to exercise — which is a readiness probe that cannot
+    # drift from what it is probing for.
     environment:
       NODE_ENV: test
       DATABASE_URL: postgresql://test:test@postgres:5432/yggdrasil_test
@@ -34,6 +41,16 @@ services:
       S3_SECRET_KEY: minioadmin
       S3_BUCKET: test
       S3_FORCE_PATH_STYLE: "true"
+    # Issue #30: the object-storage contract tests in
+    # src/storage/client.test.ts talk to the MinIO service below, so it has to
+    # be started before them. Deliberately `service_started` rather than a
+    # healthcheck condition: the MinIO image does not reliably ship an HTTP
+    # client binary, so a shell-based check would either always pass or always
+    # fail depending on the tag. The test polls `ensureBucket` instead — the
+    # same operation it is about to exercise — which is a readiness probe that
+    # cannot drift from what it is probing for.
     depends_on:
       postgres:
         condition: service_healthy
+      minio:
+        condition: service_started

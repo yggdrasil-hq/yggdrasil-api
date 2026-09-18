@@ -17,6 +17,7 @@ import { startRecordingSweep } from "./recordings/sweep.js";
 import { JobScreenshotRepository } from "./screenshots/repository.js";
 import { startScreenshotSweep } from "./screenshots/sweep.js";
 import { startScheduler } from "./scheduling/scheduler.js";
+import { createObjectStorage } from "./storage/client.js";
 import { startTestingGateReconcile } from "./features/testing-gate-reconcile.js";
 import { UserRepository } from "./users/repository.js";
 
@@ -101,9 +102,17 @@ async function main(): Promise<void> {
   // scheduler above, and safe with several replicas (the purge is idempotent).
   // Without this, "retention" would be a policy nothing enforces, and the
   // recordings table would grow without bound.
+  // The sweeps need the same storage client the routes use, because reclaiming
+  // an object-backed artifact is a delete against the bucket rather than an
+  // UPDATE (issue #30) — a sweep constructed without it would tombstone rows
+  // whose bytes it never removed.
+  const sweepStorage = createObjectStorage(
+    config.storage.configured ? config.storage : null,
+  );
+
   if (config.recordings.enabled) {
     startRecordingSweep(
-      new JobRecordingRepository(pool),
+      new JobRecordingRepository(pool, sweepStorage),
       config.recordings.sweepIntervalMs,
       (message) => console.error(message),
     );
@@ -116,7 +125,7 @@ async function main(): Promise<void> {
   // that raising one silently changed the other's cadence.
   if (config.screenshots.enabled) {
     startScreenshotSweep(
-      new JobScreenshotRepository(pool),
+      new JobScreenshotRepository(pool, sweepStorage),
       config.screenshots.sweepIntervalMs,
       (message) => console.error(message),
     );
