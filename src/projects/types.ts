@@ -57,6 +57,20 @@ export interface PublicProject {
   agenticReviewEnabled: boolean;
   uploadedExtensionsEnabled: boolean;
   hasDesignSurface: boolean;
+  /**
+   * Issue #31 part 1: the zone this project's test schedules are interpreted in,
+   * or `null` for the default (UTC).
+   *
+   * **Promoted out of `settings` rather than exposing the bag.** `settings` is
+   * internal and holds whatever the product wants; a client reading it directly
+   * would be coupled to a storage decision, and the next preference added would
+   * silently widen the public contract. This is the read half of the write route
+   * `PUT /:projectId/timezone` — without it the setting was settable and
+   * unreadable, which is precisely the "stored value that nothing reads looks
+   * like a feature while doing nothing" failure the issue's own comment warns
+   * about.
+   */
+  timeZone: string | null;
   repositories: PublicProjectRepository[];
   repositoryRemovalBlockedReason: string | null;
 }
@@ -109,6 +123,12 @@ export function toPublicProject(
     agenticReviewEnabled: project.agenticReviewEnabled,
     uploadedExtensionsEnabled: project.uploadedExtensionsEnabled,
     hasDesignSurface: project.hasDesignSurface,
+    // Read from the JSONB bag here, so the storage choice stays behind this
+    // mapper. `typeof` rather than a cast: a value written by something else
+    // (or an older shape) must degrade to the default rather than being handed
+    // to a client as a zone it will try to display.
+    timeZone:
+      typeof project.settings?.timezone === "string" ? project.settings.timezone : null,
     repositories: project.repositories.map((repo) => ({
       id: repo.id,
       githubOwner: repo.githubOwner,
