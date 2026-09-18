@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it } from "vitest";
 import pg from "pg";
 import { AuditEventRepository } from "./repository.js";
 import { runMigrations } from "../db/migrate.js";
+import { livePostgresSkipWarning, probeLivePostgres } from "../testing/live-postgres.js";
 
 /**
  * Issue #61's verification: the audit repository against a **real Postgres**.
@@ -40,6 +41,21 @@ import { runMigrations } from "../db/migrate.js";
 
 const connectionString = process.env.DATABASE_URL ?? "";
 
+const reachability = await probeLivePostgres();
+
+if (!reachability.ok) {
+  console.warn(
+    livePostgresSkipWarning({
+      label: "audit",
+      probe: reachability,
+      unverified: "the joined page query and the count query, whose predicates were unqualified (`projects` also has `organization_id`) so every read 500'd with 42702",
+
+  standalone: "scripts/verify/issue-61-audit-query.mts",
+    }),
+  );
+}
+
+
 /**
  * Reachability, decided by asking the database rather than by reading the
  * configuration — the same reasoning as the storage probe: "configured" is true
@@ -47,37 +63,7 @@ const connectionString = process.env.DATABASE_URL ?? "";
  * network cannot route to Postgres a configured-but-unreachable URL would turn
  * these cases into multi-second timeouts that get ignored.
  */
-async function probePostgres(): Promise<{ ok: boolean; detail: string }> {
-  if (!connectionString) {
-    return { ok: false, detail: "DATABASE_URL is unset" };
-  }
-  const probe = new pg.Pool({ connectionString, connectionTimeoutMillis: 5_000 });
-  try {
-    await probe.query("select 1");
-    return { ok: true, detail: "" };
-  } catch (error) {
-    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
-  } finally {
-    await probe.end().catch(() => undefined);
-  }
-}
 
-const reachability = await probePostgres();
-
-if (!reachability.ok) {
-  console.warn(
-    `\n[audit] SKIPPING the live Postgres audit-query cases: ${reachability.detail}.\n` +
-      "  The joined page query and the count query are therefore UNVERIFIED in\n" +
-      "  this run, and those two are the whole of issue #61: the predicates were\n" +
-      "  unqualified, `projects` also has `organization_id`, and every audit read\n" +
-      "  500'd with 42702. They are not mocked on purpose — a fake pool would\n" +
-      "  agree with us by construction. To verify for real, provide a reachable\n" +
-      "  DATABASE_URL and run\n" +
-      "  `docker compose -f docker-compose.test.yml up --build\n" +
-      "   --abort-on-container-exit --exit-code-from test`,\n" +
-      "  or run scripts/verify/issue-61-audit-query.mts.\n",
-  );
-}
 
 /**
  * A pool for the cases below, plus the ids seeded for them.

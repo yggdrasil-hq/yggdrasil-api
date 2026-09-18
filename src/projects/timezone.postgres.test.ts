@@ -3,6 +3,7 @@ import pg from "pg";
 import { ProjectRepository } from "./repository.js";
 import { runMigrations } from "../db/migrate.js";
 import { toPublicProject } from "./types.js";
+import { livePostgresSkipWarning, probeLivePostgres } from "../testing/live-postgres.js";
 
 /**
  * Issue #31 part 1's storage, against a **real Postgres**.
@@ -28,34 +29,22 @@ import { toPublicProject } from "./types.js";
 
 const connectionString = process.env.DATABASE_URL ?? "";
 
-async function probePostgres(): Promise<{ ok: boolean; detail: string }> {
-  if (!connectionString) return { ok: false, detail: "DATABASE_URL is unset" };
-  const probe = new pg.Pool({ connectionString, connectionTimeoutMillis: 2_000 });
-  try {
-    await probe.query("SELECT 1");
-    return { ok: true, detail: "reachable" };
-  } catch (error) {
-    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
-  } finally {
-    await probe.end().catch(() => undefined);
-  }
-}
-
-const reachability = await probePostgres();
+const reachability = await probeLivePostgres();
 
 if (!reachability.ok) {
   console.warn(
-    `\n[timezone] SKIPPING the live Postgres timezone-storage cases: ${reachability.detail}.\n` +
-      "  The JSONB read/write behind `PUT /:projectId/timezone` is therefore\n" +
-      "  UNVERIFIED in this run. That SQL is unverifiable by a fake pool, which is\n" +
-      "  why this file exists: the setting is written with `jsonb_set` and read\n" +
-      "  with `->>`, and only Postgres can confirm the two agree. To verify for\n" +
-      "  real, provide a reachable DATABASE_URL and run\n" +
-      "  `docker compose -f docker-compose.test.yml up --build\n" +
-      "   --abort-on-container-exit --exit-code-from test`,\n" +
-      "  or run scripts/verify/issue-31-timezone-storage.mts.\n",
+    livePostgresSkipWarning({
+      label: "timezone",
+      probe: reachability,
+      unverified: "the timezone storage, and that a DST transition resolves as the stored zone rather than as an offset",
+
+  standalone: "scripts/verify/issue-31-timezone.mts",
+    }),
   );
 }
+
+
+
 
 describe.skipIf(!reachability.ok)("schedule timezone storage (issue #31 part 1)", () => {
   let pool: pg.Pool;

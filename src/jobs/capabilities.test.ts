@@ -2,6 +2,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import pg from "pg";
 import { CAPABILITY_TRUST_MS, JobKindCapabilityRepository } from "./capabilities.js";
 import { runMigrations } from "../db/migrate.js";
+import { livePostgresSkipWarning, probeLivePostgres } from "../testing/live-postgres.js";
 
 /**
  * Issue #63's capability reader.
@@ -75,32 +76,21 @@ describe("JobKindCapabilityRepository (statement shape)", () => {
 
 const connectionString = process.env.DATABASE_URL ?? "";
 
-async function probePostgres(): Promise<{ ok: boolean; detail: string }> {
-  if (!connectionString) return { ok: false, detail: "DATABASE_URL is unset" };
-  const probe = new pg.Pool({ connectionString, connectionTimeoutMillis: 5_000 });
-  try {
-    await probe.query("select 1");
-    return { ok: true, detail: "" };
-  } catch (error) {
-    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
-  } finally {
-    await probe.end().catch(() => undefined);
-  }
-}
-
-const reachability = await probePostgres();
+const reachability = await probeLivePostgres();
 
 if (!reachability.ok) {
   console.warn(
-    `\n[capabilities] SKIPPING the live Postgres capability cases: ${reachability.detail}.\n` +
-      "  The freshness clause (a `reported_at >= $1` comparison, and that a stale\n" +
-      "  claim stops counting) is therefore UNVERIFIED in this run. It is not mocked\n" +
-      "  on purpose — a fake pool agrees with us by construction, which is how #43\n" +
-      "  and #61 shipped. To verify for real, provide a reachable DATABASE_URL and\n" +
-      "  run `docker compose -f docker-compose.test.yml up --build\n" +
-      "   --abort-on-container-exit --exit-code-from test`.\n",
+    livePostgresSkipWarning({
+      label: "capabilities",
+      probe: reachability,
+      unverified: "the capability read, and that an unknown job kind is ignored rather than rejected",
+
+    }),
   );
 }
+
+
+
 
 let pool: pg.Pool | null = null;
 if (reachability.ok) {

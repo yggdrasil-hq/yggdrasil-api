@@ -3,6 +3,7 @@ import pg from "pg";
 import { TestRunReportRepository } from "./reports-repository.js";
 import { runMigrations } from "../db/migrate.js";
 import { JOB_TRIGGER_SOURCES } from "../jobs/types.js";
+import { livePostgresSkipWarning, probeLivePostgres } from "../testing/live-postgres.js";
 
 /**
  * Issue #75, verified against a **real Postgres**.
@@ -24,35 +25,22 @@ import { JOB_TRIGGER_SOURCES } from "../jobs/types.js";
 
 const connectionString = process.env.DATABASE_URL ?? "";
 
-async function probePostgres(): Promise<{ ok: boolean; detail: string }> {
-  if (!connectionString) return { ok: false, detail: "DATABASE_URL is unset" };
-  const probe = new pg.Pool({ connectionString, connectionTimeoutMillis: 2_000 });
-  try {
-    await probe.query("SELECT 1");
-    return { ok: true, detail: "reachable" };
-  } catch (error) {
-    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
-  } finally {
-    await probe.end().catch(() => undefined);
-  }
-}
-
-const reachability = await probePostgres();
+const reachability = await probeLivePostgres();
 
 if (!reachability.ok) {
   console.warn(
-    `\n[run-history] SKIPPING the live Postgres manual-trigger cases: ${reachability.detail}.\n` +
-      "  The history read is therefore UNVERIFIED in this run, and that read is\n" +
-      "  the whole of issue #75: `trigger_source` allows 'manual' in the schema\n" +
-      "  and the response type did not, so a manual run was returned as a value\n" +
-      "  its own declaration said could not occur. It is not mocked on purpose —\n" +
-      "  a fake pool would agree with the type by construction. To verify for\n" +
-      "  real, provide a reachable DATABASE_URL and run\n" +
-      "  `docker compose -f docker-compose.test.yml up --build\n" +
-      "   --abort-on-container-exit --exit-code-from test`,\n" +
-      "  or run scripts/verify/issue-75-manual-trigger.mts.\n",
+    livePostgresSkipWarning({
+      label: "run-history",
+      probe: reachability,
+      unverified: "the history read, since `trigger_source` allows 'manual' in the schema and the response type did not",
+
+  standalone: "scripts/verify/issue-75-manual-trigger.mts",
+    }),
   );
 }
+
+
+
 
 describe.skipIf(!reachability.ok)("run history against a real Postgres (issue #75)", () => {
   let pool: pg.Pool;
