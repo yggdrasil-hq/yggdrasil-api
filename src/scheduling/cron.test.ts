@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   MAX_LOOKBACK_DAYS,
   isDueForSchedule,
+  minimumIntervalMs,
   parseCron,
   previousOccurrence,
 } from "./cron.js";
@@ -348,9 +349,11 @@ describe("isDueForSchedule", () => {
     ).toBe(false);
   });
 
-  it("respects sub-hourly schedules the validator currently allows", () => {
-    // `meetsMinimumInterval` does not actually reject `* 10 * * *`, so the
-    // scheduler must still be correct for it (see the ADR's follow-up).
+  it("stays correct for sub-hourly schedules the validator rejects", () => {
+    // `meetsMinimumInterval` now rejects `*/15 * * * *`, so a schedule this
+    // short can only exist if it was saved before that tightening. The
+    // scheduler must still dispatch it at most once per window rather than
+    // once per missed tick.
     const base = {
       expression: "*/15 * * * *",
       createdAt: utc(2026, 9, 1),
@@ -387,5 +390,38 @@ describe("isDueForSchedule", () => {
 
   it("exposes a lookback window of at least a year", () => {
     expect(MAX_LOOKBACK_DAYS).toBeGreaterThanOrEqual(366);
+  });
+});
+
+describe("minimumIntervalMs", () => {
+  it("measures an hourly schedule as one hour", () => {
+    expect(minimumIntervalMs("0 * * * *", utc(2026, 9, 17, 12))).toBe(3_600_000);
+  });
+
+  it("measures a weekly schedule as a week", () => {
+    expect(minimumIntervalMs("0 9 * * 1", utc(2026, 9, 17, 12))).toBe(
+      7 * 24 * 3_600_000,
+    );
+  });
+
+  it("finds the short gap in a schedule whose gap is not constant", () => {
+    // Daily at 00:00 and 00:30: sampled occurrences include the 30-minute
+    // pair, which is the gap the minimum-interval rule is about.
+    expect(minimumIntervalMs("0,30 0 * * *", utc(2026, 9, 17, 12))).toBe(
+      30 * 60_000,
+    );
+  });
+
+  it("reports the one gap it can see on a sparse schedule", () => {
+    // A yearly schedule has at most two occurrences inside the lookback, so
+    // the scan ends there and reports the one gap it saw.
+    expect(minimumIntervalMs("0 0 1 1 *", utc(2026, 9, 17, 12))).toBe(
+      365 * 24 * 3_600_000,
+    );
+  });
+
+  it("returns null when there is nothing to measure", () => {
+    expect(minimumIntervalMs("0 0 31 2 *", utc(2026, 9, 17, 12))).toBeNull();
+    expect(minimumIntervalMs("not a cron", utc(2026, 9, 17, 12))).toBeNull();
   });
 });

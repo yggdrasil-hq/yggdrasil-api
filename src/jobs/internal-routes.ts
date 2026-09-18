@@ -20,6 +20,7 @@ import {
 import type { JobUsageRepository } from "../usage/repository.js";
 import { NOOP_LIVE_PUBLISHER, type LivePublisher } from "../live/deltas.js";
 import { summarizeGrillTranscript } from "./grill-context.js";
+import { evaluateTestingGate } from "../features/testing-gate-runner.js";
 
 const actionItemSchema = z.object({
   type: z.enum(["secret_request", "design_grill", "subtask_feature", "test_request"]),
@@ -64,6 +65,9 @@ const jobEventSchema = z.object({
     "submit_test_report",
     "update_design_preview",
     "submit_design",
+    // Issue #27: synthesized by the Orchestrator, which reads the marker the
+    // build pod's entrypoint wrote when it resolved conflicts with the base.
+    "merge_conflicts",
   ]),
   question: z.string().optional(),
   markdown: z.string().optional(),
@@ -600,21 +604,11 @@ async function syncFeatureState(
         summary: event.summary,
         recordingPath: event.recordingPath,
       });
-      const runs = await deps.jobs.listFeatureTestRuns(job.featureId);
-      const reports = await Promise.all(
-        runs.map((run) => deps.testRunReports.findByJob(run.id)),
-      );
-      if (reports.some((report) => report === null)) return;
-      if (reports.some((report) => report!.failed > 0)) {
-        const failedReport = reports.find((report) => report!.failed > 0)!;
-        await deps.features.setReturned(
-          job.featureId,
-          "test_failure",
-          failedReport.summary,
-        );
-        return;
-      }
-      await advanceAfterTesting(deps, job.projectId, job.featureId);
+      // Issue #40: the gate decides whether the *runs* are done, not whether
+      // every one of them submitted a report. The old check bailed while any run
+      // lacked one, so a run that never reported (a container that never started)
+      // blocked the feature in `testing` forever.
+      await evaluateTestingGate(deps, job.projectId, job.featureId);
       return;
     }
     if (event.type === "request_action_item") {
@@ -670,29 +664,6 @@ async function syncFeatureState(
   }
 }
 
-async function advanceAfterTesting(
-  deps: {
-    features: FeatureRepository;
-    jobs: JobRepository;
-    projects: ProjectRepository;
-  },
-  projectId: string,
-  featureId: string,
-): Promise<void> {
-  const project = await deps.projects.findById(projectId);
-  if (!project) return;
-  if (!project.agenticReviewEnabled) {
-    await deps.features.setInReview(featureId, "");
-    return;
-  }
-  const advanced = await deps.features.setAgenticReview(featureId);
-  if (!advanced) return;
-  await deps.jobs.create({
-    projectId,
-    kind: "agentic_review",
-    featureId,
-  });
-}
 
 function formatActionItemReason(
   items: Array<{ type: string; description: string }>,

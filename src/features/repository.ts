@@ -78,6 +78,43 @@ export class FeatureRepository {
   }
 
   /**
+   * Features sitting in `testing` whose test runs have all reached a terminal
+   * state, oldest-updated first, bounded. Issue #40's reconcile tick's
+   * candidate query.
+   *
+   * A pre-filter, not the decision: it deliberately does not reproduce the
+   * "runs belonging to the current testing attempt" window that
+   * `TestRunReportRepository.listByFeature` applies. Over-selecting is harmless
+   * because the gate re-reads the feature and re-derives its runs, and a
+   * decision is only ever applied to a feature still in `testing`; under-
+   * selecting would be the bug, since it would leave a feature stuck.
+   */
+  async listTestingWithTerminalRuns(
+    limit = 50,
+  ): Promise<Array<{ id: string; projectId: string }>> {
+    const result = await this.db.query<{ id: string; project_id: string }>(
+      `SELECT f.id, f.project_id
+       FROM features f
+       WHERE f.status = 'testing'
+         AND EXISTS (
+           SELECT 1 FROM jobs r
+           WHERE r.feature_id = f.id
+             AND r.kind IN ('test_run', 'script_test_run')
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM jobs r
+           WHERE r.feature_id = f.id
+             AND r.kind IN ('test_run', 'script_test_run')
+             AND r.status IN ('pending', 'running')
+         )
+       ORDER BY f.updated_at ASC
+       LIMIT $1`,
+      [limit],
+    );
+    return result.rows.map((row) => ({ id: row.id, projectId: row.project_id }));
+  }
+
+  /**
    * Looks up a feature by its stored PR URL, globally (not scoped to a
    * project) — GitHub PR URLs are unique, and this is what lets the PR
    * webhook handler (`github/webhook-routes.ts`) match an incoming
@@ -494,16 +531,29 @@ export class FeatureRepository {
     return result.rows.map(mapFeature);
   }
 
+  /**
+   * Moves a feature to a terminal state — the path behind `run_failed`,
+   * `run_cancelled` and `request_action_item`'s kickback to `draft`.
+   *
+   * **Both casts on `$2` are load-bearing (issue #43).** Without them Postgres
+   * cannot deduce one type for the parameter: the assignment to `status`
+   * (varchar) implies `varchar` while the comparison to the untyped literal
+   * `'draft'` implies `text`, so the statement raises
+   * `42P08 inconsistent types deduced for parameter $2` on every call. Every
+   * caller failed silently behind a fake repository in tests, and only where a
+   * real pool runs — production and a live dev stack — so a crashed run left its
+   * feature in its previous status instead of `failed`.
+   */
   async updateStatus(
     featureId: string,
     status: FeatureStatus,
   ): Promise<Feature | null> {
     const result = await this.db.query<FeatureRow>(
       `UPDATE features
-       SET status = $2,
-           adr_approved = CASE WHEN $2 = 'draft' THEN FALSE ELSE adr_approved END,
-           return_reason = CASE WHEN $2 = 'draft' THEN NULL ELSE return_reason END,
-           return_comment = CASE WHEN $2 = 'draft' THEN NULL ELSE return_comment END,
+       SET status = $2::varchar,
+           adr_approved = CASE WHEN $2::text = 'draft' THEN FALSE ELSE adr_approved END,
+           return_reason = CASE WHEN $2::text = 'draft' THEN NULL ELSE return_reason END,
+           return_comment = CASE WHEN $2::text = 'draft' THEN NULL ELSE return_comment END,
            updated_at = NOW()
        WHERE id = $1
        RETURNING ${featureColumns}`,

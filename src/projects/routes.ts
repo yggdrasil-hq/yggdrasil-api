@@ -3,7 +3,7 @@ import { z } from "zod";
 import { config } from "../config.js";
 import { createAuthMiddleware } from "../auth/middleware.js";
 import type { SessionService } from "../auth/sessions.js";
-import { dispatchJob } from "../jobs/dispatch.js";
+import { dispatchDeployJob, dispatchJob } from "../jobs/dispatch.js";
 import type { JobRepository } from "../jobs/repository.js";
 import {
   buildGrillRestartSeed,
@@ -696,7 +696,16 @@ export function createProjectsRouter(deps: {
     // this, nothing ever deploys `main` until some *later* push happens to
     // land on an already-`ready` project (see ADR 013 addendum: the
     // pull_request-webhook path has the identical gap and fix).
-    await dispatchJob(deps.jobs, { projectId: project.id, kind: "deploy" });
+    //
+    // This is a project's *first* deploy, so it cannot conflict with anything —
+    // but the dispatch is the same call as everywhere else, and a conflict here
+    // (another project-init race already dispatched it) means the deploy exists,
+    // which is the outcome this line wants either way.
+    await dispatchDeployJob(deps.jobs, {
+      projectId: project.id,
+      kind: "deploy",
+      ref: "main",
+    });
 
     const updated = await deps.projects.findByIdForUser(project.id, req.currentUser!.id);
     if (!updated) {
@@ -838,11 +847,23 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    const job = await dispatchJob(deps.jobs, {
+    const job = await dispatchDeployJob(deps.jobs, {
       projectId: project.id,
       kind: "rollback",
       targetRevision: parsed.data.revision,
+      // A rollback applies no new commit, so the honest "which commit is
+      // deployed" for the row it is about to write is the one the target
+      // revision was deployed from (issue #26). Null for a target recorded
+      // before that ref was populated, which the job schema spells as absent.
+      ref: (await deps.deploys.refForRevision(project.id, parsed.data.revision)) ?? undefined,
     });
+    if ("conflict" in job) {
+      // The pre-check above passed but another request inserted first. Both
+      // would touch the same Helm release, so the loser is refused rather than
+      // left to fail inside Helm with a less intelligible error.
+      res.status(409).json({ error: "A deployment operation is already in progress" });
+      return;
+    }
 
     await deps.audit.record(res, {
       organizationId: project.organizationId,
@@ -856,7 +877,7 @@ export function createProjectsRouter(deps: {
         // `targetRevision` is what the operator asked to go back to.
         revision: current,
         targetRevision: parsed.data.revision,
-        jobId: job.id,
+        jobId: job.job.id,
       },
     });
 
@@ -890,7 +911,33 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    await dispatchJob(deps.jobs, { projectId: project.id, kind: "deploy" });
+    const job = await dispatchDeployJob(deps.jobs, {
+      projectId: project.id,
+      kind: "deploy",
+      // The primary deployment is always the default branch's content (ADR 003
+      // §9), and the webhook path only ever deploys `main` — so a manual
+      // redeploy (rotated secrets, a chart change with no code change) is a
+      // deploy of `main` too (issue #26).
+      ref: "main",
+    });
+    if ("conflict" in job) {
+      res.status(409).json({ error: "A deployment operation is already in progress for this project" });
+      return;
+    }
+
+    // Audited even though the routine push-driven deploy is not: this is the
+    // only deploy an operator triggers by hand, and the asymmetry with
+    // rollback was the thing that read wrong (issue #26, ADR 022 §8). A
+    // webhook deploy has no actor to record and would repeat on every push.
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.deployTriggered,
+      targetType: "project",
+      targetId: project.id,
+      metadata: { ref: "main", jobId: job.job.id },
+    });
 
     res.status(201).json({});
   });

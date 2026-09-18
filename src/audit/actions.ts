@@ -18,12 +18,18 @@ export const AUDIT_ACTIONS = {
   projectMarkedReady: "project.marked_ready",
   projectChartScaffoldFailed: "project.chart_scaffold_failed",
   /**
+   * ADR 022: a primary deployment was triggered by hand (issue #26). Recorded
+   * alongside `deploy.rolled_back` so the two operator-initiated deployment
+   * actions read symmetrically in the trail. The routine push-driven deploy is
+   * still deliberately unaudited (ADR 028's out-of-scope table, ADR 022 §8):
+   * it has no actor to name and would add a row per push to `main`.
+   */
+  deployTriggered: "deploy.triggered",
+  /**
    * ADR 022: a primary-deployment rollback was requested. Recorded even though
    * the resulting job row also exists, because the job row carries no actor —
    * and "who sent production back to an older revision, and when" is exactly
-   * what an audit trail is for. Note the routine `POST /deploy` trigger is
-   * still deliberately unaudited (ADR 028's out-of-scope table); the asymmetry
-   * is intentional and explained in ADR 022.
+   * what an audit trail is for.
    */
   deployRolledBack: "deploy.rolled_back",
 

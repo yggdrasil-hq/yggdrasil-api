@@ -4,7 +4,7 @@ import express from "express";
 import { config, isGitHubAppConfigured } from "../config.js";
 import type { FeatureActionItemRepository } from "../features/action-items-repository.js";
 import type { FeatureRepository } from "../features/repository.js";
-import { dispatchJob } from "../jobs/dispatch.js";
+import { dispatchDeployJob } from "../jobs/dispatch.js";
 import type { JobRepository } from "../jobs/repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
 import { GithubInstallationRepository } from "./installation-repository.js";
@@ -72,6 +72,19 @@ interface PullRequestReviewWebhookPayload {
 const MAIN_BRANCH_REF = "refs/heads/main";
 
 /**
+ * The git ref a deploy job records, given the ref a push webhook reports.
+ *
+ * `job.ref` (and so `project_deploys.ref`) holds a ref, not the `refs/heads/`
+ * spelling GitHub sends — the same shape `test_run` uses ("main"), so the
+ * deploy history and everything else agree on what a ref looks like. Strips
+ * whatever namespace prefix the ref carries rather than hardcoding `main`, so
+ * it stays correct if the primary branch is ever configurable.
+ */
+function branchName(ref: string): string {
+  return ref.replace(/^refs\/(heads|tags)\//, "");
+}
+
+/**
  * Enqueues a `deploy` job when a push lands on the primary repo's `main`
  * branch of a project that has finished `project_init` (ADR 003 §9-13).
  */
@@ -87,7 +100,14 @@ export async function handlePushEvent(
     payload.repository.name,
   );
   if (project && project.status === "ready") {
-    await dispatchJob(deps.jobs, { projectId: project.id, kind: "deploy" });
+    // The pushed ref, so the deploy ledger records which commit this deploy is
+    // of instead of a null (issue #26). A `deploy` job has no other consumer of
+    // `ref` — only feature_build and test_run check one out.
+    await dispatchDeployJob(deps.jobs, {
+      projectId: project.id,
+      kind: "deploy",
+      ref: branchName(payload.ref),
+    });
   }
 }
 
@@ -138,7 +158,16 @@ export async function handlePullRequestEvent(
       // happens to be processed first, it would silently no-op (GitHub
       // doesn't redeliver), and the project's always-on deployment would
       // never get its first `deploy` job at all (ADR 013 addendum).
-      await dispatchJob(deps.jobs, { projectId: project.id, kind: "deploy" });
+      await dispatchDeployJob(deps.jobs, {
+        projectId: project.id,
+        kind: "deploy",
+        // The merge landed on the primary branch (this handler only runs for a
+        // merged PR, and the project's primary deployment is that branch's
+        // content — ADR 003 §9), so the ref is that branch. Recorded rather
+        // than left null so the first entry in a project's deploy history
+        // answers "of what?" like every later one does (issue #26).
+        ref: branchName(MAIN_BRANCH_REF),
+      });
     }
   }
 }

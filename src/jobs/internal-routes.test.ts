@@ -89,6 +89,10 @@ function buildApp(deps: {
   upsertStep?: ReturnType<typeof vi.fn>;
   upsertReport?: ReturnType<typeof vi.fn>;
   findReport?: ReturnType<typeof vi.fn>;
+  /** Issue #40: the gate reads the feature's whole run list, not just one report. */
+  listReportExecutions?: ReturnType<typeof vi.fn>;
+  /** Issue #40: the gate only applies while the feature is in `testing`. */
+  featureStatus?: string;
   projectFindById?: ReturnType<typeof vi.fn>;
   finalizeDesign?: ReturnType<typeof vi.fn>;
   upsertUsage?: ReturnType<typeof vi.fn>;
@@ -109,7 +113,7 @@ function buildApp(deps: {
     slug: "feature",
     title: "Feature",
     featureType: "normal",
-    status: "running",
+    status: deps.featureStatus ?? "running",
     branchName: null,
     adrMarkdown: null,
     awaitingUserInput: false,
@@ -181,7 +185,12 @@ function buildApp(deps: {
         resolveDesignSession,
       } as never,
       tests: { listEnabledByProject: listEnabledTests } as never,
-      testRunReports: { upsertStep, upsertReport, findByJob: findReport } as never,
+      testRunReports: {
+        upsertStep,
+        upsertReport,
+        findByJob: findReport,
+        listByFeature: deps.listReportExecutions ?? vi.fn(async () => []),
+      } as never,
       projects: { findById: projectFindById } as never,
       designs: {
         finalize: deps.finalizeDesign ?? vi.fn(async () => undefined),
@@ -797,6 +806,96 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .set("Authorization", "Bearer test-internal-api-token")
       .send({ type: "submit_test_report", passed: 1, failed: 0 });
     expect(invalid.status).toBe(400);
+  });
+
+  /*
+   * Issue #40: the gate is now derived from the *run list* rather than from the
+   * reports it can see. This is the wiring test — the decision itself is
+   * exhaustively covered in `features/testing-gate.test.ts` and
+   * `testing-gate-runner.test.ts`. It exists because nothing asserted this
+   * transition at all before, which is why the stuck-feature bug survived.
+   */
+  it("applies the Testing gate from the feature's run list on a submitted report", async () => {
+    const setReturned = vi.fn(async () => null);
+    const execution = {
+      jobId: JOB_ID,
+      testId: null,
+      testGroup: "unit",
+      status: "completed",
+      lastError: null,
+      completedAt: new Date(),
+      steps: [],
+      report: {
+        jobId: JOB_ID,
+        testId: null,
+        passed: 3,
+        failed: 1,
+        skipped: 0,
+        total: 4,
+        coveragePercent: null,
+        failingTests: ["auth rejects an expired token"],
+        summary: "One unit test failed.",
+        recordingPath: null,
+        createdAt: new Date(),
+        steps: [],
+      },
+    };
+    const app = buildApp({
+      upsertReport: vi.fn(async () => undefined),
+      setReturned,
+      listReportExecutions: vi.fn(async () => [execution]),
+      featureStatus: "testing",
+      findById: async () => makeJob({ kind: "test_run", featureId: "feature_42" }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({
+        type: "submit_test_report",
+        passed: 3,
+        failed: 1,
+        skipped: 0,
+        total: 4,
+        summary: "One unit test failed.",
+        failingTests: ["auth rejects an expired token"],
+      });
+
+    expect(res.status).toBe(201);
+    expect(setReturned).toHaveBeenCalledWith(
+      "feature_42",
+      "test_failure",
+      expect.stringContaining("auth rejects an expired token"),
+    );
+  });
+
+  it("does not apply the gate while the feature is not in testing", async () => {
+    // The fake feature is `running`, which is the state a report cannot
+    // legitimately arrive in (submit_build_result is what moves it to testing).
+    const setReturned = vi.fn(async () => null);
+    const app = buildApp({
+      upsertReport: vi.fn(async () => undefined),
+      setReturned,
+      listReportExecutions: vi.fn(async () => [{
+        jobId: JOB_ID,
+        testId: null,
+        testGroup: "unit",
+        status: "completed",
+        lastError: null,
+        completedAt: new Date(),
+        steps: [],
+        report: null,
+      }]),
+      findById: async () => makeJob({ kind: "test_run", featureId: "feature_42" }),
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "submit_test_report", passed: 1, failed: 0, summary: "ok" });
+
+    expect(res.status).toBe(201);
+    expect(setReturned).not.toHaveBeenCalled();
   });
 
   it("accepts a canonical report from a script test job", async () => {
