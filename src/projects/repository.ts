@@ -306,6 +306,42 @@ export class ProjectRepository {
     );
   }
 
+  /**
+   * Issue #31 part 1: the zone this project's test schedules are interpreted in.
+   *
+   * **In the `settings` JSONB bag rather than a column**, deliberately: it is a
+   * per-project preference with no query of its own beyond the scheduler's
+   * candidate read, which already joins `projects`, and `settings` exists for
+   * exactly this shape. A column would be a migration per preference; ADR 016
+   * item 4's precedent is the bag for anything the product does not filter on.
+   *
+   * **`null` removes the key** rather than storing an explicit null or a
+   * sentinel `"UTC"`. "Not set" and "set to UTC" mean the same thing to every
+   * reader, and collapsing them keeps one representation of the default instead
+   * of two that a later reader has to reconcile. It also means a project that
+   * never sets a zone carries no key at all, so the JSONB stays empty for the
+   * overwhelming majority of projects.
+   *
+   * A single `jsonb_set`/`-` rather than read-modify-write, so two concurrent
+   * settings writes cannot lose each other by racing on the whole object.
+   */
+  async setTimeZone(projectId: string, timeZone: string | null): Promise<void> {
+    if (timeZone === null) {
+      await this.db.query(
+        `UPDATE projects SET settings = settings - 'timezone', updated_at = NOW() WHERE id = $1`,
+        [projectId],
+      );
+      return;
+    }
+    await this.db.query(
+      `UPDATE projects
+          SET settings = jsonb_set(settings, '{timezone}', to_jsonb($2::text), true),
+              updated_at = NOW()
+        WHERE id = $1`,
+      [projectId, timeZone],
+    );
+  }
+
   /** ADR 014: records the project-init interview's UI/design-surface answer. */
   async setHasDesignSurface(projectId: string, hasDesignSurface: boolean): Promise<void> {
     await this.db.query(

@@ -5,6 +5,7 @@ import {
   minimumIntervalMs,
   parseCron,
   previousOccurrence,
+  previousOccurrenceInTimeZone,
 } from "./cron.js";
 
 /** UTC helper — every assertion in this file is in UTC, by ADR 026's design. */
@@ -423,5 +424,222 @@ describe("minimumIntervalMs", () => {
   it("returns null when there is nothing to measure", () => {
     expect(minimumIntervalMs("0 0 31 2 *", utc(2026, 9, 17, 12))).toBeNull();
     expect(minimumIntervalMs("not a cron", utc(2026, 9, 17, 12))).toBeNull();
+  });
+});
+
+/*
+ * Issue #31 part 1: evaluating a schedule in a project's own zone.
+ *
+ * The design decision these hold in place is *named zone, resolved per
+ * occurrence* rather than a stored offset — so the assertions below are largely
+ * about the same wall time producing different instants across a transition,
+ * which is exactly what an offset cannot do.
+ */
+describe("previousOccurrenceInTimeZone", () => {
+  const NY = "America/New_York";
+
+  it("resolves a daily wall time in the project's zone", () => {
+    // 09:00 New York in January is 14:00Z (EST, -5).
+    expect(
+      previousOccurrenceInTimeZone("0 9 * * *", utc(2026, 1, 15, 23, 0), NY)?.toISOString(),
+    ).toBe("2026-01-15T14:00:00.000Z");
+  });
+
+  // The point of the whole feature: the *same* expression means the same local
+  // time all year, so it is a different instant either side of the transition.
+  // A fixed offset would return the same UTC instant in both months.
+  it("keeps the wall time fixed across a DST transition", () => {
+    expect(
+      previousOccurrenceInTimeZone("0 9 * * *", utc(2026, 1, 15, 23, 0), NY)?.toISOString(),
+    ).toBe("2026-01-15T14:00:00.000Z");
+    expect(
+      previousOccurrenceInTimeZone("0 9 * * *", utc(2026, 7, 15, 23, 0), NY)?.toISOString(),
+    ).toBe("2026-07-15T13:00:00.000Z");
+  });
+
+  it("still returns the latest occurrence at or before the reference", () => {
+    // 12:00Z is 08:00 in New York, so the 09:00 run has not happened yet and the
+    // previous day's is the answer.
+    expect(
+      previousOccurrenceInTimeZone("0 9 * * *", utc(2026, 1, 15, 12, 0), NY)?.toISOString(),
+    ).toBe("2026-01-14T14:00:00.000Z");
+  });
+
+  // ADR 026's spring-forward answer: the wall time does not exist, so that day
+  // is skipped and the previous day is returned. The alternative — shifting to
+  // 03:30 — would invent a time nobody configured.
+  it("skips a wall time that does not exist on the transition day", () => {
+    const occurrence = previousOccurrenceInTimeZone(
+      "30 2 * * *",
+      utc(2026, 3, 8, 23, 0),
+      NY,
+    );
+
+    expect(occurrence?.toISOString()).toBe("2026-03-07T07:30:00.000Z");
+  });
+
+  it("runs on the transition day itself for a time that does exist", () => {
+    // 02:30 is skipped; 09:00 is not, so the same day still produces a run.
+    expect(
+      previousOccurrenceInTimeZone("0 9 * * *", utc(2026, 3, 8, 23, 0), NY)?.toISOString(),
+    ).toBe("2026-03-08T13:00:00.000Z");
+  });
+
+  // ADR 026's fall-back answer: take the earlier of the two, so the run is not an
+  // hour late for no reason the user asked for.
+  it("takes the earlier instant for a wall time that happens twice", () => {
+    const occurrence = previousOccurrenceInTimeZone(
+      "30 1 * * *",
+      utc(2026, 11, 1, 23, 0),
+      NY,
+    );
+
+    expect(occurrence?.toISOString()).toBe("2026-11-01T05:30:00.000Z");
+  });
+
+  // The local day is 23 or 25 hours across a transition, so a lookback that
+  // stepped by a fixed 24 hours would drift by an hour on one side of it.
+  it("walks local calendar days, not 24-hour steps", () => {
+    // 01:00 local on 2026-03-09 is 05:00Z (EDT). Asking from 04:00Z on the 9th
+    // — which is 23:00 on the 8th locally — must find the 8th's 01:00 EST
+    // (06:00Z), not the 9th's.
+    expect(
+      previousOccurrenceInTimeZone("0 1 * * *", utc(2026, 3, 9, 4, 0), NY)?.toISOString(),
+    ).toBe("2026-03-08T06:00:00.000Z");
+  });
+
+  it("matches the day-of-week in the project's zone", () => {
+    // 2026-03-02 is a Monday. A Monday 09:00 New York schedule requested just
+    // after it should find that day, not the boundary day in UTC terms.
+    expect(
+      previousOccurrenceInTimeZone("0 9 * * 1", utc(2026, 3, 2, 23, 0), NY)?.toISOString(),
+    ).toBe("2026-03-02T14:00:00.000Z");
+  });
+
+  it("matches the day-of-month in the project's zone", () => {
+    expect(
+      previousOccurrenceInTimeZone("0 0 15 * *", utc(2026, 1, 15, 23, 0), NY)?.toISOString(),
+    ).toBe("2026-01-15T05:00:00.000Z");
+  });
+
+  // UTC is the pre-#31 behaviour for every project that has not set a zone, so it
+  // must be delegated unchanged rather than recomputed through the local walk.
+  it("is identical to the UTC path for UTC and for an unusable zone", () => {
+    const at = utc(2026, 1, 15, 23, 0);
+    const expected = previousOccurrence("0 9 * * *", at)?.toISOString();
+
+    expect(previousOccurrenceInTimeZone("0 9 * * *", at, "UTC")?.toISOString()).toBe(expected);
+    // A bad stored value degrades one project to the old behaviour rather than
+    // throwing and abandoning the whole candidate pass.
+    expect(previousOccurrenceInTimeZone("0 9 * * *", at, "Not/AZone")?.toISOString()).toBe(
+      expected,
+    );
+    expect(previousOccurrenceInTimeZone("0 9 * * *", at, "")?.toISOString()).toBe(expected);
+  });
+
+  it("returns null for an unparseable expression, as the UTC path does", () => {
+    expect(previousOccurrenceInTimeZone("not a cron", utc(2026, 1, 15, 23, 0), NY)).toBeNull();
+  });
+
+  it("returns null for an invalid reference date", () => {
+    expect(
+      previousOccurrenceInTimeZone("0 9 * * *", new Date(Number.NaN), NY),
+    ).toBeNull();
+  });
+
+  it("finds an occurrence for a sparse schedule, so the lookback is not too short", () => {
+    // Yearly; would be missed entirely by a lookback of a few days.
+    expect(
+      previousOccurrenceInTimeZone("0 0 1 1 *", utc(2026, 6, 1, 0, 0), NY)?.toISOString(),
+    ).toBe("2026-01-01T05:00:00.000Z");
+  });
+});
+
+describe("isDueForSchedule with a project timezone", () => {
+  const NY = "America/New_York";
+
+  it("fires when the zone's wall time has passed", () => {
+    // 09:05 in New York on a summer day is 13:05Z.
+    expect(
+      isDueForSchedule({
+        expression: "0 9 * * *",
+        lastRunAt: null,
+        createdAt: utc(2026, 1, 1),
+        now: utc(2026, 7, 15, 13, 5),
+        timeZone: NY,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not fire before the zone's wall time, even though UTC says otherwise", () => {
+    // The boundary the zone actually moves. `lastRunAt` is the previous local
+    // run — 09:00 EDT on the 14th, which is 13:00Z — so the question is whether
+    // *today's* 09:00 local has passed yet.
+    const previousRun = utc(2026, 7, 14, 13, 0);
+
+    // 12:05Z is 08:05 local: today's 09:00 has not arrived, so the previous
+    // occurrence is still the 14th's and nothing is due. Reading the expression
+    // as UTC would have fired at 09:00Z, three hours too early.
+    expect(
+      isDueForSchedule({
+        expression: "0 9 * * *",
+        lastRunAt: previousRun,
+        createdAt: utc(2026, 1, 1),
+        now: utc(2026, 7, 15, 12, 5),
+        timeZone: NY,
+      }),
+    ).toBe(false);
+
+    // 13:05Z is 09:05 local, so it has.
+    expect(
+      isDueForSchedule({
+        expression: "0 9 * * *",
+        lastRunAt: previousRun,
+        createdAt: utc(2026, 1, 1),
+        now: utc(2026, 7, 15, 13, 5),
+        timeZone: NY,
+      }),
+    ).toBe(true);
+  });
+
+  it("is unchanged from the UTC behaviour when no zone is given", () => {
+    const input = {
+      expression: "0 9 * * *",
+      lastRunAt: null,
+      createdAt: utc(2026, 1, 1),
+      now: utc(2026, 7, 15, 12, 5),
+    };
+    expect(isDueForSchedule(input)).toBe(
+      isDueForSchedule({ ...input, timeZone: "UTC" }),
+    );
+    expect(isDueForSchedule({ ...input, timeZone: null })).toBe(isDueForSchedule(input));
+  });
+
+  it("still catches up once per missed window in a zone", () => {
+    // Same shape as the UTC catch-up test: having just run, the next tick is not
+    // due again; after a long gap it fires once.
+    const base = {
+      expression: "0 9 * * *",
+      createdAt: utc(2026, 1, 1),
+      timeZone: NY,
+    };
+    expect(
+      isDueForSchedule({ ...base, lastRunAt: utc(2026, 7, 15, 13, 0), now: utc(2026, 7, 15, 13, 5) }),
+    ).toBe(false);
+    expect(
+      isDueForSchedule({ ...base, lastRunAt: utc(2026, 7, 1), now: utc(2026, 7, 15, 13, 5) }),
+    ).toBe(true);
+  });
+
+  it("tolerates an invalid zone by treating it as UTC", () => {
+    expect(
+      isDueForSchedule({
+        expression: "0 9 * * *",
+        lastRunAt: null,
+        createdAt: utc(2026, 1, 1),
+        now: utc(2026, 7, 15, 12, 5),
+        timeZone: "Not/AZone",
+      }),
+    ).toBe(true);
   });
 });

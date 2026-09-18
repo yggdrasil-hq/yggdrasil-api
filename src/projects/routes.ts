@@ -24,6 +24,7 @@ import type { TestRunReportRepository } from "../tests/reports-repository.js";
 import { toPublicTestRunExecution } from "../tests/report-types.js";
 import { toPublicTestRunHistoryEntry } from "../tests/run-history.js";
 import { toPublicAgenticReview } from "../features/review-types.js";
+import { isValidTimeZone } from "../scheduling/timezone.js";
 import {
   isValidCronExpression,
   meetsMinimumInterval,
@@ -987,6 +988,74 @@ export function createProjectsRouter(deps: {
       return;
     }
     res.json(await toPublicProjectWithRemovalMeta(updated));
+  });
+
+  /**
+   * Issue #31 part 1: the zone this project's test schedules are read in.
+   *
+   * A dedicated route rather than a field on the `/:projectId` PATCH above, for
+   * the reason the uploaded-extensions route below gives: that schema makes
+   * `agenticReviewEnabled` **required**, so adding an optional field would either
+   * change an existing endpoint's contract or force every caller to restate a
+   * toggle it is not editing.
+   *
+   * **Validated on write.** `isValidTimeZone` rejects a value this runtime cannot
+   * resolve, so a typo is a `400` here rather than a project quietly scheduling
+   * in UTC forever. Readers still tolerate an invalid *stored* value — the set of
+   * resolvable zones can differ between deploys, and a bad row must not wedge the
+   * scheduler — so write-validated and read-tolerant are deliberately different
+   * postures. `timeZoneOrUtc` holds the other half.
+   *
+   * `null` clears the setting back to the default rather than storing `"UTC"`:
+   * the two mean the same thing to every reader, and one representation of the
+   * default is better than two to reconcile.
+   *
+   * Audited, because changing a schedule's timezone changes *when a job runs* —
+   * the same class of change as editing its cron expression.
+   */
+  router.put("/:projectId/timezone", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+
+    const parsed = parseBody(
+      z.object({
+        // Nullable and optional: `null` and absent both mean "clear it". A
+        // caller omitting the field is not making a mistake, it is asking for
+        // the default.
+        timeZone: z.string().trim().max(64).nullable().optional(),
+      }),
+      req.body,
+    );
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+
+    const requested = parsed.data.timeZone ?? null;
+    if (requested !== null && !isValidTimeZone(requested)) {
+      // Names it as a zone problem explicitly: "invalid input" would send an
+      // operator looking for a payload-shape fault rather than a typo in a zone
+      // name, and the field is free-form to the caller.
+      res.status(400).json({ error: `Unknown time zone: ${requested}` });
+      return;
+    }
+
+    await deps.projects.setTimeZone(project.id, requested);
+
+    await deps.audit.record(res, {
+      organizationId: project.organizationId,
+      projectId: project.id,
+      actorUserId: req.currentUser!.id,
+      action: AUDIT_ACTIONS.projectUpdated,
+      targetType: "project",
+      targetId: project.id,
+      metadata: { timeZone: requested },
+    });
+
+    res.json({ timeZone: requested });
   });
 
   // ADR 025 item 7: per-project opt-in for uploaded Pi extensions. Separate

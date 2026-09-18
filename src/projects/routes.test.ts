@@ -189,6 +189,8 @@ function buildApp(opts: BuildAppOptions) {
     markReady: vi.fn(async () => undefined),
     setAgenticReviewEnabled: vi.fn(async () => undefined),
     setUploadedExtensionsEnabled: vi.fn(async () => undefined),
+    // Issue #31: recording the project's schedule timezone.
+    setTimeZone: vi.fn(async () => undefined),
     delete: vi.fn(async () => true),
   };
   const features = {
@@ -380,6 +382,7 @@ function authedRequest(app: express.Express) {
   return {
     get: (url: string) => request(app).get(url).set("Cookie", SESSION_COOKIE),
     post: (url: string) => request(app).post(url).set("Cookie", SESSION_COOKIE),
+    put: (url: string) => request(app).put(url).set("Cookie", SESSION_COOKIE),
     patch: (url: string) => request(app).patch(url).set("Cookie", SESSION_COOKIE),
     delete: (url: string) => request(app).delete(url).set("Cookie", SESSION_COOKIE),
   };
@@ -2258,5 +2261,88 @@ describe("GET /:projectId/features/:featureId/agentic-review (issue #59)", () =>
 
     expect(res.status).toBe(404);
     expect(jobEvents.findLatestReviewByFeature).not.toHaveBeenCalled();
+  });
+});
+
+describe("PUT /:projectId/timezone (issue #31 part 1)", () => {
+  const project = makeProject();
+  const url = `/projects/${project.id}/timezone`;
+
+  it("stores a real IANA zone", async () => {
+    const { app, projects } = buildApp({ project });
+
+    const res = await authedRequest(app).put(url).send({ timeZone: "America/New_York" });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ timeZone: "America/New_York" });
+    expect(projects.setTimeZone).toHaveBeenCalledWith(project.id, "America/New_York");
+  });
+
+  // Validated on write so a typo is a 400 rather than a project that quietly
+  // schedules in UTC forever — the failure a user would never see.
+  it("rejects a zone this runtime cannot resolve", async () => {
+    const { app, projects } = buildApp({ project });
+
+    const res = await authedRequest(app).put(url).send({ timeZone: "Not/AZone" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain("Not/AZone");
+    expect(projects.setTimeZone).not.toHaveBeenCalled();
+  });
+
+  it("clears back to the default for an explicit null", async () => {
+    const { app, projects } = buildApp({ project });
+
+    const res = await authedRequest(app).put(url).send({ timeZone: null });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ timeZone: null });
+    // null, not "UTC": one representation of the default rather than two.
+    expect(projects.setTimeZone).toHaveBeenCalledWith(project.id, null);
+  });
+
+  it("clears back to the default when the field is omitted", async () => {
+    const { app, projects } = buildApp({ project });
+
+    const res = await authedRequest(app).put(url).send({});
+
+    expect(res.status).toBe(200);
+    expect(projects.setTimeZone).toHaveBeenCalledWith(project.id, null);
+  });
+
+  it("trims surrounding whitespace rather than storing it", async () => {
+    const { app, projects } = buildApp({ project });
+
+    await authedRequest(app).put(url).send({ timeZone: "  America/New_York  " });
+
+    // A stored zone with a trailing space is one `Intl` would reject on the read
+    // side, so the setting would validate here and degrade to UTC there.
+    expect(projects.setTimeZone).toHaveBeenCalledWith(project.id, "America/New_York");
+  });
+
+  it("records an audit row, because it changes when a job runs", async () => {
+    const { app, audit } = buildApp({ project });
+
+    await authedRequest(app).put(url).send({ timeZone: "Asia/Kolkata" });
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "project.updated",
+        projectId: project.id,
+        metadata: { timeZone: "Asia/Kolkata" },
+      }),
+    );
+  });
+
+  it("404s a project the caller cannot access", async () => {
+    const { app, projects } = buildApp({ project: null });
+
+    const res = await authedRequest(app)
+      .put("/projects/99999999-9999-4999-8999-999999999999/timezone")
+      .send({ timeZone: "UTC" });
+
+    expect(res.status).toBe(404);
+    expect(projects.setTimeZone).not.toHaveBeenCalled();
   });
 });

@@ -84,6 +84,11 @@ export async function runSchedulerTick(
         lastRunAt: candidate.lastRunAt,
         createdAt: candidate.createdAt,
         now,
+        // Issue #31 part 1: the project's own zone. `null` for a project that has
+        // not set one, which is the pre-#31 behaviour, and `isDueForSchedule`
+        // resolves an unusable stored value to UTC rather than throwing — a bad
+        // setting must not abort the tick for every other project.
+        timeZone: candidate.scheduleTimeZone,
       });
       if (!isDue) result.skippedNotDue += 1;
       return isDue;
