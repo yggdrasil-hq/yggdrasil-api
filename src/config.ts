@@ -88,12 +88,46 @@ export const config = {
    *
    * `retryDelayMs` is floored so a bad env var cannot turn a failing Postgres
    * connection into a tight reconnect loop.
+   *
+   * The three limits below are issue #24 (ADR 019 follow-up 4). They are
+   * configurable rather than constants because the right ceiling depends on the
+   * install — a self-hosted single-user deployment and a shared one have
+   * different ideas of "abusive" — and because the response to a limit that
+   * fires wrongly must be to raise it without a redeploy of the code. Each is
+   * floored for the same reason the numbers above are: a limit of 0 (or a NaN
+   * from an unparseable value) would close every socket on its first frame,
+   * which is an outage caused by a guard rather than prevented by it.
+   *
+   * The defaults and the reasoning behind their size are documented on
+   * `FrameBudget` in `live/limits.ts` — deliberately there rather than here, so
+   * the number and the argument for it cannot drift apart.
    */
   live: {
     enabled: process.env.LIVE_RELAY_ENABLED !== "false",
     retryDelayMs: Math.max(
       1_000,
       Number(process.env.LIVE_RELAY_RETRY_MS) || 5_000,
+    ),
+    /** Sustained outbound frames per socket, per second. */
+    framesPerSecond: Math.max(
+      1,
+      Math.floor(Number(process.env.LIVE_FRAMES_PER_SECOND)) || 60,
+    ),
+    /** Frames a socket may send back-to-back before the sustained rate applies. */
+    frameBurst: Math.max(
+      1,
+      Math.floor(Number(process.env.LIVE_FRAME_BURST)) || 120,
+    ),
+    /**
+     * Total delta text bytes relayed for one job before its deltas stop being
+     * relayed (issue #24). `0` disables the ceiling, matching
+     * `RECORDING_MAX_BYTES`' convention that 0 is a meaningful "off" rather than
+     * "unset" — see `recordRelayedDeltaBytes` in `jobs/repository.ts` for what
+     * happens at the boundary and why nothing is lost when it is reached.
+     */
+    deltaBytesPerJob: Math.max(
+      0,
+      Math.floor(Number(process.env.LIVE_DELTA_BYTES_PER_JOB)) || 8_000_000,
     ),
   },
   sessionTtl: {

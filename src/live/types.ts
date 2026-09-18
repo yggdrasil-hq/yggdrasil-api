@@ -37,6 +37,24 @@ export const LIVE_SOCKET_PATH = "/ws";
  */
 export const LIVE_CLOSE_UNAUTHORIZED = 4401;
 export const LIVE_CLOSE_PROTOCOL = 4400;
+/**
+ * Issue #24: the connection exceeded its frame budget and was closed.
+ *
+ * A distinct code rather than reusing `LIVE_CLOSE_PROTOCOL`, which is documented
+ * above as "a protocol mismatch". A rate limit is not a mismatch — the client did
+ * nothing malformed — and collapsing the two would make a log line or a close
+ * code unable to say which happened.
+ *
+ * **The client's correct response is to stop and fall back to polling**, exactly
+ * as for the other two codes, and this is a cross-repo contract worth being
+ * precise about: `web/lib/features/live-relay.ts` recognises 4401 and 4400 as
+ * do-not-retry and treats *any other* code as retryable. Until the Web app learns
+ * 4429, the interim behaviour is its bounded reconnect (ten attempts, 1s→30s
+ * backoff, then it stays on the poll) — degraded but correct, because it always
+ * ends in the complete REST state path and can never loop. Filed as a Web
+ * follow-up; this comment is the contract a future reader needs to see.
+ */
+export const LIVE_CLOSE_RATE_LIMITED = 4429;
 
 /**
  * A job event as it goes over the socket. `createdAt` is an ISO string here

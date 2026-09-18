@@ -1,0 +1,37 @@
+-- Issue #24 (ADR 019 follow-up 4): a ceiling on the delta text relayed for one
+-- job.
+--
+-- The per-socket frame budget in `live/limits.ts` bounds what one *connection*
+-- costs. It does not bound what one *job* can emit: a runaway model, or a
+-- producer bug, can stream deltas indefinitely, and every socket subscribed to
+-- that feature receives all of them. This column is that bound, and it is stored
+-- rather than counted in memory for three reasons:
+--
+--   1. The delta ingest runs on whichever API replica nginx happened to route the
+--      Orchestrator's POST to, and every replica can write deltas for the same
+--      job. An in-process counter would therefore allow N × the ceiling with N
+--      replicas, and would be silently wrong in exactly the 2-replica deployment
+--      ADR 003 §20 commits to.
+--   2. An in-process counter keyed by job needs an eviction policy, because
+--      nothing tells the API that a job finished — so the bound on the runaway
+--      would itself grow without bound, which is a poor trade for a memory-safety
+--      feature.
+--   3. It is diagnosable. "This job relayed 6.2 MB of deltas" is what an operator
+--      needs to confirm a runaway; a counter that lives in a process's heap and
+--      dies with it cannot answer that.
+--
+-- No extra round trip is created by this. `jobs/internal-routes.ts` already read
+-- the job row once per delta (`findById`, to resolve which feature the text
+-- belongs to); `recordRelayedDeltaBytes` replaces that read with an atomic
+-- `UPDATE … RETURNING` that resolves the feature *and* advances the counter, so
+-- the per-delta query count is unchanged.
+--
+-- Deliberately a counter on `jobs` and not a row per delta: ADR 019 item 13 keeps
+-- deltas out of `job_events` precisely because one row per token would multiply
+-- the append-only table and bloat the catch-up read. One column on a row that
+-- already exists preserves that property.
+--
+-- NOT NULL DEFAULT 0 rather than nullable: "no deltas relayed yet" and "this
+-- column predates the feature" are the same fact for every reader here, and a
+-- nullable column would put a COALESCE in every query for no information.
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS delta_bytes BIGINT NOT NULL DEFAULT 0;

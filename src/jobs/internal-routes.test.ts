@@ -94,6 +94,12 @@ function buildApp(deps: {
   upsertUsage?: ReturnType<typeof vi.fn>;
   /** ADR 019 item 13: the streaming-delta publisher. */
   publishDelta?: ReturnType<typeof vi.fn>;
+  /** Issue #24: a fixed running total for the per-job delta byte counter. */
+  deltaBytes?: number;
+  /** Issue #24: how many bytes each recorded delta adds, for ceiling tests. */
+  deltaBytesPerCall?: number;
+  /** Issue #24: replace the byte counter outright. */
+  recordRelayedDeltaBytes?: ReturnType<typeof vi.fn>;
   /** The catalog default for a job kind, which is how usage attribution finds a provider. */
   jobDefaultModelId?: string | null;
   catalogModel?: { providerName?: string } | null;
@@ -101,6 +107,28 @@ function buildApp(deps: {
   const create: (input: CreateInput) => Promise<JobEvent> =
     deps.create ?? (async (input) => makeEvent({ jobId: input.jobId, type: input.type }));
   const findById = deps.findById ?? (async (jobId: string) => makeJob({ id: jobId }));
+  /**
+   * Issue #24: the delta ingest now advances a per-job byte counter in the same
+   * statement that resolved the feature (`recordRelayedDeltaBytes`), replacing
+   * the `findById` it used to do. The fake mirrors that by resolving through the
+   * same `findById` these tests already stub, so a test that changes which job —
+   * and therefore which feature — a delta belongs to needs no second stub.
+   *
+   * The returned total is what lets a test drive the ceiling; `deps.deltaBytes`
+   * sets the running total and `deps.deltaBytesPerCall` how much each call adds.
+   */
+  const recordRelayedDeltaBytes =
+    deps.recordRelayedDeltaBytes ??
+    (async (jobId: string, bytes: number) => {
+      const job = await findById(jobId);
+      if (!job) return null;
+      const previousBytes = deps.deltaBytes ?? 0;
+      return {
+        featureId: job.featureId,
+        previousBytes,
+        totalBytes: previousBytes + (deps.deltaBytesPerCall ?? bytes),
+      };
+    });
   const setAwaitingUserInput = deps.setAwaitingUserInput ?? (async () => null);
   const setSpecReady = deps.setSpecReady ?? (async () => null);
   const findFeature = async () => ({
@@ -172,7 +200,7 @@ function buildApp(deps: {
     "/internal",
     createJobsInternalRouter({
       jobEvents: { create } as never,
-      jobs: { findById, create: deps.jobsCreate ?? (async () => ({ id: "kick_grill" })), hasActiveFeatureTestRuns, listFeatureTestRuns } as never,
+      jobs: { findById, recordRelayedDeltaBytes, create: deps.jobsCreate ?? (async () => ({ id: "kick_grill" })), hasActiveFeatureTestRuns, listFeatureTestRuns } as never,
       features: { findById: findFeature, setAwaitingUserInput, setSpecReady, updateStatus, setInReview, setRunning, setTesting, setAgenticReview: async () => null, approveReview, setReturned } as never,
       actionItems: {
         createMany: createManyActionItems,
@@ -188,6 +216,7 @@ function buildApp(deps: {
       } as never,
       usage: { upsert: upsertUsage } as never,
       live: { publishDelta } as never,
+      deltaBytesPerJob: deps.deltaBytesPerJob,
       modelConfig,
     }),
   );
@@ -252,7 +281,15 @@ describe("POST /internal/jobs/:jobId/events", () => {
           create: async (input: CreateInput) => makeEvent({ jobId: input.jobId, type: input.type }),
           listSpecGrillByFeature,
         } as never,
-        jobs: { findById: async () => makeJob({ featureId: "feature_42", projectId: "proj_1", kind: "feature_build" }), create: jobsCreate } as never,
+        jobs: {
+          findById: async () => makeJob({ featureId: "feature_42", projectId: "proj_1", kind: "feature_build" }),
+          recordRelayedDeltaBytes: async () => ({
+            featureId: "feature_42",
+            previousBytes: 0,
+            totalBytes: 1,
+          }),
+          create: jobsCreate,
+        } as never,
         features: {
           findById: async () => ({
             ...makeEvent(),
@@ -1060,6 +1097,197 @@ describe("POST /internal/jobs/:jobId/events (streaming deltas, ADR 019 item 13)"
     expect(publishDelta).not.toHaveBeenCalled();
   });
 
+  /*
+   * Issue #24: the per-job delta byte ceiling. The boundary is stated as three
+   * cases — under, at, over — because "there is a counter" is not the property
+   * that matters; where it cuts is.
+   *
+   * The ceiling's failure behaviour is intentionally *not* the per-socket
+   * budget's: exceeding it stops relaying that job's deltas rather than closing
+   * subscribers' sockets, because a runaway is the producer's problem and the
+   * people watching the feature did nothing. What makes that safe is that the
+   * authoritative `agent_text` still arrives over the stored-event path, so the
+   * cost is immediacy and never content — asserted here so the claim is not just
+   * a comment.
+   */
+  describe("per-job delta ceiling (issue #24)", () => {
+    const postDelta = (app: express.Express, message: string) =>
+      request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({ type: "agent_text_delta", message });
+
+    it("relays deltas that keep the job under the ceiling", async () => {
+      const publishDelta = vi.fn(async () => undefined);
+      const app = buildApp({
+        publishDelta,
+        deltaBytesPerJob: 100,
+        // 99 bytes: the last value that is still strictly under.
+        deltaBytes: 50,
+        deltaBytesPerCall: 49,
+      });
+
+      expect((await postDelta(app, "chunk")).status).toBe(202);
+      expect(publishDelta).toHaveBeenCalledTimes(1);
+    });
+
+    it("relays the delta that lands exactly on the ceiling", async () => {
+      // `total > ceiling`, not `>=`: landing on the limit is permitted, and
+      // getting this wrong by one byte is the kind of off-by-one that a limit
+      // test exists to pin. The next byte over is refused (below).
+      const publishDelta = vi.fn(async () => undefined);
+      const app = buildApp({
+        publishDelta,
+        deltaBytesPerJob: 100,
+        deltaBytes: 50,
+        deltaBytesPerCall: 50,
+      });
+
+      expect((await postDelta(app, "chunk")).status).toBe(202);
+      expect(publishDelta).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops relaying once the job is over the ceiling", async () => {
+      const publishDelta = vi.fn(async () => undefined);
+      const app = buildApp({
+        publishDelta,
+        deltaBytesPerJob: 100,
+        deltaBytes: 50,
+        deltaBytesPerCall: 51,
+      });
+
+      // Still 202: the caller cannot tell a relayed delta from a dropped one,
+      // and it must not — failing the request would report an error the agent
+      // has no way to act on.
+      expect((await postDelta(app, "chunk")).status).toBe(202);
+      expect(publishDelta).not.toHaveBeenCalled();
+    });
+
+    it("lets the authoritative agent_text through after deltas stop", async () => {
+      // The property that makes stopping safe. Same job, over its delta ceiling,
+      // and a stored event still relays — so the bubble ends up correct and only
+      // arrives later.
+      const publishDelta = vi.fn(async () => undefined);
+      const createEvent = vi.fn(async (input: { jobId: string; type: string }) => ({
+        id: "event_1",
+        jobId: input.jobId,
+        type: input.type,
+      }));
+      const app = express();
+      app.use(express.json());
+      app.use(
+        "/internal",
+        createJobsInternalRouter({
+          jobEvents: { create: createEvent } as never,
+          jobs: {
+            findById: async () => makeJob({ featureId: "feature_42" }),
+            recordRelayedDeltaBytes: async () => ({
+              featureId: "feature_42",
+              previousBytes: 500,
+              totalBytes: 501,
+            }),
+          } as never,
+          features: {} as never,
+          actionItems: {} as never,
+          tests: {} as never,
+          testRunReports: {} as never,
+          projects: {} as never,
+          designs: {} as never,
+          usage: {} as never,
+          modelConfig: {} as never,
+          live: { publishDelta } as never,
+          deltaBytesPerJob: 100,
+        }),
+      );
+
+      // A delta for the over-ceiling job is not relayed...
+      expect((await postDelta(app, "chunk")).status).toBe(202);
+      expect(publishDelta).not.toHaveBeenCalled();
+
+      // ...but the stored event for the same job is, which is the whole reason
+      // the ceiling can drop deltas without losing content.
+      const res = await request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({ type: "agent_text", message: "the complete answer" });
+
+      expect(res.status).toBe(201);
+      expect(createEvent).toHaveBeenCalledWith(
+        expect.objectContaining({ type: "agent_text", message: "the complete answer" }),
+      );
+    });
+
+    it("treats a ceiling of zero as switched off, not as zero bytes allowed", async () => {
+      // The convention `RECORDING_MAX_BYTES` already sets in this codebase: 0 is
+      // an instruction ("no ceiling"), not an unset value. Reading it as "zero
+      // permitted" would silently disable the whole delta path for anyone who
+      // set it that way.
+      const publishDelta = vi.fn(async () => undefined);
+      const app = buildApp({
+        publishDelta,
+        deltaBytesPerJob: 0,
+        deltaBytes: 10_000_000,
+        deltaBytesPerCall: 10_000_000,
+      });
+
+      expect((await postDelta(app, "chunk")).status).toBe(202);
+      expect(publishDelta).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not relay a delta for a job with no feature", async () => {
+      // ADR 014's project-scoped design_grill has no feature topic to route to.
+      // The counter still advances — the job did produce the text — but there is
+      // nothing to publish it to.
+      const publishDelta = vi.fn(async () => undefined);
+      const app = buildApp({
+        publishDelta,
+        recordRelayedDeltaBytes: vi.fn(async () => ({
+          featureId: null,
+          previousBytes: 0,
+          totalBytes: 5,
+        })),
+      });
+
+      expect((await postDelta(app, "chunk")).status).toBe(202);
+      expect(publishDelta).not.toHaveBeenCalled();
+    });
+
+    it("logs the crossing once per job, not once per delta", async () => {
+      // A limit that floods the log while enforcing itself has just moved the
+      // problem. The `previousBytes` the atomic update returns is what makes
+      // "exactly once" implementable without an in-memory set of warned jobs
+      // (which would grow without bound and be per-replica anyway).
+      const publishDelta = vi.fn(async () => undefined);
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        // First call crosses from 50 → 101; every later call stays over.
+        let previous = 50;
+        const app = buildApp({
+          publishDelta,
+          deltaBytesPerJob: 100,
+          recordRelayedDeltaBytes: vi.fn(async () => {
+            const total = previous + 51;
+            const result = { featureId: "feature_42", previousBytes: previous, totalBytes: total };
+            previous = total;
+            return result;
+          }),
+        });
+
+        for (let i = 0; i < 5; i += 1) {
+          expect((await postDelta(app, "chunk")).status).toBe(202);
+        }
+
+        const ceilingLogs = errorSpy.mock.calls.filter((call) =>
+          String(call[0]).includes("exceeded the per-job delta ceiling"),
+        );
+        expect(ceilingLogs).toHaveLength(1);
+        expect(publishDelta).not.toHaveBeenCalled();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+  });
+
   it("still answers 202 when the relay itself fails", async () => {
     // Best-effort by contract: the delta is ephemeral and the client has a REST
     // catch-up, so a relay failure must not report an error the agent cannot act
@@ -1128,7 +1356,14 @@ describe("POST /internal/jobs/:jobId/events (streaming deltas, ADR 019 item 13)"
       "/internal",
       createJobsInternalRouter({
         jobEvents: { create: async () => makeEvent({}) } as never,
-        jobs: { findById: async () => makeJob({ featureId: "feature_42" }) } as never,
+        jobs: {
+          findById: async () => makeJob({ featureId: "feature_42" }),
+          recordRelayedDeltaBytes: async () => ({
+            featureId: "feature_42",
+            previousBytes: 0,
+            totalBytes: 6,
+          }),
+        } as never,
         features: {} as never,
         actionItems: {} as never,
         tests: {} as never,

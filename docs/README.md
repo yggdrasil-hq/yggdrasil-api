@@ -16,6 +16,7 @@ before reading the body.
 | Doc | Read this when |
 |-----|----------------|
 | [`concepts/authentication.md`](concepts/authentication.md) | Auth routes, sessions, OAuth, migrations. |
+| [`concepts/live-relay-limits.md`](concepts/live-relay-limits.md) | You touch `src/live/`, the delta ingest, or an install reports live updates stopped. |
 
 ## conventions/
 | Doc | Read this when |
