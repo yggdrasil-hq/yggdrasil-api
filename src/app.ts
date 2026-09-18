@@ -8,6 +8,7 @@ import cors from "cors";
 import express, { type Express } from "express";
 import type pg from "pg";
 import { config } from "./config.js";
+import { createObjectStorage } from "./storage/client.js";
 import { AuditEventRepository } from "./audit/repository.js";
 import { PostgresAuditRecorder } from "./audit/record.js";
 import { auditContextMiddleware } from "./audit/request-context.js";
@@ -122,8 +123,14 @@ export function createApp(deps?: AppDependencies): Express {
   const audit = new PostgresAuditRecorder(auditEvents);
   const deploys = new ProjectDeployRepository(deps.pool);
   const previews = new JobPreviewRepository(deps.pool);
-  const recordings = new JobRecordingRepository(deps.pool);
-  const screenshots = new JobScreenshotRepository(deps.pool);
+  // Issue #30: whether artifacts go to object storage is decided once, from
+  // the configuration, and handed to every repository that stores bytes. Null
+  // when no bucket is configured, which is what makes this change additive — the
+  // repositories fall back to their previous Postgres columns, so an install
+  // that has not been given a bucket behaves exactly as it did before.
+  const objectStorage = createObjectStorage(config.storage.configured ? config.storage : null);
+  const recordings = new JobRecordingRepository(deps.pool, objectStorage);
+  const screenshots = new JobScreenshotRepository(deps.pool, objectStorage);
   app.use(
     "/webhooks",
     createGitHubWebhookRouter({
@@ -161,7 +168,7 @@ export function createApp(deps?: AppDependencies): Express {
   const featureModelOverrides = new FeatureJobModelOverrideRepository(deps.pool);
   const featureModelSecrets = new FeatureModelSecretRepository(deps.pool);
   const jobUsage = new JobUsageRepository(deps.pool);
-  const orgExtensions = new OrgExtensionRepository(deps.pool);
+  const orgExtensions = new OrgExtensionRepository(deps.pool, objectStorage);
   const allocations = new AllocationRepository(deps.pool);
 
   app.use("/auth", createAuthRouter({ users, sessions }));

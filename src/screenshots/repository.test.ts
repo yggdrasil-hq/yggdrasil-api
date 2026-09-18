@@ -34,6 +34,10 @@ function screenshotRow(overrides: Record<string, unknown> = {}) {
     expires_at: new Date("2026-10-18T10:00:00.000Z"),
     purged_at: null,
     created_at: new Date("2026-09-18T10:00:00.000Z"),
+    // Issue #30: a row that predates object storage is the default a fixture
+    // should carry, so the object branch is only entered when a test asks for it.
+    storage_backend: "postgres",
+    object_key: null,
     ...overrides,
   };
 }
@@ -73,6 +77,10 @@ describe("JobScreenshotRepository.upsert", () => {
       120_000,
       expect.any(Buffer),
       new Date("2026-10-18T10:00:00.000Z"),
+      // Issue #30: with no storage configured the bytes stay in the column, and
+      // the row records that as `postgres` with no object key.
+      "postgres",
+      null,
     ]);
   });
 });
@@ -90,6 +98,10 @@ describe("JobScreenshotRepository reads", () => {
     // The listing must not pull images into memory: this is what keeps a
     // run-history response small regardless of how many screenshots a run took.
     expect(sql).not.toMatch(/\bdata\b/);
+    // The storage columns *are* selected: a metadata read still needs to know
+    // where the bytes live, so the UI can describe an artifact without fetching
+    // it.
+    expect(sql).toMatch(/storage_backend, object_key/);
     expect(values).toEqual([JOB_ID, 200]);
   });
 
@@ -120,6 +132,34 @@ describe("JobScreenshotRepository reads", () => {
     expect(found?.purgedAt).not.toBeNull();
   });
 
+  it("fetches object-backed bytes from the bucket", async () => {
+    const { pool } = fakePool([
+      screenshotRow({
+        data: null,
+        storage_backend: "object",
+        object_key: "screenshots/p/j/s.png",
+      }),
+    ]);
+    const asked: string[] = [];
+    const storage = {
+      ensureBucket: async () => undefined,
+      putObject: async () => undefined,
+      getObject: async (key: string) => {
+        asked.push(key);
+        return Buffer.from([1, 2, 3]);
+      },
+      deleteObject: async () => undefined,
+    };
+
+    const found = await new JobScreenshotRepository(pool, storage).findContent(
+      JOB_ID,
+      SCREENSHOT_ID,
+    );
+
+    expect(asked).toEqual(["screenshots/p/j/s.png"]);
+    expect(found?.data).toEqual(Buffer.from([1, 2, 3]));
+  });
+
   it("counts tombstones too, so the per-job cap cannot be reset by a purge", async () => {
     const { pool, query } = fakePool([{ count: "7" }]);
     const repository = new JobScreenshotRepository(pool);
@@ -133,24 +173,96 @@ describe("JobScreenshotRepository reads", () => {
   });
 });
 
+/**
+ * Issue #30: `purgeExpired` selects its candidates first, because reclaiming an
+ * object-backed artifact is a network call rather than an `UPDATE`. The fake
+ * pool here answers the SELECT with a Postgres-backed candidate so the rest of
+ * each assertion still describes the tombstone statement.
+ */
+function candidatePool(
+  candidates: Array<{ id: string; storage_backend: string; object_key: string | null }>,
+) {
+  const query = vi.fn(async (sql: string, values: unknown[] = []) => {
+    if (/^\s*SELECT/i.test(sql)) return { rows: candidates, rowCount: candidates.length };
+    return { rows: [], rowCount: candidates.length, values };
+  });
+  return { pool: { query } as unknown as pg.Pool, query };
+}
+
 describe("JobScreenshotRepository.purgeExpired", () => {
   it("nulls the bytes and stamps the purge, keeping the row", async () => {
-    const { pool, query } = fakePool([{ id: SCREENSHOT_ID }]);
+    const { pool, query } = candidatePool([
+      { id: SCREENSHOT_ID, storage_backend: "postgres", object_key: null },
+    ]);
     const repository = new JobScreenshotRepository(pool);
 
     expect(await repository.purgeExpired()).toBe(1);
 
-    const [sql] = query.mock.calls[0];
-    expect(sql).toMatch(/SET data = NULL, purged_at = NOW\(\)/);
-    // `<=` matches `artifactState`'s predicate exactly — the same rule written
-    // once in SQL for the sweep and once in TypeScript for a read. If these two
-    // drifted, an artifact would be either a link that 404s or bytes that are
-    // never reclaimed.
-    expect(sql).toMatch(/expires_at <= NOW\(\)/);
-    // Only rows still holding bytes, so the sweep is idempotent and a second
-    // replica finds nothing to do.
-    expect(sql).toMatch(/WHERE data IS NOT NULL/);
-    expect(sql).toMatch(/LIMIT \$1/);
+    const update = query.mock.calls.find((call) => /UPDATE/i.test(call[0] as string))!;
+    expect(update[0]).toMatch(/SET data = NULL, purged_at = NOW\(\)/);
+    // Targeting by id rather than by a re-run of the predicate: the candidate
+    // list was already resolved, and that is what makes an object-backed row's
+    // fate independent of a Postgres-backed one's.
+    expect(update[0]).toMatch(/WHERE id = ANY\(\$1::uuid\[\]\)/);
+  });
+
+  it("selects only rows still holding bytes, from either backend", async () => {
+    // The predicate the partial index mirrors. `object_key IS NOT NULL` is the
+    // half that would be missing if this change had been made carelessly, and
+    // its absence would mean object-backed artifacts were never reclaimed —
+    // while every test that only used Postgres rows still passed.
+    const { pool, query } = candidatePool([]);
+    await new JobScreenshotRepository(pool).purgeExpired(10);
+
+    const select = query.mock.calls[0]![0] as string;
+    expect(select).toMatch(/data IS NOT NULL OR object_key IS NOT NULL/);
+    expect(select).toMatch(/expires_at <= NOW\(\)/);
+    expect(select).toMatch(/LIMIT \$1/);
+    expect(query.mock.calls[0]![1]).toEqual([10]);
+  });
+
+  it("deletes the object and stamps the purge, keeping the object key", async () => {
+    const { pool, query } = candidatePool([
+      { id: SCREENSHOT_ID, storage_backend: "object", object_key: "screenshots/p/j/s.png" },
+    ]);
+    const deleted: string[] = [];
+    const storage = {
+      ensureBucket: async () => undefined,
+      putObject: async () => undefined,
+      getObject: async () => null,
+      deleteObject: async (key: string) => {
+        deleted.push(key);
+      },
+    };
+
+    expect(await new JobScreenshotRepository(pool, storage).purgeExpired()).toBe(1);
+    expect(deleted).toEqual(["screenshots/p/j/s.png"]);
+
+    const update = query.mock.calls.find((call) => /UPDATE/i.test(call[0] as string))!;
+    // Only the stamp: the key is deliberately kept, because it is the only record
+    // of what to retry if the delete had failed, and the row already holds no
+    // bytes to null.
+    expect(update[0]).toMatch(/SET purged_at = NOW\(\)/);
+    expect(update[0]).not.toMatch(/data = NULL/);
+  });
+
+  it("leaves an object-backed row reclaimable when the delete fails", async () => {
+    // Tombstoning anyway would record "reclaimed" while the bytes stayed in the
+    // bucket, and nothing would ever try again.
+    const { pool, query } = candidatePool([
+      { id: SCREENSHOT_ID, storage_backend: "object", object_key: "screenshots/p/j/s.png" },
+    ]);
+    const storage = {
+      ensureBucket: async () => undefined,
+      putObject: async () => undefined,
+      getObject: async () => null,
+      deleteObject: async () => {
+        throw new Error("bucket unreachable");
+      },
+    };
+
+    expect(await new JobScreenshotRepository(pool, storage).purgeExpired()).toBe(0);
+    expect(query.mock.calls.some((call) => /UPDATE/i.test(call[0] as string))).toBe(false);
   });
 
   it("reports zero when there is nothing to reclaim", async () => {

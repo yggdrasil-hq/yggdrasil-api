@@ -202,6 +202,53 @@ export const config = {
       Math.floor(Number(process.env.SCREENSHOT_SWEEP_INTERVAL_MS)) || 15 * 60_000,
     ),
   },
+  /**
+   * Issue #30: where binary artifacts are stored.
+   *
+   * These six variables have been set by both compose files since the dev stack
+   * was written and read by nothing — the issue calls them "aspirational", and
+   * this is what they were aspirational *for*. A recording is orders of magnitude
+   * larger than the JSON report beside it, ADR 029 stored the bytes in Postgres
+   * because no storage client existed, and the consequence recorded there was a
+   * database whose backups had started to contain video.
+   *
+   * `enabled` is derived rather than read from its own variable, and that is the
+   * important decision here: object storage is used when it is *configured*
+   * (endpoint, both credentials and a bucket are all present) and not otherwise.
+   * A separate switch would allow the two to disagree — on, with no endpoint,
+   * which is a config that can only fail at the first upload; or off, with a
+   * complete configuration, which is a set of variables that silently does
+   * nothing, which is exactly the bug being fixed. Deriving it means "configured"
+   * and "used" cannot drift, and `createObjectStorage` returns null rather than
+   * throwing when the config is partial, so a half-filled install falls back to
+   * Postgres and keeps working.
+   *
+   * The credentials are read the same way every other secret in this file is —
+   * plain `process.env`, never logged — and `S3_FORCE_PATH_STYLE` defaults to
+   * true because the bundled service is MinIO, where path style is the norm; an
+   * install pointing at AWS S3 sets it to "false" explicitly.
+   */
+  storage: (() => {
+    const endpoint = process.env.S3_ENDPOINT ?? "";
+    const accessKeyId = process.env.S3_ACCESS_KEY ?? "";
+    const secretAccessKey = process.env.S3_SECRET_KEY ?? "";
+    const bucket = process.env.S3_BUCKET ?? "";
+    return {
+      endpoint,
+      accessKeyId,
+      secretAccessKey,
+      bucket,
+      region: process.env.S3_REGION ?? "us-east-1",
+      forcePathStyle: process.env.S3_FORCE_PATH_STYLE !== "false",
+      /**
+       * True only when a client can actually be built, i.e. when every field
+       * `createObjectStorage` requires is present. Reading it from the same
+       * predicate keeps the log line below and the wiring in `app.ts` agreeing
+       * about whether storage is on.
+       */
+      configured: Boolean(endpoint && accessKeyId && secretAccessKey && bucket),
+    };
+  })(),
   rateLimit: {
     perUsername: { max: 10, windowMs: 15 * 60 * 1000 },
     perIp: { max: 30, windowMs: 15 * 60 * 1000 },
