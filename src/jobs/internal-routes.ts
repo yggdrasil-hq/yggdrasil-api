@@ -361,6 +361,13 @@ export function createJobsInternalRouter(deps: {
               : parsed.data.type === "submit_review"
                 ? parsed.data.comment ?? parsed.data.summary
                 : parsed.data.summary,
+          // Issue #59: named explicitly rather than left to the spread above.
+          // Relying on `...parsed.data` is how the verdict came to be validated,
+          // acted on, and then dropped without a type error — a caller spreading
+          // a wider object satisfies a narrower parameter, so an undeclared field
+          // is discarded silently. Spelling it means removing it is a compile
+          // error rather than a quiet loss.
+          verdict: parsed.data.verdict,
           actionItems: parsed.data.actionItems,
           snapshot: parsed.data.snapshot,
         });
