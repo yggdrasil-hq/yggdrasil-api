@@ -67,7 +67,7 @@ export class JobRepository {
     testId?: string;
     testGroup?: "unit" | "integration";
     ref?: string;
-    trigger?: "feature" | "schedule";
+    trigger?: "feature" | "schedule" | "manual";
     designName?: string;
     designSlug?: string;
     designDescription?: string;
@@ -231,6 +231,29 @@ export class JobRepository {
            AND status IN ('pending', 'running')
        ) AS exists`,
       [featureId],
+    );
+    return result.rows[0]?.exists ?? false;
+  }
+
+  /**
+   * Issue #31: whether this test already has a run in flight.
+   *
+   * Scoped to the test rather than the project, because "Run now" is per-test and
+   * the project-wide check would refuse a manual run merely because some *other*
+   * suite was running. The guard exists because a double-clicked button would
+   * otherwise enqueue two identical runs verifying the same commit — the
+   * scheduler gets this for free (at most one dispatch per test per tick), and a
+   * manual trigger has no tick to lean on.
+   */
+  async hasActiveRunForTest(testId: string): Promise<boolean> {
+    const result = await this.db.query<{ exists: boolean }>(
+      `SELECT EXISTS(
+         SELECT 1 FROM jobs
+         WHERE test_id = $1
+           AND kind IN ('test_run', 'script_test_run')
+           AND status IN ('pending', 'running')
+       ) AS exists`,
+      [testId],
     );
     return result.rows[0]?.exists ?? false;
   }

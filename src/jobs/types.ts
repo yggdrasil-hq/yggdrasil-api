@@ -17,7 +17,12 @@ export interface Job {
   testId: string | null;
   testGroup: "unit" | "integration" | null;
   ref: string | null;
-  trigger: "feature" | "schedule" | null;
+  /**
+   * How the job came to exist. `manual` is a person pressing "Run now" on a Test
+   * (issue #31) — deliberately not folded into `schedule`, which would attribute
+   * a deliberate run to the scheduler in the history the field exists to explain.
+   */
+  trigger: "feature" | "schedule" | "manual" | null;
   designName: string | null;
   designSlug: string | null;
   designDescription: string | null;

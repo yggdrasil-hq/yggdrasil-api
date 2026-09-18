@@ -13,7 +13,8 @@ export async function dispatchJob(
     testId?: string;
     testGroup?: "unit" | "integration";
     ref?: string;
-    trigger?: "feature" | "schedule";
+    /** How the job came to exist — `manual` is a person pressing "Run now" (issue #31). */
+    trigger?: "feature" | "schedule" | "manual";
     designName?: string;
     designSlug?: string;
     designDescription?: string;
