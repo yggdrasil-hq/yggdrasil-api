@@ -14,7 +14,13 @@ export type JobEventType =
   | "report_test_step"
   | "submit_test_report"
   | "update_design_preview"
-  | "submit_design";
+  | "submit_design"
+  /**
+   * Issue #27: the Orchestrator synthesized this locally to report that the
+   * build's entrypoint resolved conflicts between the feature branch and its
+   * base. Context for a reviewer, not a result — see the API's job-event route.
+   */
+  | "merge_conflicts";
 
 export interface JobEventActionItem {
   type: string;

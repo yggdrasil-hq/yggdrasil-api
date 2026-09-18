@@ -65,6 +65,9 @@ const jobEventSchema = z.object({
     "submit_test_report",
     "update_design_preview",
     "submit_design",
+    // Issue #27: synthesized by the Orchestrator, which reads the marker the
+    // build pod's entrypoint wrote when it resolved conflicts with the base.
+    "merge_conflicts",
   ]),
   question: z.string().optional(),
   markdown: z.string().optional(),
