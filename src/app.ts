@@ -74,6 +74,9 @@ import { TestRunReportRepository } from "./tests/reports-repository.js";
 import { JobRecordingRepository } from "./recordings/repository.js";
 import { createRecordingsRouter } from "./recordings/routes.js";
 import { createRecordingsInternalRouter } from "./recordings/internal-routes.js";
+import { JobScreenshotRepository } from "./screenshots/repository.js";
+import { createScreenshotsRouter } from "./screenshots/routes.js";
+import { createScreenshotsInternalRouter } from "./screenshots/internal-routes.js";
 import { UserRepository } from "./users/repository.js";
 import { NOOP_LIVE_PUBLISHER, type LivePublisher } from "./live/deltas.js";
 
@@ -120,6 +123,7 @@ export function createApp(deps?: AppDependencies): Express {
   const deploys = new ProjectDeployRepository(deps.pool);
   const previews = new JobPreviewRepository(deps.pool);
   const recordings = new JobRecordingRepository(deps.pool);
+  const screenshots = new JobScreenshotRepository(deps.pool);
   app.use(
     "/webhooks",
     createGitHubWebhookRouter({
@@ -348,6 +352,15 @@ export function createApp(deps?: AppDependencies): Express {
     "/projects",
     createRecordingsRouter({ users, sessions, projects, jobs, recordings }),
   );
+
+  // Issue #22: a run's screenshots, behind the same project-access gate as its
+  // recording — a screenshot of a real session can show real customer data, so
+  // it is not served from a public URL. Same `/projects` mount and path shape as
+  // the recordings router above.
+  app.use(
+    "/projects",
+    createScreenshotsRouter({ users, sessions, projects, jobs, screenshots }),
+  );
   app.use(
     "/internal",
     createOrganizationsInternalRouter({ projects, clusters: orgClusters }),
@@ -358,6 +371,11 @@ export function createApp(deps?: AppDependencies): Express {
   app.use(
     "/internal",
     createRecordingsInternalRouter({ jobs, recordings }),
+  );
+
+  app.use(
+    "/internal",
+    createScreenshotsInternalRouter({ jobs, screenshots }),
   );
   app.use("/internal", createAllocationsInternalRouter({ projects, allocations }));
   app.use(

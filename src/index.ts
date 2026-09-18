@@ -14,6 +14,8 @@ import { createLiveSocketServer } from "./live/socket.js";
 import { ProjectRepository } from "./projects/repository.js";
 import { JobRecordingRepository } from "./recordings/repository.js";
 import { startRecordingSweep } from "./recordings/sweep.js";
+import { JobScreenshotRepository } from "./screenshots/repository.js";
+import { startScreenshotSweep } from "./screenshots/sweep.js";
 import { startScheduler } from "./scheduling/scheduler.js";
 import { startTestingGateReconcile } from "./features/testing-gate-reconcile.js";
 import { UserRepository } from "./users/repository.js";
@@ -103,6 +105,19 @@ async function main(): Promise<void> {
     startRecordingSweep(
       new JobRecordingRepository(pool),
       config.recordings.sweepIntervalMs,
+      (message) => console.error(message),
+    );
+  }
+
+  // Issue #22: the same retention discipline for per-step screenshots. Its own
+  // sweep rather than sharing the recordings' one — the two windows are
+  // deliberately independent (screenshots are three orders of magnitude smaller,
+  // so a project may keep them longer), and a shared ticker would couple them so
+  // that raising one silently changed the other's cadence.
+  if (config.screenshots.enabled) {
+    startScreenshotSweep(
+      new JobScreenshotRepository(pool),
+      config.screenshots.sweepIntervalMs,
       (message) => console.error(message),
     );
   }
