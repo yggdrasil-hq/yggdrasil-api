@@ -16,6 +16,7 @@ function makeEvent(overrides: Partial<JobEvent> = {}): JobEvent {
     status: null,
     prUrl: null,
     summary: null,
+    verdict: null,
     actionItems: null,
     snapshot: null,
     createdAt: new Date(),

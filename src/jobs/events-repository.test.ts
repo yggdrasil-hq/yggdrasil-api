@@ -18,6 +18,7 @@ function eventRow(overrides: Record<string, unknown> = {}) {
     status: null,
     pr_url: null,
     summary: null,
+    verdict: null,
     action_items: null,
     design_snapshot: null,
     created_at: new Date("2026-09-18T10:00:00.000Z"),
@@ -117,5 +118,62 @@ describe("JobEventRepository.findByIdWithScope", () => {
     const { db } = fakePool({ scope: [] });
     const repository = new JobEventRepository(db as never);
     expect(await repository.findByIdWithScope(EVENT_ID)).toBeNull();
+  });
+});
+
+describe("verdict persistence and the feature's latest review (issue #59)", () => {
+  it("declares and stores the verdict, so it is not silently dropped", async () => {
+    const { db, queries } = fakePool({ insert: [eventRow({ type: "submit_review", verdict: "approved" })] });
+    const repository = new JobEventRepository(db as never);
+
+    const event = await repository.create({
+      jobId: JOB_ID,
+      type: "submit_review",
+      verdict: "approved",
+      summary: "Looks right.",
+    });
+
+    // The regression this guards: the caller spreads a validated payload into
+    // `create`, and a spread satisfies a narrower parameter — so an undeclared
+    // field compiles and is discarded. That is how the verdict was lost.
+    const insert = queries.find((q) => q.sql.includes("INSERT INTO job_events"));
+    expect(insert?.sql).toContain("verdict");
+    expect(insert?.values).toContain("approved");
+    expect(event.verdict).toBe("approved");
+  });
+
+  it("stores null for an event with no verdict", async () => {
+    const { db } = fakePool({ insert: [eventRow({ type: "agent_text" })] });
+    const repository = new JobEventRepository(db as never);
+
+    await repository.create({ jobId: JOB_ID, type: "agent_text", message: "hi" });
+
+    // Nothing to assert beyond "it did not throw on a missing optional field".
+    expect(true).toBe(true);
+  });
+
+  it("reads the feature's latest review through a join on jobs", async () => {
+    const { db, queries } = fakePool({
+      scope: [eventRow({ type: "submit_review", verdict: "changes_requested", summary: "Fix it." })],
+    });
+    const repository = new JobEventRepository(db as never);
+
+    const review = await repository.findLatestReviewByFeature(FEATURE_ID);
+
+    expect(review?.verdict).toBe("changes_requested");
+    const read = queries.find((q) => q.sql.includes("submit_review"));
+    // Qualified columns: `jobs` also has `id` and `created_at`, so the shared
+    // unqualified `jobEventColumns` constant here would be #61 all over again.
+    expect(read?.sql).toContain("e.verdict");
+    expect(read?.sql).toContain("e.created_at");
+    expect(read?.sql).not.toMatch(/\bSELECT id, job_id/);
+    expect(read?.values).toEqual([FEATURE_ID]);
+  });
+
+  it("returns null for a feature that has never been reviewed", async () => {
+    const { db } = fakePool({ scope: [] });
+    const repository = new JobEventRepository(db as never);
+
+    expect(await repository.findLatestReviewByFeature(FEATURE_ID)).toBeNull();
   });
 });

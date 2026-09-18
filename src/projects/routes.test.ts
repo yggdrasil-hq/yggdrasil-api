@@ -127,8 +127,10 @@ function fakeModelConfigDeps(bundle: Record<string, string> = {}) {
 }
 
 interface BuildAppOptions {
-  project: Project;
-  feature?: Feature;
+  /** `null` means "the caller cannot access it", which is how the 404 paths are driven. */
+  project: Project | null;
+  /** `null` means "no such feature in that project". */
+  feature?: Feature | null;
   projectSecrets?: Record<string, string>;
   orgSecrets?: Record<string, string>;
   activeSpecGrillJob?: unknown;
@@ -143,6 +145,8 @@ interface BuildAppOptions {
   refForRevision?: string | null;
   /** Issue #31: whether the target test already has a run in flight. */
   testHasActiveRun?: boolean;
+  /** Issue #59: the feature's most recent `submit_review` event, or null. */
+  latestReview?: unknown;
   /** ADR 024 state: the latest job (whose events form the transcript) and its events. */
   latestJob?: unknown;
   transcriptEvents?: unknown[];
@@ -151,6 +155,16 @@ interface BuildAppOptions {
 }
 
 function buildApp(opts: BuildAppOptions) {
+  /**
+   * Issue #59: the Agentic Review read. Defaults to "never reviewed" — the state
+   * most tests are in, and the one the endpoint's null-verdict branch is about.
+   */
+  const jobEvents = {
+    listByJob: vi.fn(async () => opts.transcriptEvents ?? []),
+    listSpecGrillByFeature: vi.fn(async () => opts.transcriptEvents ?? []),
+    findLatestReviewByFeature: vi.fn(async () => opts.latestReview ?? null),
+  };
+
   const app = express();
   app.use(cookieParser());
   app.use(express.json());
@@ -169,7 +183,7 @@ function buildApp(opts: BuildAppOptions) {
   };
   const projects = {
     findByIdForUser: vi.fn(async (id: string, userId: string) =>
-      id === opts.project.id && userId === OWNER_ID ? opts.project : null,
+      opts.project && id === opts.project.id && userId === OWNER_ID ? opts.project : null,
     ),
     create: vi.fn(async () => opts.project),
     markReady: vi.fn(async () => undefined),
@@ -323,10 +337,7 @@ function buildApp(opts: BuildAppOptions) {
       tests: tests as never,
       testRunReports: testRunReports as never,
       jobs: jobs as never,
-      jobEvents: {
-        listByJob: vi.fn(async () => opts.transcriptEvents ?? []),
-        listSpecGrillByFeature: vi.fn(async () => opts.transcriptEvents ?? []),
-      } as never,
+      jobEvents: jobEvents as never,
       jobMessages: {} as never,
       notifications: notifications as never,
       installations: installations as never,
@@ -359,6 +370,7 @@ function buildApp(opts: BuildAppOptions) {
     audit,
     designs,
     deploys,
+    jobEvents,
   };
 }
 
@@ -2144,5 +2156,107 @@ describe("PATCH /:projectId/uploaded-extensions-enabled (ADR 025)", () => {
 
     expect(res.status).toBe(404);
     expect(projects.setUploadedExtensionsEnabled).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET /:projectId/features/:featureId/agentic-review (issue #59)", () => {
+  const project = makeProject();
+  const feature = makeFeature({ status: "agentic_review" });
+  const url = `/projects/${project.id}/features/${feature.id}/agentic-review`;
+
+  /**
+   * The path the Web app actually calls. `fetchFeatureAgenticReview`
+   * (`web/lib/api.ts`) builds exactly this URL, and it 404'd against the real app
+   * for the whole life of the tab — nothing asserted the two sides agreed. This
+   * is that assertion, in the API's own suite because that is where the route
+   * lives; #56 was the same class of gap one layer over.
+   */
+  it("resolves the path the Web client calls", async () => {
+    const { app, jobEvents } = buildApp({ project, feature, latestReview: null });
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(200);
+    expect(jobEvents.findLatestReviewByFeature).toHaveBeenCalledWith(feature.id);
+  });
+
+  it("returns the recorded verdict and comment", async () => {
+    const { app } = buildApp({
+      project,
+      feature,
+      latestReview: {
+        id: "evt_1",
+        jobId: "job_1",
+        type: "submit_review",
+        question: null,
+        markdown: null,
+        message: null,
+        status: null,
+        prUrl: null,
+        summary: "The refresh path is missing.",
+        verdict: "changes_requested",
+        actionItems: null,
+        snapshot: null,
+        createdAt: new Date("2026-09-18T10:00:00.000Z"),
+      },
+    });
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      verdict: "changes_requested",
+      summary: "The refresh path is missing.",
+      comments: [],
+      jobId: "job_1",
+      completedAt: "2026-09-18T10:00:00.000Z",
+    });
+  });
+
+  // The tab's reported symptom. A 404 made "nobody has reviewed this" and "the
+  // request failed" the same outcome, so the client's honest empty state could
+  // never render and every un-reviewed feature showed an error instead.
+  it("answers 200 with a null verdict for a feature that was never reviewed", async () => {
+    const { app } = buildApp({ project, feature, latestReview: null });
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(200);
+    expect(res.body.verdict).toBeNull();
+    expect(res.body.summary).toBeNull();
+    expect(res.body.comments).toEqual([]);
+  });
+
+  it("404s a feature that is not in the project the caller asked about", async () => {
+    // `getOwnedProject` succeeds (the caller owns the project); the feature read
+    // is what has to reject it, which is the same gate the sibling routes use.
+    const { app, jobEvents } = buildApp({ project, feature: null });
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/features/${feature.id}/agentic-review`,
+    );
+
+    expect(res.status).toBe(404);
+    expect(jobEvents.findLatestReviewByFeature).not.toHaveBeenCalled();
+  });
+
+  it("404s a malformed feature id without querying", async () => {
+    const { app, jobEvents } = buildApp({ project, feature });
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/features/not-a-uuid/agentic-review`,
+    );
+
+    expect(res.status).toBe(404);
+    expect(jobEvents.findLatestReviewByFeature).not.toHaveBeenCalled();
+  });
+
+  it("404s a project the caller cannot access", async () => {
+    const { app, jobEvents } = buildApp({ project: null, feature });
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(404);
+    expect(jobEvents.findLatestReviewByFeature).not.toHaveBeenCalled();
   });
 });

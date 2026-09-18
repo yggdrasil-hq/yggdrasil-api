@@ -39,6 +39,16 @@ export interface JobEvent {
   status: string | null;
   prUrl: string | null;
   summary: string | null;
+  /**
+   * Issue #59: the Agentic Review verdict, when this row is a `submit_review`.
+   *
+   * NULL means **not recorded** rather than "no verdict": the column was added
+   * after the event type existed, and every review written before it has no
+   * verdict to recover (`db/migrations/051_job_event_verdict.sql`). The read
+   * endpoint's `verdict: null` is the same word for the same reason, which is
+   * why neither is rendered as a decision of any kind.
+   */
+  verdict: string | null;
   actionItems: JobEventActionItem[] | null;
   snapshot: Record<string, string> | null;
   createdAt: Date;
@@ -54,6 +64,7 @@ interface JobEventRow {
   status: string | null;
   pr_url: string | null;
   summary: string | null;
+  verdict: string | null;
   action_items: JobEventActionItem[] | null;
   design_snapshot: Record<string, string> | null;
   created_at: Date;
@@ -74,7 +85,7 @@ export interface JobEventWithScope {
 
 /** The event columns, spelled once so every read returns the same shape. */
 const jobEventColumns = `id, job_id, type, question, markdown, message, status, pr_url,
-         summary, action_items, design_snapshot, created_at`;
+         summary, verdict, action_items, design_snapshot, created_at`;
 
 function mapJobEvent(row: JobEventRow): JobEvent {
   return {
@@ -87,6 +98,7 @@ function mapJobEvent(row: JobEventRow): JobEvent {
     status: row.status,
     prUrl: row.pr_url,
     summary: row.summary,
+    verdict: row.verdict,
     actionItems: row.action_items,
     snapshot: row.design_snapshot,
     createdAt: row.created_at,
@@ -116,15 +128,25 @@ export class JobEventRepository {
     status?: string;
     prUrl?: string;
     summary?: string;
+    /**
+     * Issue #59: `submit_review`'s verdict. Declared here so it is stored rather
+     * than silently dropped.
+     *
+     * It *was* being dropped, and quietly: the caller spreads the validated
+     * payload (`...parsed.data`) into this function, so an undeclared field
+     * compiles and is discarded — the transition happened and the record of it
+     * did not. Naming it here is what makes the omission a type error next time.
+     */
+    verdict?: string;
     actionItems?: JobEventActionItem[];
     snapshot?: Record<string, string>;
   }): Promise<JobEvent> {
     const result = await this.db.query<JobEventRow>(
       `INSERT INTO job_events
-         (job_id, type, question, markdown, message, status, pr_url, summary, action_items, design_snapshot)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         (job_id, type, question, markdown, message, status, pr_url, summary, verdict, action_items, design_snapshot)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        RETURNING id, job_id, type, question, markdown, message, status, pr_url,
-         summary, action_items, design_snapshot, created_at`,
+         summary, verdict, action_items, design_snapshot, created_at`,
       [
         input.jobId,
         input.type,
@@ -134,6 +156,7 @@ export class JobEventRepository {
         input.status ?? null,
         input.prUrl ?? null,
         input.summary ?? null,
+        input.verdict ?? null,
         input.actionItems ?? null,
         input.snapshot ?? null,
       ],
@@ -178,7 +201,7 @@ export class JobEventRepository {
   async findByIdWithScope(eventId: string): Promise<JobEventWithScope | null> {
     const result = await this.db.query<JobEventScopeRow>(
       `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
-         e.status, e.pr_url, e.summary, e.action_items, e.design_snapshot,
+         e.status, e.pr_url, e.summary, e.verdict, e.action_items, e.design_snapshot,
          e.created_at, j.project_id, j.feature_id
        FROM job_events e
        INNER JOIN jobs j ON j.id = e.job_id
@@ -198,7 +221,7 @@ export class JobEventRepository {
   async listSpecGrillByFeature(featureId: string): Promise<JobEvent[]> {
     const result = await this.db.query<JobEventRow>(
       `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
-         e.status, e.pr_url, e.summary, e.action_items, e.design_snapshot,
+         e.status, e.pr_url, e.summary, e.verdict, e.action_items, e.design_snapshot,
          e.created_at
        FROM job_events e
        INNER JOIN jobs j ON j.id = e.job_id
@@ -207,5 +230,51 @@ export class JobEventRepository {
       [featureId],
     );
     return result.rows.map(mapJobEvent);
+  }
+
+  /**
+   * Issue #59: a feature's most recent Agentic Review verdict, or null when the
+   * feature has never been reviewed.
+   *
+   * **Joined through `jobs` rather than filtered on the feature directly**, because
+   * `job_events` has no `feature_id` — the event knows only its job, and the job
+   * knows its feature. A subquery on `jobs` would be the same query with an extra
+   * plan node; the join is what lets the `idx_job_events_reviews` partial index
+   * (migration 051) supply the ordering.
+   *
+   * **The most recent review, not the reviews of the most recent review job.**
+   * Those are the same row in practice and different questions in principle: a
+   * feature is returned, rebuilt and reviewed again, so "the current verdict" is
+   * the newest `submit_review` the feature has, whichever run produced it. Asking
+   * per-job would need the feature's *latest* `agentic_review` job first — an
+   * extra query, and a worse answer if that job crashed before submitting, since
+   * it would then report "no review" over an older verdict that is still the last
+   * thing anyone decided.
+   *
+   * `ORDER BY e.created_at DESC` with no tiebreak beyond it is deliberate but
+   * worth naming: two reviews of one feature in the same millisecond would be
+   * ordered arbitrarily. That is not reachable — a review is a whole agent run,
+   * and the second cannot start until the first has finished and the feature has
+   * moved back to `implementation` — so a deterministic tiebreak would be
+   * machinery for a case that cannot occur.
+   */
+  async findLatestReviewByFeature(featureId: string): Promise<JobEvent | null> {
+    const result = await this.db.query<JobEventRow>(
+      // Qualified columns, not the shared `jobEventColumns` constant: those are
+      // unqualified, and this is a join against `jobs`, which has its own `id`
+      // and `created_at`. Reusing the constant here is exactly how issue #61's
+      // audit query became ambiguous against the joined `projects` table — the
+      // constant is only safe in a single-table read.
+      `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
+         e.status, e.pr_url, e.summary, e.verdict, e.action_items,
+         e.design_snapshot, e.created_at
+       FROM job_events e
+       INNER JOIN jobs j ON j.id = e.job_id
+       WHERE j.feature_id = $1 AND e.type = 'submit_review'
+       ORDER BY e.created_at DESC
+       LIMIT 1`,
+      [featureId],
+    );
+    return result.rows[0] ? mapJobEvent(result.rows[0]) : null;
   }
 }

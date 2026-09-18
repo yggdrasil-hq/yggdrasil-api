@@ -23,6 +23,7 @@ import type { TestRepository } from "../tests/repository.js";
 import type { TestRunReportRepository } from "../tests/reports-repository.js";
 import { toPublicTestRunExecution } from "../tests/report-types.js";
 import { toPublicTestRunHistoryEntry } from "../tests/run-history.js";
+import { toPublicAgenticReview } from "../features/review-types.js";
 import {
   isValidCronExpression,
   meetsMinimumInterval,
@@ -1222,6 +1223,46 @@ export function createProjectsRouter(deps: {
       status: feature.status,
       runs: reports.map(toPublicTestRunExecution),
     });
+  });
+
+  /**
+   * Issue #59: the feature's Agentic Review verdict (ADR 015 items 14-16).
+   *
+   * The stage's tab has been calling this path since it was built and getting a
+   * 404 — no read endpoint ever existed — so the tab reported "Unable to load
+   * agentic review." for a feature that had simply never been reviewed. That is
+   * the failure this route fixes, and it is why **a feature with no review
+   * answers 200 with `verdict: null`** rather than 404: the two states are
+   * genuinely different, and collapsing them is what made the tab unusable.
+   *
+   * Gated exactly like the sibling feature routes (`getOwnedProject`, then the
+   * feature has to belong to that project) rather than with a new capability,
+   * matching `GET /testing` immediately above.
+   *
+   * Returns the *most recent* verdict rather than a history: a feature can be
+   * returned and re-reviewed, and the tab asks what the reviewer decided last.
+   * `findLatestReviewByFeature` documents why that is not the same question as
+   * "the reviews of the latest review job".
+   */
+  router.get("/:projectId/features/:featureId/agentic-review", requireAuth, async (req, res) => {
+    const project = await getOwnedProject(req, routeParam(req.params.projectId));
+    if (!project) {
+      res.status(404).json({ error: "Project not found" });
+      return;
+    }
+    const featureId = parseFeatureId(routeParam(req.params.featureId));
+    if (!featureId) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+    const feature = await deps.features.findById(project.id, featureId);
+    if (!feature) {
+      res.status(404).json({ error: "Feature not found" });
+      return;
+    }
+
+    const review = await deps.jobEvents.findLatestReviewByFeature(feature.id);
+    res.json(toPublicAgenticReview(review));
   });
 
   router.patch("/:projectId/features/:featureId", requireAuth, async (req, res) => {
