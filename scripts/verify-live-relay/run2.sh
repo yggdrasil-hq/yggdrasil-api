@@ -77,23 +77,19 @@ start_replica() {
     "$IMAGE" ./node_modules/.bin/tsx src/index.ts >/dev/null
 }
 
-echo "== two api replicas, one database =="
-# Serialised deliberately, and this is NOT cosmetic. Two replicas booting
-# simultaneously both see the same migration as unapplied and both apply it; the
-# loser dies on `schema_migrations_pkey` and never serves. That is a real defect
-# (filed separately) in `src/db/migrate.ts`'s check-then-act, not a property of
-# this harness — but it is not what #32 is about, so the harness works around it
-# by letting the first replica finish migrating before starting the second. A real
-# rolling deploy tolerates this because replicas do not usually start in the same
-# millisecond; a `docker compose up` of two at once does not.
+echo "== two api replicas, one database, started TOGETHER =="
+# Deliberately simultaneous. This used to be serialised — start A, wait for
+# "API listening", then start B — because two replicas booting at once both saw
+# the same migration as unapplied, both applied it, and the loser died on
+# `schema_migrations_pkey` and never served (#76). `runMigrations` now takes an
+# advisory lock, so the race is gone and the workaround is removed.
+#
+# Keeping the simultaneous start is the point: it is what exercises the fix on
+# every run of this harness, rather than only in the one-off check that was made
+# when the lock was added.
 start_replica "$A"
-echo "started $A; waiting for it to finish migrating before starting $B"
-for _ in $(seq 1 120); do
-  if docker logs "$A" 2>&1 | grep -q "API listening"; then break; fi
-  sleep 1
-done
 start_replica "$B"
-echo "started $B"
+echo "started $A and $B simultaneously"
 
 echo "== nginx (two-replica upstream; API directives copied from deploy/nginx/dev.conf) =="
 docker run -d --name "$NGINX" --network "$NET" \

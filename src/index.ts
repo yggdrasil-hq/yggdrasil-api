@@ -23,7 +23,12 @@ import { UserRepository } from "./users/repository.js";
 
 async function main(): Promise<void> {
   const pool = getPool();
-  await runMigrations(pool);
+  // Issue #76: this waits for another replica's migration pass rather than
+  // racing it, and reports the wait — a rollout where several replicas start
+  // together is normal, and a replica that appears to hang on boot should say
+  // why. It throws if the lock cannot be taken, which is deliberate: a replica
+  // that cannot know the schema is current must not serve.
+  await runMigrations(pool, { onWait: (message) => console.log(`migrations: ${message}`) });
 
   const app = createApp({
     pool,
