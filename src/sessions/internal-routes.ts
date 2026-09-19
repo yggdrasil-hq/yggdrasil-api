@@ -1,4 +1,4 @@
-import { Router, raw } from "express";
+import { Router, json, raw } from "express";
 import type express from "express";
 import { config } from "../config.js";
 import type { JobRepository } from "../jobs/repository.js";
@@ -8,12 +8,15 @@ import { formatByteSize, resolveExpiry } from "../shared/artifacts.js";
 import { isUuid } from "../shared/uuid.js";
 import type { JobSessionRepository } from "./repository.js";
 import {
+  isForkPointOutcome,
   isSessionOutcome,
+  rejectForkPointUpload,
   rejectSessionUpload,
   sessionState,
   SESSION_CONTENT_TYPE,
+  type ForkPointOutcome,
 } from "./retention.js";
-import { toPublicJobSession } from "./types.js";
+import { toPublicJobSession, type ForkPoint } from "./types.js";
 
 /**
  * ADR 032 item 1's upload endpoint: the Orchestrator posts the Pi session file it
@@ -164,7 +167,132 @@ export function createSessionsInternalRouter(deps: {
             new Date(),
           ),
           canFork: session.outcome === "collected",
+          // The upload response reports the run's fork points too, because it is
+          // the same question ("what became of this run's session") and a client
+          // comparing an upload response against a later GET must not see two
+          // different shapes for it.
+          forkPoints: await deps.sessions.findForkPoints(job.id),
         }),
+      });
+    },
+  );
+
+  /**
+   * ADR 032 item 2's capture: which previous user messages a finished job's session
+   * can be forked from.
+   *
+   * ## Why this is a second route rather than a field on the session post
+   *
+   * The session route's body is the raw JSONL artifact, and that is load-bearing:
+   * a session is routinely megabytes (Pi appends tool results verbatim), so it is
+   * the body precisely so base64-in-JSON cannot inflate it by a third — and the
+   * route carries its own `raw` parser at the artifact cap rather than going through
+   * the JSON parser. A fork-point list is structured and variable-length, so it
+   * cannot ride as a query parameter and cannot share that body without one of the
+   * two being corrupted. (A multipart body would carry both, at the cost of a
+   * parser dependency this deployment cannot install, for one field.)
+   *
+   * ## Why that is safe, and what it costs
+   *
+   * A second call can fail independently, so a run can end up with a stored session
+   * and no fork-point report. That absence is *why* `outcome` is stored and why no
+   * row maps to `unknown`: a missing report reads as "nobody found out", never as
+   * "there are none". The cost is one extra round trip and one more failure mode the
+   * Orchestrator logs and continues past — the same best-effort posture every
+   * artifact post here has, since a capture must never fail the run that produced it.
+   *
+   * ## Why the outcome travels in the body rather than in the query string
+   *
+   * The session route puts its small fields in the query because its body is spoken
+   * for by the artifact. Here the body is JSON and the outcome belongs beside the
+   * points it describes, so that a reader of the payload sees the claim and its
+   * evidence together rather than having to correlate a URL with a body.
+   */
+  router.post(
+    "/jobs/:jobId/session/fork-points",
+    requireInternalApiToken,
+    // The parser is declared **on this route** rather than relied on from the app,
+    // for the reason the session route declares `raw()` on itself: this router is
+    // mounted in tests and in production, and a route whose request parsing depends
+    // on what its host happened to install is a route that behaves differently in the
+    // two. (`app.ts` does install `express.json()` globally; a mount without it made
+    // every body here arrive unparsed, which is how this was found.)
+    //
+    // The limit is this payload's own, not the session artifact's: a fork-point list
+    // is one short string per human reply — kilobytes for the chattiest grill that
+    // could exist — so a limit in the artifact's range would be describing a body
+    // this endpoint cannot receive.
+    (req, res, next) => {
+      forkPointsJsonParser(req, res, (error?: unknown) => {
+        // A parser rejection is answered in this router's own non-fatal shape rather
+        // than left to the shared 413 middleware below, whose wording names a
+        // *session* limit — and a reason an operator cannot act on is worse than no
+        // reason. Same contract as the session route: the Orchestrator logs it and
+        // finishes the job normally.
+        if (error) {
+          res.status(202).json({
+            stored: false,
+            reason: `Fork points exceed the ${formatByteSize(FORK_POINTS_MAX_BYTES)} limit`,
+          });
+          return;
+        }
+        next();
+      });
+    },
+    async (req, res) => {
+      const jobId = routeParam(req.params.jobId);
+      if (!isUuid(jobId)) {
+        res.status(404).json({ error: "Job not found" });
+        return;
+      }
+
+      const job = await deps.jobs.findById(jobId);
+      if (!job) {
+        res.status(404).json({ error: "Job not found" });
+        return;
+      }
+
+      // The same scoping the session post applies, and for the same reason: ADR 032
+      // scopes session collection to the grill, so fork points for anything else are
+      // a misconfiguration worth surfacing rather than storing. A design session is
+      // a grill too and is out of scope, so it is refused by this branch rather than
+      // by silence.
+      if (job.kind !== "spec_grill") {
+        res.status(202).json({
+          stored: false,
+          reason: "This job kind does not collect a session",
+        });
+        return;
+      }
+
+      const body: unknown = req.body;
+      const parsed = parseForkPointBody(body);
+      if ("reason" in parsed) {
+        res.status(202).json({ stored: false, reason: parsed.reason });
+        return;
+      }
+
+      const rejection = rejectForkPointUpload({
+        outcome: parsed.outcome,
+        pointCount: parsed.points?.length ?? 0,
+      });
+      if (rejection) {
+        res.status(202).json({ stored: false, reason: rejection });
+        return;
+      }
+
+      await deps.sessions.upsertForkPoints(
+        job.id,
+        parsed.outcome,
+        parsed.points ?? null,
+      );
+
+      res.status(201).json({
+        stored: true,
+        // Read back rather than echoing the request: the response then states what
+        // is *stored*, which is the thing a caller comparing it against a later GET
+        // can rely on.
+        forkPoints: await deps.sessions.findForkPoints(job.id),
       });
     },
   );
@@ -221,5 +349,90 @@ function stringOrNull(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const trimmed = value.trim();
   return trimmed === "" ? null : trimmed;
+}
+
+/**
+ * The bound on a fork-points body (ADR 032 item 2).
+ *
+ * Sized from what the payload actually is — one short string per human reply in a
+ * grill — rather than borrowed from the session artifact's cap: a grill with a
+ * hundred replies at a few kilobytes each is still well under this, and a limit in
+ * the megabytes would describe a body this endpoint has no reason to expect.
+ *
+ * Deliberately a property of the *transport* and not of policy: unlike the session
+ * cap there is no configuration for it, because there is no operator decision in it
+ * — a fork-point list too large to store is a bug in the capture, not a deployment
+ * choice about how much to keep.
+ */
+const FORK_POINTS_MAX_BYTES = 256_000;
+
+/**
+ * The fork-points route's own JSON parser.
+ *
+ * Built once, outside the request path: `json()` returns a configured middleware,
+ * and constructing one per request would allocate a parser on every capture.
+ */
+const forkPointsJsonParser = json({ limit: FORK_POINTS_MAX_BYTES });
+
+/**
+ * Decodes a fork-points body, or a reason it cannot be stored.
+ *
+ * Returns a reason rather than throwing, matching every other refusal in this
+ * router: the Orchestrator logs it and finishes the job normally, because a capture
+ * must never fail the run that produced it.
+ *
+ * **An entry with no usable `entryId` is a refusal, not a silent drop.** `fork` is
+ * sent the id and Pi rejects an unknown one outright, so a stored point with an
+ * empty id would be offered to a user and then refuse them. (The Orchestrator's
+ * parser drops such entries before they get this far, so this is the second line —
+ * worth having because this route is the trust boundary, and a hand-written request
+ * never passed through that parser.) An empty `text` is allowed: it is display only,
+ * and Pi is the only source for it.
+ *
+ * `outcome: "unavailable"` deliberately accepts **no** points, mirroring the
+ * session route's rule that a failing outcome cannot carry a body: a caller must not
+ * be able to store points while claiming not to know whether points exist.
+ */
+function parseForkPointBody(
+  body: unknown,
+): { outcome: ForkPointOutcome; points: ForkPoint[] | null } | { reason: string } {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return { reason: "A fork-points body must be a JSON object" };
+  }
+
+  const { outcome, points } = body as { outcome?: unknown; points?: unknown };
+  if (typeof outcome !== "string" || !isForkPointOutcome(outcome)) {
+    return {
+      reason: `Unrecognised fork-points outcome: ${typeof outcome === "string" && outcome !== "" ? outcome : "(missing)"}`,
+    };
+  }
+
+  if (outcome === "unavailable") {
+    // Present-but-empty is accepted and normalised away, because JSON has no way to
+    // distinguish ``absent`` from `[]` for a caller that serialises uniformly, and
+    // refusing that would be refusing a shape rather than a claim.
+    if (Array.isArray(points) && points.length > 0) {
+      return { reason: `An outcome of "unavailable" cannot carry fork points` };
+    }
+    return { outcome, points: null };
+  }
+
+  if (!Array.isArray(points)) {
+    return { reason: `A "captured" outcome must carry a points array` };
+  }
+
+  const parsed: ForkPoint[] = [];
+  for (const point of points) {
+    if (typeof point !== "object" || point === null) {
+      return { reason: "Each fork point must be an object with an entryId" };
+    }
+    const { entryId, text } = point as { entryId?: unknown; text?: unknown };
+    const id = stringOrNull(entryId);
+    if (id === null) {
+      return { reason: "Each fork point must have a non-empty entryId" };
+    }
+    parsed.push({ entryId: id, text: typeof text === "string" ? text : "" });
+  }
+  return { outcome, points: parsed };
 }
 

@@ -1,8 +1,12 @@
 import type pg from "pg";
 import type { ObjectStorage } from "../storage/client.js";
 import { sessionKey } from "../storage/keys.js";
-import type { SessionOutcome } from "./retention.js";
-import type { JobSession, JobSessionContent } from "./types.js";
+import type {
+  ForkPointOutcome,
+  ForkPointState,
+  SessionOutcome,
+} from "./retention.js";
+import type { ForkPoint, JobForkPoints, JobSession, JobSessionContent } from "./types.js";
 
 interface SessionRow {
   job_id: string;
@@ -20,6 +24,13 @@ interface SessionRow {
 
 interface SessionContentRow extends SessionRow {
   data: Buffer | null;
+}
+
+interface ForkPointRow {
+  job_id: string;
+  outcome: ForkPointOutcome;
+  points: ForkPoint[] | null;
+  captured_at: Date;
 }
 
 type StorageBackend = "postgres" | "object";
@@ -302,7 +313,91 @@ export class JobSessionRepository {
       );
       purged += result.rowCount ?? 0;
     }
+
+    // ADR 032 item 2's fork points go with the bytes, in the same pass. Two reasons
+    // rather than one: a fork point without its session file cannot be acted on
+    // (there is nothing to `switch_session` to), and its `text` is a copy of the
+    // conversation the retention window was applied to — so leaving it behind would
+    // keep conversation text past the window that reclaimed the session it came
+    // from. Both lists are covered, so a row reclaimed on either backend loses its
+    // points. Deleted rather than tombstoned: nothing reads a fork point for a
+    // purged session, and the session row already records that it expired.
+    const purgedJobs = [...reclaimableInDatabase, ...reclaimedInStorage];
+    if (purgedJobs.length > 0) {
+      await this.db.query(
+        `DELETE FROM job_fork_points WHERE job_id = ANY($1::uuid[])`,
+        [purgedJobs],
+      );
+    }
     return purged;
+  }
+
+  /**
+   * Records which previous user messages a run's session can be forked from (ADR
+   * 032 item 2), replacing any earlier record for the same job.
+   *
+   * **An upsert rather than an insert**, because the capture is a second, separate
+   * report about the same run: a retried post, or a run whose capture was retried
+   * after a transient failure, must not fail on the primary key of a row that is
+   * already correct. The Orchestrator posts it once per run, so the replacement case
+   * is rare — but "rare" is not a reason for a route that can 500 on a duplicated
+   * delivery, which every artifact post in this suite is designed to tolerate.
+   *
+   * `points` is written as one JSONB value rather than row-by-row: the list is
+   * always read and written whole, and its order is Pi's own answer order, which a
+   * child table would have to re-encode as a position column nothing would read.
+   */
+  async upsertForkPoints(
+    jobId: string,
+    outcome: ForkPointOutcome,
+    points: ForkPoint[] | null,
+  ): Promise<void> {
+    await this.db.query(
+      `INSERT INTO job_fork_points (job_id, outcome, points)
+            VALUES ($1, $2, $3::jsonb)
+       ON CONFLICT (job_id) DO UPDATE
+              SET outcome = EXCLUDED.outcome,
+                  points = EXCLUDED.points,
+                  captured_at = NOW()`,
+      [jobId, outcome, points === null ? null : JSON.stringify(points)],
+    );
+  }
+
+  /**
+   * A run's fork points, or null when this API holds no record for it.
+   *
+   * Null is `unknown` and not `captured`-with-nothing: only the Orchestrator's own
+   * report can say "Pi answered and there are none", so a missing row must not be
+   * read as an answer. The caller maps it to the wire state (`toPublicJobSession`),
+   * which is where that rule is stated once.
+   *
+   * The out-of-contract rows the CHECK makes unwritable are still handled rather
+   * than trusted: a `captured` row whose `points` came back null (a constraint
+   * relaxed by a future migration, or a row written by hand) is reported as
+   * `unavailable` instead of as an empty list, because an empty list is the claim
+   * "there are none" and this row does not support it. Same posture as the session
+   * read path's `data !== null` check.
+   */
+  async findForkPoints(jobId: string): Promise<JobForkPoints | null> {
+    const result = await this.db.query<ForkPointRow>(
+      `SELECT job_id, outcome, points, captured_at
+         FROM job_fork_points
+        WHERE job_id = $1`,
+      [jobId],
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+
+    const points = row.points ?? null;
+    const state: ForkPointState =
+      row.outcome === "captured" && points !== null ? "captured" : "unavailable";
+    return {
+      jobId: row.job_id,
+      state,
+      outcome: row.outcome,
+      points: state === "captured" ? points : null,
+      capturedAt: row.captured_at,
+    };
   }
 }
 

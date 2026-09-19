@@ -3,7 +3,8 @@ import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { createSessionsInternalRouter } from "./internal-routes.js";
 import type { Job } from "../jobs/types.js";
-import type { JobSession } from "./types.js";
+import type { ForkPointOutcome } from "./retention.js";
+import type { ForkPoint, JobForkPoints, JobSession } from "./types.js";
 
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
 const JOB_ID = "22222222-2222-4222-8222-222222222222";
@@ -37,7 +38,13 @@ function makeJob(overrides: Partial<Job> = {}): Job {
   } as Job;
 }
 
-function buildApp(overrides: { job?: Job | null; upsert?: ReturnType<typeof vi.fn> } = {}) {
+function buildApp(
+  overrides: {
+    job?: Job | null;
+    upsert?: ReturnType<typeof vi.fn>;
+    forkPoints?: JobForkPoints | null;
+  } = {},
+) {
   const app = express();
 
   const upsert =
@@ -68,11 +75,37 @@ function buildApp(overrides: { job?: Job | null; upsert?: ReturnType<typeof vi.f
     findById: vi.fn(async () => (overrides.job === undefined ? makeJob() : overrides.job)),
   };
 
+  /*
+   * The fork-points half of the repository (ADR 032 item 2), which the session route
+   * reads back for its own response and the sibling route writes.
+   *
+   * Held in a local variable so the two calls describe one stored row rather than two
+   * independents: an upsert followed by a read — which is exactly the round trip the
+   * route performs — has to see what was just written, or a test asserting the
+   * response would be asserting on a fiction. Defaults to null, which is `unknown`,
+   * for the same reason the read-path double does: a default of captured-empty would
+   * assert the opposite of the distinction this feature exists for.
+   */
+  let storedForkPoints: JobForkPoints | null =
+    overrides.forkPoints === undefined ? null : overrides.forkPoints;
+  const findForkPoints = vi.fn(async () => storedForkPoints);
+  const upsertForkPoints = vi.fn(
+    async (jobId: string, outcome: ForkPointOutcome, points: ForkPoint[] | null) => {
+      storedForkPoints = {
+        jobId,
+        state: outcome,
+        outcome,
+        points,
+        capturedAt: new Date(),
+      };
+    },
+  );
+
   app.use(
     "/internal",
     createSessionsInternalRouter({
       jobs: jobs as never,
-      sessions: { upsert } as never,
+      sessions: { upsert, upsertForkPoints, findForkPoints } as never,
     }),
   );
 
@@ -256,5 +289,112 @@ describe("POST /internal/jobs/:jobId/session", () => {
     expect(res.status).toBe(202);
     expect(res.body.stored).toBe(false);
     expect(res.body.reason).toContain("limit");
+  });
+});
+
+/**
+ * ADR 032 item 2's capture route (#103). The sibling of the session post, because
+ * the session route's body is the raw JSONL artifact and cannot also carry a
+ * structured list — see the route's own comment for why that forces a second call and
+ * why the outcome therefore has to travel with the points.
+ */
+describe("POST /internal/jobs/:jobId/session/fork-points (#103)", () => {
+  function postPoints(
+    app: express.Express,
+    body: string | object | undefined,
+    jobId = JOB_ID,
+  ) {
+    return request(app)
+      .post(`/internal/jobs/${jobId}/session/fork-points`)
+      .set("Authorization", `Bearer ${INTERNAL_TOKEN}`)
+      .set("Content-Type", "application/json")
+      .send(body);
+  }
+
+  const points = [
+    { entryId: "a1b2c3d4", text: "First reply" },
+    { entryId: "c3d4e5f6", text: "Second reply" },
+  ];
+
+  it("stores a captured answer with its points and reads them back", async () => {
+    const { app } = buildApp();
+    const res = await postPoints(app, { outcome: "captured", points });
+
+    expect(res.status).toBe(201);
+    expect(res.body.stored).toBe(true);
+    // Read back from the repository rather than echoing the request, so the response
+    // states what is *stored* — which is what a caller comparing it against a later
+    // GET relies on.
+    expect(res.body.forkPoints.state).toBe("captured");
+    expect(res.body.forkPoints.points).toEqual(points);
+  });
+
+  it("stores an answered-empty list as captured, not as a failure", async () => {
+    // A real Pi 0.84.4 answers `{"messages":[]}` for a session with no user
+    // messages, so this is a fact and must not be refused or downgraded.
+    const { app } = buildApp();
+    const res = await postPoints(app, { outcome: "captured", points: [] });
+
+    expect(res.status).toBe(201);
+    expect(res.body.forkPoints.state).toBe("captured");
+    expect(res.body.forkPoints.points).toEqual([]);
+  });
+
+  it("stores an unanswered capture with no points at all", async () => {
+    const { app } = buildApp();
+    const res = await postPoints(app, { outcome: "unavailable" });
+
+    expect(res.status).toBe(201);
+    expect(res.body.forkPoints.state).toBe("unavailable");
+    expect(res.body.forkPoints.points).toBeNull();
+  });
+
+  it("declines, with a reason, an unanswered outcome that carries points", async () => {
+    // 202 rather than 4xx, the same convention every artifact post here uses: the
+    // Orchestrator logs the reason and finishes the job normally, because a capture
+    // must never fail the run that produced it.
+    const { app } = buildApp();
+    const res = await postPoints(app, { outcome: "unavailable", points });
+
+    expect(res.status).toBe(202);
+    expect(res.body.stored).toBe(false);
+    expect(res.body.reason).toContain("unavailable");
+  });
+
+  it("declines a point with no entry id, rather than storing an unusable one", async () => {
+    // `fork` is sent the id and Pi rejects an unknown one with "Invalid entry ID for
+    // forking", so a stored point with no id would be offered and then refuse.
+    const { app } = buildApp();
+    const res = await postPoints(app, {
+      outcome: "captured",
+      points: [{ text: "no id" }],
+    });
+
+    expect(res.status).toBe(202);
+    expect(res.body.reason).toContain("entryId");
+  });
+
+  it("declines an unrecognised outcome and a non-object body", async () => {
+    const { app } = buildApp();
+    for (const body of [{ outcome: "maybe" }, { points }, "nonsense"]) {
+      const res = await postPoints(app, body);
+      expect(res.status).toBe(202);
+      expect(res.body.stored).toBe(false);
+    }
+  });
+
+  it("404s an unknown job, so the route cannot be used to probe job ids", async () => {
+    const { app } = buildApp({ job: null });
+    const res = await postPoints(app, { outcome: "captured", points });
+    expect(res.status).toBe(404);
+  });
+
+  it("declines a job kind that does not collect a session", async () => {
+    // The same scoping the session post applies: ADR 032 scopes this to the grill.
+    const { app } = buildApp({ job: makeJob({ kind: "feature_build" }) });
+    const res = await postPoints(app, { outcome: "captured", points });
+
+    expect(res.status).toBe(202);
+    expect(res.body.reason).toContain("does not collect a session");
   });
 });

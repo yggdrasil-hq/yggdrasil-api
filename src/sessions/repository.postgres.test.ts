@@ -324,3 +324,179 @@ describe.skipIf(!reachability.ok)("JobSessionRepository against a real Postgres"
     expect(row.rows).toHaveLength(0);
   });
 });
+
+/**
+ * ADR 032 items 2/3: the fork points, against a real Postgres.
+ *
+ * **Why this belongs in this file rather than a fake-pool test.** Everything
+ * interesting here is about what the *database* does: a new table with its own
+ * `CHECK`, a JSONB round trip that must preserve Pi's answer order, and a retention
+ * deletion that has to fire in the same pass as the bytes. A fake pool agrees with
+ * the code by construction, and this suite has already shipped two bugs of exactly
+ * that shape (#43, #61) behind green tests. The `jsonb` cast in particular is the
+ * kind of thing a mock cannot have an opinion about.
+ */
+describe.skipIf(!reachability.ok)("fork points against a real Postgres (#103)", () => {
+  let pool: pg.Pool;
+  let projectId: string;
+  let sessions: JobSessionRepository;
+
+  const points = [
+    { entryId: "a1b2c3d4", text: "First: make me a portfolio site." },
+    { entryId: "c3d4e5f6", text: "Second: add a projects section." },
+  ];
+
+  // Byte content for the retention test below. The values do not matter — only that
+  // the row holds *something* — but it has to be JSONL-shaped, because that is what
+  // this column holds in production.
+  const bytes = Buffer.from('{"type":"user","id":"a1b2c3d4","text":"hi"}\n');
+
+  /** A fresh job per test, so one test's rows cannot decide another's. */
+  async function freshJob(): Promise<string> {
+    const id = (
+      await pool.query(
+        `INSERT INTO jobs (project_id, kind, status)
+         VALUES ($1, 'spec_grill', 'completed') RETURNING id`,
+        [projectId],
+      )
+    ).rows[0].id;
+    return id;
+  }
+
+  beforeAll(async () => {
+    pool = new pg.Pool({ connectionString });
+    await runMigrations(pool);
+    sessions = new JobSessionRepository(pool);
+
+    const stamp = Date.now();
+    const userId = (
+      await pool.query(
+        `INSERT INTO users (username, display_name, github_id, github_login)
+         VALUES ($1, 'I103', $2, $1) RETURNING id`,
+        [`i103_${stamp}`, stamp],
+      )
+    ).rows[0].id;
+    const orgId = (
+      await pool.query(
+        `INSERT INTO organizations (name, slug) VALUES ($1, $1) RETURNING id`,
+        [`i103-org-${stamp}`],
+      )
+    ).rows[0].id;
+    projectId = (
+      await pool.query(
+        `INSERT INTO projects (owner_user_id, organization_id, name, slug, status)
+         VALUES ($1, $2, 'I103', $3, 'ready') RETURNING id`,
+        [userId, orgId, `i103-${stamp}`],
+      )
+    ).rows[0].id;
+  });
+
+  afterAll(async () => {
+    // Cascades to `jobs` and `job_fork_points` from the project, so this removes
+    // this file's rows and nothing else. The scratch database is the caller's to
+    // drop.
+    await pool
+      .query("DELETE FROM projects WHERE id = $1", [projectId])
+      .catch(() => undefined);
+    await pool.end().catch(() => undefined);
+  });
+
+  it("round-trips captured points, preserving Pi's own order and text", async () => {
+    const job = await freshJob();
+    await sessions.upsertForkPoints(job, "captured", points);
+
+    const read = await sessions.findForkPoints(job);
+    expect(read?.state).toBe("captured");
+    expect(read?.outcome).toBe("captured");
+    // Read back rather than trusting what was written, so the claim is about what
+    // Postgres holds — and the *order* matters, because the list is rendered in it.
+    expect(read?.points).toEqual(points);
+  });
+
+  it("reads an answered-empty list as captured with nothing, not as a failure", async () => {
+    const job = await freshJob();
+    await sessions.upsertForkPoints(job, "captured", []);
+
+    const read = await sessions.findForkPoints(job);
+    // The distinction the whole feature turns on: Pi answered and there are none.
+    expect(read?.state).toBe("captured");
+    expect(read?.points).toEqual([]);
+    expect(read?.points).not.toBeNull();
+  });
+
+  it("stores unavailable with no points at all, and reads it as unavailable", async () => {
+    const job = await freshJob();
+    await sessions.upsertForkPoints(job, "unavailable", null);
+
+    const read = await sessions.findForkPoints(job);
+    expect(read?.state).toBe("unavailable");
+    expect(read?.points).toBeNull();
+  });
+
+  it("reports no record as null, which the caller maps to unknown", async () => {
+    // Null rather than `captured: []`: this API was never told anything, which is a
+    // different claim from "Pi said there are none".
+    const job = await freshJob();
+    expect(await sessions.findForkPoints(job)).toBeNull();
+  });
+
+  it("replaces on a re-delivery rather than failing on the primary key", async () => {
+    const job = await freshJob();
+    await sessions.upsertForkPoints(job, "unavailable", null);
+    // The second delivery supersedes the first, because a retried capture that
+    // succeeded must not be blocked by an earlier failure's row.
+    await sessions.upsertForkPoints(job, "captured", points);
+
+    const read = await sessions.findForkPoints(job);
+    expect(read?.state).toBe("captured");
+    expect(read?.points).toEqual(points);
+  });
+
+  it("refuses, in the database, an unanswered outcome that carries points", async () => {
+    // The CHECK is the guard, not this repository's validation: a direct INSERT
+    // that contradicts itself must be unwritable, exactly as the session table's
+    // four byte states are. Asserting on the constraint rather than on the code means
+    // a future path that bypassed the repository would still be stopped.
+    const job = await freshJob();
+    await expect(
+      pool.query(
+        `INSERT INTO job_fork_points (job_id, outcome, points)
+         VALUES ($1, 'unavailable', $2::jsonb)`,
+        [job, JSON.stringify(points)],
+      ),
+    ).rejects.toThrow(/job_fork_points_outcome_consistent/);
+
+    // ...and its mirror: a captured row with no list, which would read as "there are
+    // none" for a question whose answer was never recorded.
+    await expect(
+      pool.query(
+        `INSERT INTO job_fork_points (job_id, outcome, points)
+         VALUES ($1, 'captured', NULL)`,
+        [job],
+      ),
+    ).rejects.toThrow(/job_fork_points_outcome_consistent/);
+  });
+
+  it("reclaims the fork points in the same pass that reclaims the bytes", async () => {
+    // ADR 032's data-retention reasoning: a fork point's `text` is a copy of the
+    // conversation the window was applied to, so leaving it behind would keep
+    // conversation text past the window that reclaimed the session it came from.
+    const job = await freshJob();
+    await sessions.upsert({
+      jobId: job,
+      projectId,
+      outcome: "collected",
+      sessionId: "s-1",
+      podFilePath: "/root/.pi/agent/sessions/x.jsonl",
+      data: bytes,
+      expiresAt: new Date(Date.now() - 60_000), // already past its window
+    });
+    await sessions.upsertForkPoints(job, "captured", points);
+    expect(await sessions.findForkPoints(job)).not.toBeNull();
+
+    await sessions.purgeExpired();
+
+    expect((await sessions.findByJob(job))?.purgedAt).not.toBeNull();
+    expect(await sessions.findForkPoints(job)).toBeNull();
+  });
+});

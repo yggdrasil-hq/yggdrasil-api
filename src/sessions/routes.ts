@@ -7,8 +7,12 @@ import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
 import { UserRepository } from "../users/repository.js";
 import type { JobSessionRepository } from "./repository.js";
-import { permitsFork, sessionState, UNKNOWN_SESSION_STATE } from "./retention.js";
-import { sessionStateExplanation, toPublicJobSession } from "./types.js";
+import { permitsFork, sessionState, UNKNOWN_FORK_POINT_STATE, UNKNOWN_SESSION_STATE } from "./retention.js";
+import {
+  forkPointStateExplanation,
+  sessionStateExplanation,
+  toPublicJobSession,
+} from "./types.js";
 
 /**
  * ADR 032's read side: what became of one job's Pi session.
@@ -120,14 +124,27 @@ export function createSessionsRouter(deps: {
           )
         : UNKNOWN_SESSION_STATE;
 
+      /*
+       * The fork points are read in the same response, and the two states they carry
+       * are deliberately independent of the session's. That independence is the point
+       * (ADR 032 item 2): the capture is a second, separate report, so a run can have
+       * its bytes stored and `unknown` fork points — which must render as "we could
+       * not find out which points you can resume from", never as an empty list.
+       */
+      const forkPoints = await deps.jobSessions.findForkPoints(job.id);
+
       res.json({
         session: toPublicJobSession({
           jobId: job.id,
           session,
           state,
           canFork: permitsFork(state),
+          forkPoints,
         }),
         explanation: sessionStateExplanation(state),
+        forkPointsExplanation: forkPointStateExplanation(
+          forkPoints?.state ?? UNKNOWN_FORK_POINT_STATE,
+        ),
       });
     },
   );
