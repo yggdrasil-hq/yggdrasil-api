@@ -19,6 +19,7 @@ import {
 } from "../secrets/model-config.js";
 import type { JobUsageRepository } from "../usage/repository.js";
 import { NOOP_LIVE_PUBLISHER, type LivePublisher } from "../live/deltas.js";
+import { LIVE_DELTA_MAX_PAYLOAD_BYTES, deltaTextFitsPayload } from "../live/types.js";
 import { config } from "../config.js";
 import { summarizeGrillTranscript } from "./grill-context.js";
 import { UNKNOWN_CAPABILITIES, type JobKindCapabilities } from "./capabilities.js";
@@ -166,14 +167,35 @@ const requestedActionItemSchema = z.object({
  * "`agent_text_delta` is relayed but never stored" is enforced by the shape of
  * the validation rather than by a branch someone could later reorder.
  *
- * `message` is the delta text (the same field the Orchestrator already uses for
- * prose), bounded because it travels through a `pg_notify` payload whose hard
- * limit is 8000 bytes — a genuine chunk is a handful of bytes, so this only
- * rejects a producer that is not actually streaming.
+ * **The bound is the publisher's own, measured the same way (issue #78).** The
+ * original was `z.string().min(1).max(4_000)`, and `.max()` on a Zod string
+ * counts **UTF-16 code units**, not bytes — while the comment above it justified
+ * the number by a *byte* limit. The two could therefore only agree on ASCII, and
+ * multi-byte text sat in the gap: 4000 CJK characters is 12000 bytes, which the
+ * route accepted and `encodeDeltaPayload` then dropped. The producer was told
+ * nothing (correctly — deltas are best-effort), so the only trace was a log line.
+ *
+ * So this does not bound the text at all — it asks `deltaTextFitsPayload`, which
+ * runs the publisher's own `JSON.stringify` against the publisher's own ceiling.
+ * One predicate, one answer.
+ *
+ * **Why not "text bytes ≤ ceiling minus a constant".** That was the first attempt
+ * and it was wrong in the same direction as the bug: `JSON.stringify` *escapes*
+ * characters, so 6891 newlines serialise to a 13891-byte payload rather than
+ * 7000. A constant envelope left a gap twice as wide as the one being fixed. The
+ * only honest measurement is the serialisation itself.
+ *
+ * `min(1)` stays: an empty delta carries no text and `encodeDeltaPayload` rejects
+ * it, so accepting it here would just move the drop downstream.
  */
 const jobEventDeltaSchema = z.object({
   type: z.literal("agent_text_delta"),
-  message: z.string().min(1).max(4_000),
+  message: z
+    .string()
+    .min(1)
+    .refine((text) => deltaTextFitsPayload(text), {
+      message: `Delta text is too large to relay (over ${LIVE_DELTA_MAX_PAYLOAD_BYTES} bytes once serialised)`,
+    }),
 });
 
 /**

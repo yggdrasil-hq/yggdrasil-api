@@ -111,9 +111,15 @@ async function deltaCrossProcess({ name, wsUrl, writeUrl, message, expectDeliver
     if (expectDelivery) {
       record(name, Boolean(frame), frame ? "delivered (write=" + host(writeUrl) + ")" : "NOT delivered (write=" + host(writeUrl) + ")");
     } else {
-      record(name, status === 202 && !frame,
-        "route accepted (" + status + "), publisher " + (frame ? "DELIVERED" : "dropped") +
-        ", payload " + Buffer.byteLength(text) + " bytes");
+      // Issue #78: the route now rejects an oversize payload (400) instead of
+      // accepting it (202) and letting the publisher drop it. The assertion is
+      // the *invariant*, not the old symptom: nothing was accepted-and-lost.
+      //
+      // Before the fix this expected `202 && !frame` — which is precisely the
+      // silent drop, encoded as a pass. A verification that asserts the bug is
+      // worse than no verification, because it certifies the bug.
+      record(name, status === 400 && !frame,
+        "route refused (" + status + "), nothing delivered, payload " + Buffer.byteLength(text) + " bytes");
     }
   } finally { ws.close(); }
 }
@@ -160,16 +166,36 @@ async function main() {
     wsUrl: WS_A, writeUrl: API_B, expectDelivery: true,
   });
 
-  // The two caps, at a boundary that shows they are in different units.
-  const ascii = "a".repeat(4000);
+  // The payload bound, at the boundary that used to be two different boundaries.
+  //
+  // Issue #78 fixed the mismatch these cases documented: the route counted
+  // characters and the publisher counted bytes, so multi-byte text was accepted
+  // by the route and dropped by the publisher. Both now ask the publisher's own
+  // question, so these assert the *invariant* rather than the discrepancy —
+  // anything the route accepts is delivered.
+  const ascii = "a".repeat(6000);
   await deltaCrossProcess({
-    name: "delta at the route's 4000-char limit, ASCII (~" + Buffer.byteLength(ascii) + " bytes)",
+    name: "delta well inside the payload bound, ASCII (~" + Buffer.byteLength(ascii) + " bytes)",
     wsUrl: WS_A, writeUrl: API_B, message: ascii, expectDelivery: true,
   });
+
+  // The case that was the bug: 4000 three-byte characters is 12000 bytes, over
+  // the publisher's 7000-byte ceiling. The route now rejects it too, so nothing
+  // is silently dropped — the write is refused rather than accepted-and-lost.
   const multiByte = "\u4e2d".repeat(4000);
   await deltaCrossProcess({
-    name: "same 4000 chars, multi-byte (~" + Buffer.byteLength(multiByte) + " bytes)",
+    name: "multi-byte text over the payload bound is refused by the route (~" +
+      Buffer.byteLength(multiByte) + " bytes)",
     wsUrl: WS_A, writeUrl: API_B, message: multiByte, expectDelivery: false,
+  });
+
+  // And a multi-byte payload that *fits* must still be delivered — the fix must
+  // not have narrowed the bound to ASCII.
+  const multiByteFits = "\u4e2d".repeat(1500);
+  await deltaCrossProcess({
+    name: "multi-byte text inside the payload bound is delivered (~" +
+      Buffer.byteLength(multiByteFits) + " bytes)",
+    wsUrl: WS_A, writeUrl: API_B, message: multiByteFits, expectDelivery: true,
   });
 
   await storedEventCrossProcess({

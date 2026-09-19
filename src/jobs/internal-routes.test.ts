@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { createJobsInternalRouter } from "./internal-routes.js";
 import type { JobEvent, JobEventType } from "./events-repository.js";
 import type { Job } from "./types.js";
+import { LIVE_DELTA_MAX_PAYLOAD_BYTES } from "../live/types.js";
 
 function makeEvent(overrides: Partial<JobEvent> = {}): JobEvent {
   return {
@@ -1563,17 +1564,49 @@ describe("POST /internal/jobs/:jobId/events (streaming deltas, ADR 019 item 13)"
     const publishDelta = vi.fn(async () => undefined);
     const app = buildApp({ publishDelta });
 
-    for (const message of ["", "x".repeat(5_000)]) {
+    // `""` is rejected by the schema's `min(1)`; the long one is rejected by the
+    // payload-size predicate. Both fall through to the stored-event schema, which
+    // rejects the type — so a malformed delta is a 400 rather than a silently
+    // forwarded no-op.
+    //
+    // Issue #78: this case used to be `"x".repeat(5_000)`, which the old
+    // *character* bound refused. That is no longer oversize — 5000 ASCII
+    // characters serialise to 5109 bytes, comfortably inside the publisher's
+    // 7000-byte ceiling — so asserting a 400 for it would now be asserting that
+    // the route rejects something it can relay. The oversize case is derived from
+    // the real ceiling instead of being a number that happened to exceed an
+    // unrelated one.
+    const oversize = "x".repeat(LIVE_DELTA_MAX_PAYLOAD_BYTES);
+
+    for (const message of ["", oversize]) {
       const res = await request(app)
         .post(`/internal/jobs/${JOB_ID}/events`)
         .set("Authorization", "Bearer test-internal-api-token")
         .send({ type: "agent_text_delta", message });
 
-      // Falls through to the stored-event schema, which rejects the type — so a
-      // malformed delta is a 400 rather than a silently forwarded no-op.
       expect(res.status).toBe(400);
     }
     expect(publishDelta).not.toHaveBeenCalled();
+  });
+
+  it("relays a long ASCII delta the publisher can carry (issue #78)", async () => {
+    // The other half of the fix: the route must not start refusing payloads the
+    // publisher would send. Before #78 a 5000-character chunk was refused for
+    // exceeding a character bound while the publisher's byte bound would have
+    // allowed it — the mirror image of the bug being fixed, and worth pinning so
+    // a future tightening does not reintroduce it.
+    const publishDelta = vi.fn(async () => undefined);
+    const app = buildApp({ publishDelta });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text_delta", message: "x".repeat(5_000) });
+
+    expect(res.status).toBe(202);
+    expect(publishDelta).toHaveBeenCalledWith(
+      expect.objectContaining({ text: "x".repeat(5_000) }),
+    );
   });
 
   it("requires the internal bearer token", async () => {
