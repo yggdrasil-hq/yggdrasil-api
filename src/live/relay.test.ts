@@ -30,6 +30,7 @@ function scope(overrides: Partial<JobEventWithScope> = {}): JobEventWithScope {
       summary: null,
       verdict: null,
       questionForm: null,
+      reviewFindings: null,
       actionItems: null,
       snapshot: null,
       createdAt: new Date("2026-09-18T10:00:00.000Z"),

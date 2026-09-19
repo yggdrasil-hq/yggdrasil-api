@@ -113,6 +113,36 @@ const jobEventSchema = z.object({
     )
     .max(20)
     .optional(),
+  /**
+   * Issue #73: a review's per-location findings, so the verdict's blockers are
+   * countable and locatable instead of only prose in `comment`.
+   *
+   * **Optional, and its absence means "prose".** Every review written before this
+   * existed carries none, and a reviewer may legitimately choose to write a
+   * paragraph — the issue is explicit that the two modes coexist. So the schema
+   * does not require it, and the storage distinguishes absent (`null`) from empty
+   * (`[]`): only the latter is a statement that there are no findings.
+   *
+   * The names match the tool's arguments exactly (`path`, `line`, `body`,
+   * `blocking`), so a reader comparing `agentic_review/skills/review/SKILL.md` and
+   * `extensions/yggdrasil-contract` with this schema is comparing the same words —
+   * the same rule `ask_user`'s structured half follows.
+   *
+   * Bounds mirror the sibling `options` list: a review with more than 50 findings
+   * is a runaway, not a review, and an unbounded `body` would let one event row
+   * carry a megabyte into every transcript read.
+   */
+  findings: z
+    .array(
+      z.object({
+        path: z.string().trim().max(512).optional(),
+        line: z.number().int().positive().optional(),
+        body: z.string().trim().min(1).max(4000),
+        blocking: z.boolean().optional(),
+      }),
+    )
+    .max(50)
+    .optional(),
   passed: z.number().int().nonnegative().optional(),
   failed: z.number().int().nonnegative().optional(),
   skipped: z.number().int().nonnegative().optional(),
@@ -540,6 +570,35 @@ export function createJobsInternalRouter(deps: {
               : null,
           actionItems: parsed.data.actionItems,
           snapshot: parsed.data.snapshot,
+          /*
+           * Issue #73: spelled out rather than left to the `...parsed.data` spread,
+           * for the reason the `verdict` comment above gives at length — an
+           * undeclared field is discarded silently, which is exactly how #59 lost
+           * the verdict. The mapping is not cosmetic either: the request carries
+           * optional fields (`path`/`line`/`blocking`) and the column's shape wants
+           * them explicitly null/false rather than undefined, so a renderer never
+           * has to distinguish "absent" from "false" for a field the producer
+           * simply omitted.
+           *
+           * `findings === undefined` ⇒ null (prose, or pre-#73), and `[]` ⇒ `[]`
+           * (structured with nothing found). The two are different answers to "how
+           * many blocking issues", which is why this does not default to `[]`.
+           */
+          reviewFindings:
+            parsed.data.type === "submit_review" && parsed.data.findings !== undefined
+              ? parsed.data.findings.map((finding) => ({
+                  path: finding.path ?? null,
+                  line: finding.line ?? null,
+                  body: finding.body,
+                  // Defaults to **true**, matching the read contract's own default
+                  // (`web/lib/features/agentic-review.ts`). The issue that specified
+                  // this endpoint described the findings as *the blocking flags*, so
+                  // an omitted flag means "these are the blockers", not "none of
+                  // these matter" — and defaulting to false would let a review pass
+                  // its gate while displaying the findings that should stop it.
+                  blocking: finding.blocking ?? true,
+                }))
+              : null,
         });
       } catch (error) {
         console.error(`failed to record event for job ${jobId}:`, error);

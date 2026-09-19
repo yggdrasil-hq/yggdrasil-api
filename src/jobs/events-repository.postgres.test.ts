@@ -130,6 +130,41 @@ describe.skipIf(!reachability.ok)("JobEventRepository against a real Postgres", 
     });
   });
 
+  /*
+   * Issue #73: a **jsonb array**, which is a different case from the object above
+   * and the one that had no coverage at all.
+   *
+   * `action_items` is a jsonb array column and its only writer passes a JS array
+   * (`jobs/internal-routes.ts`). `node-postgres` serialises a JS *array* as a
+   * Postgres array literal rather than as JSON — so `$n::jsonb` receives `{...}`
+   * instead of `[...]` and Postgres rejects it with `invalid input syntax for type
+   * json`. See the repository's note on why arrays are encoded explicitly.
+   *
+   * This case exists because the object case passed while the array case was
+   * broken: every other real-database test here writes an *object*
+   * (`questionForm`), so the array path was never executed against a database. That
+   * is the shape of #43/#61/#75 — SQL nothing ran.
+   */
+  it("round-trips a jsonb *array* through JSONB unchanged", async () => {
+    const created = await repository.create({
+      jobId,
+      type: "submit_adr",
+      markdown: "# ADR",
+      actionItems: [
+        { type: "secret_request", description: "Needs a provider key" },
+        { type: "subtask_feature", description: "Split out the migration" },
+      ],
+    });
+
+    const events = await repository.listByJob(jobId);
+    const stored = events.find((event) => event.id === created.id);
+
+    expect(stored?.actionItems).toEqual([
+      { type: "secret_request", description: "Needs a provider key" },
+      { type: "subtask_feature", description: "Split out the migration" },
+    ]);
+  });
+
   it("stores NULL for a prose question, and reads it back as null", async () => {
     // The other half of "the two modes coexist", and the state of every row
     // written before migration 052.

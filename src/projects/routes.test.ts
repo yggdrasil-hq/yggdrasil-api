@@ -2297,6 +2297,7 @@ describe("GET /:projectId/features/:featureId/agentic-review (issue #59)", () =>
         prUrl: null,
         summary: "The refresh path is missing.",
         verdict: "changes_requested",
+        reviewFindings: null,
         actionItems: null,
         snapshot: null,
         createdAt: new Date("2026-09-18T10:00:00.000Z"),
@@ -2310,9 +2311,54 @@ describe("GET /:projectId/features/:featureId/agentic-review (issue #59)", () =>
       verdict: "changes_requested",
       summary: "The refresh path is missing.",
       comments: [],
+      // Issue #73: a prose review, so the findings are not countable. The client
+      // uses this to drop the blocking-count phrase rather than assert zero.
+      findingsRecorded: false,
       jobId: "job_1",
       completedAt: "2026-09-18T10:00:00.000Z",
     });
+  });
+
+  /*
+   * Issue #73's end-to-end half: findings that arrive structured reach the wire as
+   * `comments` with `findingsRecorded: true`, so a client may count blockers.
+   * Without this the column could be written and never read, which is the failure
+   * mode #59 recorded for the verdict.
+   */
+  it("returns structured findings, and says they were recorded", async () => {
+    const { app } = buildApp({
+      project,
+      feature,
+      latestReview: {
+        id: "evt_2",
+        jobId: "job_2",
+        type: "submit_review",
+        question: null,
+        markdown: null,
+        message: null,
+        status: null,
+        prUrl: null,
+        summary: "Three things to fix.",
+        verdict: "changes_requested",
+        questionForm: null,
+        reviewFindings: [
+          { path: "src/auth.ts", line: 42, body: "Token refresh is missing.", blocking: true },
+          { path: null, line: null, body: "Overall shape is fine.", blocking: false },
+        ],
+        actionItems: null,
+        snapshot: null,
+        createdAt: new Date("2026-09-18T10:00:00.000Z"),
+      },
+    });
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(200);
+    expect(res.body.findingsRecorded).toBe(true);
+    expect(res.body.comments).toEqual([
+      { path: "src/auth.ts", line: 42, body: "Token refresh is missing.", blocking: true },
+      { path: null, line: null, body: "Overall shape is fine.", blocking: false },
+    ]);
   });
 
   // The tab's reported symptom. A 404 made "nobody has reviewed this" and "the
