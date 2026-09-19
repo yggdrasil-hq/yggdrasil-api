@@ -79,24 +79,37 @@ export function resolveGrillReplyTimeout(raw: string | undefined): {
 }
 
 /**
- * Parses `SESSION_MAX_BYTES`, where **zero is a value and not an absence**.
+ * Parses an integer limit where **zero is a value and not an absence** (issue #104).
  *
- * ADR 032 item 4 requires a non-positive cap to mean "reclaim everything", and the
- * `Number(env) || default` idiom the sibling config blocks use cannot express that:
- * `0 || 5_000_000` is the default, so the instruction would be silently replaced by
- * the thing it was meant to switch off. Hence an explicit parser rather than the
- * idiom — and exported, following `resolveGrillReplyTimeout`, so the interesting half
- * (what a given string resolves to) is testable without constructing the module.
+ * The `Number(env) || fallback` idiom the other config blocks use cannot express
+ * zero: `0 || 5_000_000` is the fallback, so `SESSION_MAX_BYTES=0` would silently
+ * configure the cap it was meant to switch off. Anything reading a *limit* needs
+ * this instead, because for a limit zero is a legitimate instruction ("refuse
+ * everything", "keep none") rather than an unset value — and the consumers are
+ * written for it: `exceedsSizeCap` in `shared/artifacts.ts` refuses every non-empty
+ * artifact at `0`, and the delta relay branches on `maxBytesPerJob > 0`. A zero that
+ * could never arrive left both of those guarding a state no operator could produce.
  *
- * An unset, empty or unparseable value is the default, which is the one case that
- * *should* fall back: a typo must not switch collection off. A negative value is
+ * **One function rather than one per site**, because three copies of a parse rule is
+ * how `SESSION_MAX_BYTES` came to differ from its two siblings in the first place:
+ * all three were documented to accept zero, only one did, and nothing said so.
+ *
+ * An unset, empty or unparseable value is the fallback, which is the one case that
+ * *should* fall back: a typo must not switch a feature off. A negative value is
  * clamped to zero rather than kept, so `-1` and `0` cannot mean different things to
- * the upload path and the sweep.
+ * two readers of one setting. A fractional value is floored: these are bytes and
+ * counts, and `4096.5` bytes is not a size a comparison can mean anything with.
+ *
+ * Deliberately **not** used for the settings where zero has no meaning — see
+ * `recordings.sweepIntervalMs` and the `retentionDays` values, which keep a floor
+ * because a zero-length interval is a busy loop and a zero-day window purges
+ * immediately. Those are absences whatever the operator typed, so the idiom is
+ * correct there and inventing a meaning for zero would be the bug.
  */
-export function sessionMaxBytesFrom(raw: string | undefined): number {
-  if (raw === undefined || raw.trim() === "") return DEFAULT_SESSION_MAX_BYTES;
+export function limitFrom(raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback;
   const parsed = Number(raw);
-  if (!Number.isFinite(parsed)) return DEFAULT_SESSION_MAX_BYTES;
+  if (!Number.isFinite(parsed)) return fallback;
   return Math.max(0, Math.floor(parsed));
 }
 
@@ -111,6 +124,21 @@ export function sessionMaxBytesFrom(raw: string | undefined): number {
  * chosen independently so a reader knows the coupling is deliberate.
  */
 export const DEFAULT_SESSION_MAX_BYTES = 5_000_000;
+
+/**
+ * The default cap on one recording, and the value `RECORDING_MAX_BYTES=0` switches
+ * off entirely (the upload path refuses every non-empty artifact rather than
+ * falling back to this). ADR 029 records why a recording is capped at all.
+ */
+export const DEFAULT_RECORDING_MAX_BYTES = 25_000_000;
+
+/**
+ * The default ceiling on delta text relayed for one job before its deltas stop
+ * (issue #24). Zero disables the ceiling — it means "relay everything", the
+ * opposite of the recording cap's zero — which is why the two need one parser and
+ * cannot share a meaning.
+ */
+export const DEFAULT_LIVE_DELTA_BYTES_PER_JOB = 8_000_000;
 
 function required(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback;
@@ -239,9 +267,9 @@ export const config = {
      * "unset" — see `recordRelayedDeltaBytes` in `jobs/repository.ts` for what
      * happens at the boundary and why nothing is lost when it is reached.
      */
-    deltaBytesPerJob: Math.max(
-      0,
-      Math.floor(Number(process.env.LIVE_DELTA_BYTES_PER_JOB)) || 8_000_000,
+    deltaBytesPerJob: limitFrom(
+      process.env.LIVE_DELTA_BYTES_PER_JOB,
+      DEFAULT_LIVE_DELTA_BYTES_PER_JOB,
     ),
   },
   sessionTtl: {
@@ -270,10 +298,18 @@ export const config = {
    * turn the sweep into a busy loop. `enabled` follows the scheduler's
    * reasoning: a background job that has to be switched on is one that silently
    * does nothing after a fresh install.
+   *
+   * **`sweepIntervalMs` and `retentionDays` deliberately keep the `||` idiom and
+   * their floors** (issue #104): zero has no meaning for either — a zero-length
+   * interval is a busy loop and a zero-day window purges a recording as it arrives —
+   * so for these two an absent or nonsensical value falling back to the default is
+   * the correct reading, and routing them through `limitFrom` would invent a meaning
+   * that the sweep has no behaviour for. Only the *limits* (`maxBytes`,
+   * `deltaBytesPerJob`, a count) treat zero as an instruction.
    */
   recordings: {
     enabled: process.env.RECORDINGS_ENABLED !== "false",
-    maxBytes: Math.max(0, Number(process.env.RECORDING_MAX_BYTES) || 25_000_000),
+    maxBytes: limitFrom(process.env.RECORDING_MAX_BYTES, DEFAULT_RECORDING_MAX_BYTES),
     retentionDays: Math.max(1, Number(process.env.RECORDING_RETENTION_DAYS) || 30),
     sweepIntervalMs: Math.max(
       1_000,
@@ -304,13 +340,13 @@ export const config = {
    *
    *   **A value of zero is an instruction, not an absence** — ADR 032 item 4's
    *   "if it is set to zero it must mean 'reclaim everything', not 'keep
-   *   forever'". It is parsed by `sessionMaxBytesFrom` rather than by the
-   *   `Number(env) || default` idiom the sibling blocks use, because that idiom
-   *   cannot express zero at all: `0 || 25_000_000` is the default, so an operator
-   *   writing `SESSION_MAX_BYTES=0` would silently get 5 MB. That is a real trap and
-   *   not a hypothetical — `RECORDING_MAX_BYTES=0` is unreachable the same way,
-   *   which is filed separately rather than changed here, since altering the
-   *   recording path's parsing is not this change's business.
+   *   forever'". It is parsed by `limitFrom` rather than by the
+   *   `Number(env) || default` idiom, because that idiom cannot express zero at
+   *   all: `0 || 25_000_000` is the default, so an operator writing
+   *   `SESSION_MAX_BYTES=0` would silently get 5 MB. Issue #104 found that the same
+   *   trap had made `RECORDING_MAX_BYTES=0` and `LIVE_DELTA_BYTES_PER_JOB=0`
+   *   unreachable while both their comments promised otherwise; all three now share
+   *   the one parser, so the rule is stated once.
    *
    * - `retentionDays` is the other half of the bound, and a session is the more
    *   sensitive artifact: it holds the full conversation including anything the
@@ -323,7 +359,7 @@ export const config = {
    */
   sessions: {
     enabled: process.env.SESSIONS_ENABLED !== "false",
-    maxBytes: sessionMaxBytesFrom(process.env.SESSION_MAX_BYTES),
+    maxBytes: limitFrom(process.env.SESSION_MAX_BYTES, DEFAULT_SESSION_MAX_BYTES),
     retentionDays: Math.max(
       1,
       Math.floor(Number(process.env.SESSION_RETENTION_DAYS)) || 30,

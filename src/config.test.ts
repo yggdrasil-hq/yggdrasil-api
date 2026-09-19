@@ -1,12 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_GRILL_REPLY_TIMEOUT_MS,
+  DEFAULT_LIVE_DELTA_BYTES_PER_JOB,
+  DEFAULT_RECORDING_MAX_BYTES,
   DEFAULT_SESSION_MAX_BYTES,
   GRILL_REPLY_TIMEOUT_ENV,
   appPublicRedirect,
   config,
+  limitFrom,
   resolveGrillReplyTimeout,
-  sessionMaxBytesFrom,
 } from "./config.js";
 
 describe("appPublicRedirect", () => {
@@ -113,39 +115,111 @@ describe("the grill reply bound mirrors the Orchestrator's (#92)", () => {
 });
 
 /**
- * ADR 032 item 4's session cap, and the trap it exists to avoid.
+ * Issue #104: a value of zero is an *instruction*, not an absence — and the rule is
+ * tested in two halves because they fail differently.
  *
- * The sibling config blocks parse with `Number(env) || default`, which **cannot
- * express zero**: `0 || 5_000_000` is the default, so `SESSION_MAX_BYTES=0` would
- * silently configure the cap it was meant to switch off. Item 4 requires zero to
- * mean "reclaim everything", so the value is parsed explicitly and this is the test
- * that proves the difference — it fails against the idiom, which is the point.
+ * `limitFrom` is the rule. Before it there were three copies of it: `SESSION_MAX_BYTES`
+ * accepted zero, `RECORDING_MAX_BYTES` and `LIVE_DELTA_BYTES_PER_JOB` were both
+ * documented to and did not, and nothing failed to say so — the idiom they used,
+ * `Number(env) || default`, cannot express zero at all. So the first block proves the
+ * rule, and the second proves each cap actually reaches it with its own default; a
+ * correct parser nobody calls is this burn-down's "looks finished, does nothing" shape.
  */
-describe("sessionMaxBytesFrom", () => {
-  it("treats zero as the instruction it is, not as an absence", () => {
-    expect(sessionMaxBytesFrom("0")).toBe(0);
-    expect(sessionMaxBytesFrom(" 0 ")).toBe(0);
+describe("limitFrom: an integer limit where zero is a value, not an absence (#104)", () => {
+  // A fallback with no other reason to be this number, so a test that confuses the
+  // fallback for the parsed value cannot pass by coincidence.
+  const FALLBACK = 25_000_000;
+
+  it("treats zero as the instruction it is", () => {
+    expect(limitFrom("0", FALLBACK)).toBe(0);
+    expect(limitFrom(" 0 ", FALLBACK)).toBe(0);
   });
 
-  it("clamps a negative value to zero so the upload path and the sweep agree", () => {
-    // `-1` and `0` must not mean different things to two readers of one setting.
-    expect(sessionMaxBytesFrom("-1")).toBe(0);
-    expect(sessionMaxBytesFrom("-99999")).toBe(0);
+  it("clamps a negative value to zero so two readers of one setting agree", () => {
+    // `-1` and `0` must not mean different things to the upload path and the sweep.
+    expect(limitFrom("-1", FALLBACK)).toBe(0);
+    expect(limitFrom("-99999", FALLBACK)).toBe(0);
   });
 
-  it("uses the default when the value is unset, empty or unparseable", () => {
-    // The one case that *should* fall back: a typo must not switch collection off.
+  it("uses the fallback when the value is unset, empty or unparseable", () => {
+    // The one case that *should* fall back: a typo must not switch a feature off.
     for (const raw of [undefined, "", "   ", "abc", "5MB", "NaN", "Infinity"]) {
-      expect(sessionMaxBytesFrom(raw), String(raw)).toBe(DEFAULT_SESSION_MAX_BYTES);
+      expect(limitFrom(raw, FALLBACK), String(raw)).toBe(FALLBACK);
     }
   });
 
   it("keeps a real value, and floors a fractional one", () => {
-    expect(sessionMaxBytesFrom("1000")).toBe(1000);
-    expect(sessionMaxBytesFrom("1000.9")).toBe(1000);
+    // These are bytes and counts; `4096.5` bytes is not a size a comparison can
+    // mean anything with, so it resolves to the same value as `4096`.
+    expect(limitFrom("1000", FALLBACK)).toBe(1000);
+    expect(limitFrom("1000.9", FALLBACK)).toBe(1000);
   });
+});
 
-  it("matches the Orchestrator's own default cap", () => {
+/**
+ * The wiring half: every cap reads its own environment variable through `limitFrom`,
+ * and keeps its own default.
+ *
+ * **Why these re-import the module.** `config` is a single object built once at
+ * import, so asserting on the imported binding only ever observes whatever this
+ * process was started with. Setting a variable and importing again is the only way to
+ * observe the parse rule *through* the wiring rather than beside it.
+ */
+describe("every cap reaches zero, and keeps its own default (#104)", () => {
+  const caps = [
+    {
+      env: "RECORDING_MAX_BYTES",
+      read: (c: typeof config) => c.recordings.maxBytes,
+      fallback: DEFAULT_RECORDING_MAX_BYTES,
+      means: "refuse every non-empty recording",
+    },
+    {
+      env: "LIVE_DELTA_BYTES_PER_JOB",
+      read: (c: typeof config) => c.live.deltaBytesPerJob,
+      fallback: DEFAULT_LIVE_DELTA_BYTES_PER_JOB,
+      means: "relay every delta, i.e. no ceiling",
+    },
+    {
+      env: "SESSION_MAX_BYTES",
+      read: (c: typeof config) => c.sessions.maxBytes,
+      fallback: DEFAULT_SESSION_MAX_BYTES,
+      means: "reclaim every session",
+    },
+  ];
+
+  /** `config` re-evaluated with `name` set to `value`, or removed when undefined. */
+  async function configWith(
+    name: string,
+    value: string | undefined,
+  ): Promise<typeof config> {
+    vi.resetModules();
+    const saved = process.env[name];
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+    try {
+      return (await import("./config.js")).config;
+    } finally {
+      if (saved === undefined) delete process.env[name];
+      else process.env[name] = saved;
+      vi.resetModules();
+    }
+  }
+
+  for (const cap of caps) {
+    it(`${cap.env}=0 reaches the cap (${cap.means}) rather than its default`, async () => {
+      // The assertion the issue is about: an operator writing `=0` used to get
+      // `cap.fallback` back, silently, because `0 || fallback` is the fallback.
+      expect(cap.read(await configWith(cap.env, "0"))).toBe(0);
+    });
+
+    it(`${cap.env} falls back to its own default when unset, empty or unparseable`, async () => {
+      for (const raw of [undefined, "", "   ", "not-a-number"]) {
+        expect(cap.read(await configWith(cap.env, raw)), String(raw)).toBe(cap.fallback);
+      }
+    });
+  }
+
+  it("pins the session cap to the Orchestrator's own default", () => {
     // A cross-repo constant neither suite can see across: if the two disagree, the
     // API silently declines artifacts the Orchestrator considered within policy and
     // the only symptom is a 202 in the other service's log. The Orchestrator's
@@ -153,6 +227,5 @@ describe("sessionMaxBytesFrom", () => {
     // (`DefaultSessionMaxBytes`), and this asserts the equality so a change on
     // either side goes red here.
     expect(DEFAULT_SESSION_MAX_BYTES).toBe(5_000_000);
-    expect(config.sessions.maxBytes).toBe(DEFAULT_SESSION_MAX_BYTES);
   });
 });
