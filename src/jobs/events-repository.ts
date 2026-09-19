@@ -29,6 +29,40 @@ export interface JobEventActionItem {
   draftTestMarkdown?: string;
 }
 
+/**
+ * Issue #38: one choice offered by a structured grill question.
+ *
+ * `description` is optional because it often is — "PostgreSQL" needs no gloss,
+ * while "SQLite" is only a real choice once you know it is "simplest for local
+ * development". The tool does not require it, so storage must not either.
+ */
+export interface JobEventQuestionOption {
+  label: string;
+  description: string | null;
+}
+
+/**
+ * Issue #38: how a grill question should be *rendered*, when the agent knew the
+ * answer was a choice rather than free prose.
+ *
+ * Null on the containing event means the question is prose — which is both the
+ * pre-#38 state of every row and the current state of an open-ended question
+ * ("what problem does this solve?"). The issue is explicit that the two modes
+ * coexist, and treating "no form" as "prose" rather than as "structured but
+ * empty" keeps that in one representation instead of two.
+ *
+ * `header` is a nullable string even though the tool requires it alongside
+ * `options`: see the event schema in `jobs/internal-routes.ts` for why the
+ * *requirement* lives there rather than here. Briefly — a renderer can fall back
+ * to the question text as a heading, so a missing header is a cosmetic problem,
+ * and storing null keeps a malformed payload renderable instead of unreadable.
+ */
+export interface JobEventQuestionForm {
+  header: string | null;
+  multiSelect: boolean;
+  options: JobEventQuestionOption[];
+}
+
 export interface JobEvent {
   id: string;
   jobId: string;
@@ -49,6 +83,11 @@ export interface JobEvent {
    * why neither is rendered as a decision of any kind.
    */
   verdict: string | null;
+  /**
+   * Issue #38: the structured form of an `ask_user` question, or null when it
+   * was asked as prose. See `JobEventQuestionForm`.
+   */
+  questionForm: JobEventQuestionForm | null;
   actionItems: JobEventActionItem[] | null;
   snapshot: Record<string, string> | null;
   createdAt: Date;
@@ -65,6 +104,7 @@ interface JobEventRow {
   pr_url: string | null;
   summary: string | null;
   verdict: string | null;
+  question_form: JobEventQuestionForm | null;
   action_items: JobEventActionItem[] | null;
   design_snapshot: Record<string, string> | null;
   created_at: Date;
@@ -85,7 +125,7 @@ export interface JobEventWithScope {
 
 /** The event columns, spelled once so every read returns the same shape. */
 const jobEventColumns = `id, job_id, type, question, markdown, message, status, pr_url,
-         summary, verdict, action_items, design_snapshot, created_at`;
+         summary, verdict, question_form, action_items, design_snapshot, created_at`;
 
 function mapJobEvent(row: JobEventRow): JobEvent {
   return {
@@ -99,6 +139,7 @@ function mapJobEvent(row: JobEventRow): JobEvent {
     prUrl: row.pr_url,
     summary: row.summary,
     verdict: row.verdict,
+    questionForm: row.question_form,
     actionItems: row.action_items,
     snapshot: row.design_snapshot,
     createdAt: row.created_at,
@@ -138,15 +179,23 @@ export class JobEventRepository {
      * did not. Naming it here is what makes the omission a type error next time.
      */
     verdict?: string;
+    /**
+     * Issue #38: the structured form of an `ask_user` question. Declared here for
+     * the reason the `verdict` comment below spells out at length — a caller
+     * spreads a wider object into a narrower parameter, so an undeclared field is
+     * discarded *silently*. The spread in `jobs/internal-routes.ts` would drop a
+     * question form without a type error.
+     */
+    questionForm?: JobEventQuestionForm | null;
     actionItems?: JobEventActionItem[];
     snapshot?: Record<string, string>;
   }): Promise<JobEvent> {
     const result = await this.db.query<JobEventRow>(
       `INSERT INTO job_events
-         (job_id, type, question, markdown, message, status, pr_url, summary, verdict, action_items, design_snapshot)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         (job_id, type, question, markdown, message, status, pr_url, summary, verdict, question_form, action_items, design_snapshot)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        RETURNING id, job_id, type, question, markdown, message, status, pr_url,
-         summary, verdict, action_items, design_snapshot, created_at`,
+         summary, verdict, question_form, action_items, design_snapshot, created_at`,
       [
         input.jobId,
         input.type,
@@ -157,6 +206,7 @@ export class JobEventRepository {
         input.prUrl ?? null,
         input.summary ?? null,
         input.verdict ?? null,
+        input.questionForm ?? null,
         input.actionItems ?? null,
         input.snapshot ?? null,
       ],
@@ -201,7 +251,8 @@ export class JobEventRepository {
   async findByIdWithScope(eventId: string): Promise<JobEventWithScope | null> {
     const result = await this.db.query<JobEventScopeRow>(
       `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
-         e.status, e.pr_url, e.summary, e.verdict, e.action_items, e.design_snapshot,
+         e.status, e.pr_url, e.summary, e.verdict, e.question_form,
+         e.action_items, e.design_snapshot,
          e.created_at, j.project_id, j.feature_id
        FROM job_events e
        INNER JOIN jobs j ON j.id = e.job_id
@@ -221,7 +272,8 @@ export class JobEventRepository {
   async listSpecGrillByFeature(featureId: string): Promise<JobEvent[]> {
     const result = await this.db.query<JobEventRow>(
       `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
-         e.status, e.pr_url, e.summary, e.verdict, e.action_items, e.design_snapshot,
+         e.status, e.pr_url, e.summary, e.verdict, e.question_form,
+         e.action_items, e.design_snapshot,
          e.created_at
        FROM job_events e
        INNER JOIN jobs j ON j.id = e.job_id
@@ -266,8 +318,8 @@ export class JobEventRepository {
       // audit query became ambiguous against the joined `projects` table — the
       // constant is only safe in a single-table read.
       `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
-         e.status, e.pr_url, e.summary, e.verdict, e.action_items,
-         e.design_snapshot, e.created_at
+         e.status, e.pr_url, e.summary, e.verdict, e.question_form,
+         e.action_items, e.design_snapshot, e.created_at
        FROM job_events e
        INNER JOIN jobs j ON j.id = e.job_id
        WHERE j.feature_id = $1 AND e.type = 'submit_review'

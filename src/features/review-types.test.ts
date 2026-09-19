@@ -23,6 +23,7 @@ function makeEvent(overrides: Partial<JobEvent> = {}): JobEvent {
     prUrl: null,
     summary: "Auth flow is missing the token refresh path.",
     verdict: "changes_requested",
+    questionForm: null,
     actionItems: null,
     snapshot: null,
     createdAt: new Date("2026-09-18T10:00:00.000Z"),

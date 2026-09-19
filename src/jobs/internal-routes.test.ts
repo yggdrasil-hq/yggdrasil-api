@@ -18,6 +18,7 @@ function makeEvent(overrides: Partial<JobEvent> = {}): JobEvent {
     prUrl: null,
     summary: null,
     verdict: null,
+    questionForm: null,
     actionItems: null,
     snapshot: null,
     createdAt: new Date(),
@@ -67,6 +68,21 @@ type CreateInput = {
     draftTestMarkdown?: string;
   }>;
   snapshot?: Record<string, string>;
+  /**
+   * Issue #38: the structured form of an `ask_user` question.
+   *
+   * Declared here as well as on the real input because this test's local shape is
+   * narrower than the route's — which is *why* the compiler caught the omission
+   * when the route started passing it, and is the same mechanism that made #59's
+   * missing `verdict` a silent loss instead of a type error. A test double whose
+   * input type is a subset of the real one will keep doing that, so it is worth
+   * keeping the two fields in step rather than reaching for a cast.
+   */
+  questionForm?: {
+    header: string | null;
+    multiSelect: boolean;
+    options: Array<{ label: string; description: string | null }>;
+  } | null;
 };
 
 function buildApp(deps: {
@@ -265,7 +281,21 @@ describe("POST /internal/jobs/:jobId/events", () => {
 
     expect(res.status).toBe(201);
     expect(res.body).toEqual({ id: "event_42" });
-    expect(gotInput).toEqual({ jobId: JOB_ID, type: "ask_user", question: "Which auth model?" });
+    /*
+     * `questionForm: null` is listed because the route now always passes it, and
+     * `toEqual` treats a property with the value `null` as significant while it
+     * ignores one whose value is `undefined`. That asymmetry is why this
+     * assertion survived the earlier `verdict`/`actionItems`/`snapshot` additions
+     * unchanged (all three were `undefined` for this event) and needed updating
+     * for this one. A reader adding an event field should know which of the two
+     * they are dealing with: `?? null` in the route makes it significant here.
+     */
+    expect(gotInput).toEqual({
+      jobId: JOB_ID,
+      type: "ask_user",
+      question: "Which auth model?",
+      questionForm: null,
+    });
   });
 
   it("persists a submit_adr event with markdown", async () => {
@@ -378,6 +408,8 @@ describe("POST /internal/jobs/:jobId/events", () => {
       jobId: JOB_ID,
       type: "update_design_preview",
       snapshot: { "designs/checkout/page.html": "<h1>Hello</h1>" },
+      // Present-and-null, not undefined: see the note in the ask_user case above.
+      questionForm: null,
     });
   });
 
@@ -638,6 +670,174 @@ describe("POST /internal/jobs/:jobId/events", () => {
 
     expect(res.status).toBe(201);
     expect(setAwaitingUserInput).toHaveBeenCalledWith("feature_42", true);
+  });
+
+  /*
+   * Issue #38: the structured form of an `ask_user` question.
+   *
+   * The event type does not change — this is the same `ask_user` the prose case
+   * uses, gaining detail. That is deliberate and is what lets the question and its
+   * answer ride the existing paths (ADR 006's mid-run reply, ADR 019's relay)
+   * rather than a second mechanism.
+   */
+  describe("structured questions (issue #38)", () => {
+    it("persists the form, normalising a missing description to null", async () => {
+      let gotInput: CreateInput | undefined;
+      const app = buildApp({
+        findById: async () => makeJob({ kind: "spec_grill", featureId: "feature_42" }),
+        create: async (input) => {
+          gotInput = input;
+          return makeEvent({ jobId: input.jobId, type: input.type });
+        },
+      });
+
+      const res = await request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({
+          type: "ask_user",
+          question: "Which database should the API use?",
+          header: "Database",
+          multiSelect: false,
+          options: [
+            { label: "PostgreSQL", description: "Matches the existing API stack" },
+            { label: "SQLite" },
+          ],
+        });
+
+      expect(res.status).toBe(201);
+      expect(gotInput?.questionForm).toEqual({
+        header: "Database",
+        multiSelect: false,
+        options: [
+          { label: "PostgreSQL", description: "Matches the existing API stack" },
+          // Absent becomes null rather than undefined, so the stored JSONB has a
+          // stable shape the Web app can read without an existence check per
+          // option.
+          { label: "SQLite", description: null },
+        ],
+      });
+    });
+
+    it("defaults multiSelect to false rather than leaving it undefined", async () => {
+      // The field decides which control renders, so "absent" has to resolve to a
+      // concrete single-choice answer rather than being the renderer's problem.
+      let gotInput: CreateInput | undefined;
+      const app = buildApp({
+        findById: async () => makeJob({ kind: "spec_grill", featureId: "feature_42" }),
+        create: async (input) => {
+          gotInput = input;
+          return makeEvent({ jobId: input.jobId, type: input.type });
+        },
+      });
+
+      await request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({
+          type: "ask_user",
+          question: "Which?",
+          header: "Pick one",
+          options: [{ label: "A" }, { label: "B" }],
+        });
+
+      expect(gotInput?.questionForm?.multiSelect).toBe(false);
+    });
+
+    it("keeps questionForm null for a prose question", async () => {
+      // The other half of "the two modes coexist": a question with no options is
+      // today's behaviour exactly, and the API must not invent a form for it.
+      let gotInput: CreateInput | undefined;
+      const app = buildApp({
+        findById: async () => makeJob({ kind: "spec_grill", featureId: "feature_42" }),
+        create: async (input) => {
+          gotInput = input;
+          return makeEvent({ jobId: input.jobId, type: input.type });
+        },
+      });
+
+      const res = await request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({ type: "ask_user", question: "What problem does this solve?" });
+
+      expect(res.status).toBe(201);
+      expect(gotInput?.questionForm).toBeNull();
+    });
+
+    it("rejects options with no header, because the control needs a label", async () => {
+      // Tested rather than only documented: this is the one malformed shape a
+      // model is most likely to produce (it supplied real choices and forgot the
+      // heading), so the API has to say so instead of storing a form the Web app
+      // renders with a blank title.
+      const app = buildApp({
+        findById: async () => makeJob({ kind: "spec_grill", featureId: "feature_42" }),
+      });
+
+      const res = await request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({
+          type: "ask_user",
+          question: "Which?",
+          options: [{ label: "A" }],
+        });
+
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(res.body)).toContain("header");
+    });
+
+    it("rejects an empty options array rather than downgrading it to prose", async () => {
+      // A caller that meant to offer choices and produced none has a bug; treating
+      // that as a text box would hide it from the caller that could fix it.
+      const app = buildApp({
+        findById: async () => makeJob({ kind: "spec_grill", featureId: "feature_42" }),
+      });
+
+      const res = await request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({ type: "ask_user", question: "Which?", header: "Pick", options: [] });
+
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(res.body)).toContain("at least one");
+    });
+
+    it("rejects ask_user on a job kind with no chat surface", async () => {
+      /*
+       * Prevention is the skills' `allowed-tools` frontmatter, which lists
+       * `ask_user` only for the three grill skills. This is the backstop: a job
+       * kind with no chat surface has no reply to wait for, and `ask_user` ends
+       * the turn without ending the run, so accepting one produces a run that
+       * hangs with nothing on screen to explain it.
+       */
+      const app = buildApp({
+        findById: async () => makeJob({ kind: "feature_build", featureId: "feature_42" }),
+      });
+
+      const res = await request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({ type: "ask_user", question: "Which?", header: "Pick", options: [{ label: "A" }] });
+
+      expect(res.status).toBe(400);
+      expect(JSON.stringify(res.body)).toContain("chat surface");
+    });
+
+    it("still accepts ask_user on design_grill", async () => {
+      // The second grill kind, so a future narrowing of GRILL_JOB_KINDS cannot
+      // silently break the design session without failing here.
+      const app = buildApp({
+        findById: async () => makeJob({ kind: "design_grill", featureId: null }),
+      });
+
+      const res = await request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({ type: "ask_user", question: "Which?", header: "Pick", options: [{ label: "A" }] });
+
+      expect(res.status).toBe(201);
+    });
   });
 
   it("clears awaiting_user_input when a run_failed event arrives", async () => {

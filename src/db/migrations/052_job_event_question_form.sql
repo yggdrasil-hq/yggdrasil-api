@@ -1,0 +1,38 @@
+-- Issue #38: a grill question that is a *choice* needs to survive a reload.
+--
+-- `ask_user` already carries a question as prose and gets the human's reply back
+-- as the next prompt (ADR 006 items 9-10). What it cannot express is that the
+-- question has a small set of known answers — so the Web app renders a chat box
+-- for every question and the user types "PostgreSQL" by hand, even when the agent
+-- knew to offer "PostgreSQL / SQLite" as a choice.
+--
+-- The structured form rides the *existing* event rather than adding a second one:
+-- the tool is still `ask_user`, the event type is still `ask_user`, the reply is
+-- still a `user_message`, and the transport is unchanged. Only the shape of the
+-- question gains detail, which is why there is no new event type here and no new
+-- route anywhere.
+--
+-- **Why a jsonb column rather than scalars.** `action_items` and
+-- `design_snapshot` are the precedent for a structured payload on this table, and
+-- this is the same kind of thing: a small object whose sub-shape (the option
+-- list) is variable-length and meaningless when split into columns. `verdict` went
+-- the other way as a scalar, correctly, because it is one value with a CHECK-able
+-- domain. The two decisions differ because the payloads differ.
+--
+-- **Why not reuse `action_items` or `design_snapshot`.** Both are typed and
+-- consumed by other features; a third meaning in either would make every reader
+-- branch on the event type before it could trust the field.
+--
+-- **NULL means "asked as prose", not "asked without options".** That is the state
+-- of every `ask_user` row written before this migration, and it is also what a
+-- free-text question writes today — the two cases are genuinely the same thing to
+-- a renderer, so they share a representation rather than one of them becoming
+-- `{}` and needing a separate "was it structured?" test.
+--
+-- Shape (validated at the API's event schema, not by a CHECK here — a CHECK
+-- cannot express "header is required when options are present" without becoming
+-- unreadable, and the schema is where a helpful error message can live):
+--
+--   { "header": "Database", "multiSelect": false,
+--     "options": [ { "label": "PostgreSQL", "description": "Matches the API stack" } ] }
+ALTER TABLE job_events ADD COLUMN IF NOT EXISTS question_form JSONB;
