@@ -50,6 +50,19 @@ VALUES (
   'spec_grill', 'running'
 ) ON CONFLICT (id) DO NOTHING;
 
+-- Issue #25: a `design_grill` job, which is the one kind with a topic of its own.
+-- No `feature_id`, deliberately: that is what makes it unroutable by the feature
+-- topic and is the whole reason the design topic had to exist. `design_slug` is
+-- left NULL so the route's "snapshot path inside the design folder" check is a
+-- no-op — this fixture is about the relay's routing, not that rule.
+INSERT INTO jobs (id, project_id, feature_id, kind, status)
+VALUES (
+  '77777777-7777-4777-8777-777777777777',
+  '33333333-3333-4333-8333-333333333333',
+  NULL,
+  'design_grill', 'running'
+) ON CONFLICT (id) DO NOTHING;
+
 -- The session id *is* the cookie value (the relay reads an opaque id off the raw
 -- Cookie header and calls findValid on it — there is no signature), so the
 -- verifier can authenticate by sending this literal.

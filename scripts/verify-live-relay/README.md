@@ -43,11 +43,23 @@ runs there, and drops it. Their data is untouched.
 | delta at the route's 4000-char limit | the documented producer bound still works |
 | same 4000 chars, multi-byte | the route accepts it and the publisher drops it (issue #78) |
 | through nginx | upgrade, subscribe and delivery all survive the proxy |
+| design session: event across replicas on its own topic | issue #25's topic, on the same load-bearing path — written by B, observed on A's socket |
+| feature event stays off the design topic | the **negative** half: a feature's event must not reach a design subscription, which a positive case cannot express |
 | idle 90s through nginx | **past nginx's default 60s `proxy_read_timeout`**, so this distinguishes the configured 3600s from the default |
 
 Plus a `pg_notify` payload-cap probe outside the Node harness (7999 bytes accepted,
 8000 rejected), which is the constraint that justifies the stored-event payload
 being an id rather than event data.
+
+**On the negative check, and why it was rewritten.** Its first version subscribed to
+the *feature* topic and wrote a *design* event, asserting nothing arrived — which
+could never have failed: the fixture design job has no `feature_id`, so its events
+cannot reach any feature topic even if the routing is wrong, because the topic they
+would be mis-routed to is `feature:<designJobId>`, not the one under test. It now
+watches the **design** topic and writes a **feature** event, and it was verified
+falsifiable by temporarily making `deliverStored` also publish to the design topic:
+that run reported `LEAKED onto the design topic` and failed on that check alone. A
+negative case that cannot fail is worse than none, because it reads as coverage.
 
 ## Two things that will bite you, both reproduced here first
 
@@ -66,7 +78,7 @@ work and receive nothing, forever.
 ## Files
 
 - `run2.sh` — orchestration, fixtures, the `pg_notify` probe, replica log dump, and cleanup.
-- `verify.cjs` — the nine checks.
+- `verify.cjs` — the eleven checks.
 - `fixtures.sql` — the session / org membership / project / feature / job rows the
   socket auth path requires, all fixed UUIDs.
 - `nginx.conf` — the API directives copied byte-for-byte from `deploy/nginx/dev.conf`;

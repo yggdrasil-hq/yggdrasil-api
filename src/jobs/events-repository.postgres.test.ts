@@ -233,7 +233,7 @@ describe.skipIf(!reachability.ok)("JobEventRepository against a real Postgres", 
     const created = await repository.create({
       jobId: designJobId,
       type: "update_design_preview",
-      snapshot: { "/index.html": "<html></html>" },
+      snapshot: { "index.html": "<html></html>" },
     });
 
     const scoped = await repository.findByIdWithScope(created.id);
