@@ -44,6 +44,7 @@ async function main(): Promise<void> {
   const server = createServer(app);
 
   const hub = new LiveHub();
+  const liveJobs = new JobRepository(pool);
   createLiveSocketServer({
     server,
     hub,
@@ -51,6 +52,9 @@ async function main(): Promise<void> {
     users: new UserRepository(pool),
     projects: new ProjectRepository(pool),
     features: new FeatureRepository(pool),
+    // Issue #25: design sessions are resolved through the job repository, so the
+    // socket can authorise a design subscription the way the REST route does.
+    jobs: liveJobs,
     onError: (message) => console.error(message),
   });
   // The listener is started here, not inside `createApp`, for the same reason

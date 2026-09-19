@@ -4,10 +4,14 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { config } from "../config.js";
 import type { SessionService } from "../auth/sessions.js";
 import type { FeatureRepository } from "../features/repository.js";
+import type { JobRepository } from "../jobs/repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
 import type { UserRepository } from "../users/repository.js";
 import { readCookie } from "./cookies.js";
-import { authorizeSubscription } from "./authorization.js";
+import {
+  authorizeDesignSessionSubscription,
+  authorizeSubscription,
+} from "./authorization.js";
 import { FrameBudget, type FrameBudgetOptions } from "./limits.js";
 import type { LiveConnection, LiveHub } from "./hub.js";
 import {
@@ -16,6 +20,7 @@ import {
   LIVE_CLOSE_UNAUTHORIZED,
   LIVE_PROTOCOL_VERSION,
   LIVE_SOCKET_PATH,
+  liveTopicForDesignSession,
   liveTopicForFeature,
   parseClientFrame,
   type ServerFrame,
@@ -63,6 +68,14 @@ export interface LiveSocketDeps {
   users: UserRepository;
   projects: ProjectRepository;
   features: FeatureRepository;
+  /**
+   * Issue #25: design sessions are `design_grill` jobs, and
+   * `authorizeDesignSessionSubscription` mirrors the design-session events route by
+   * resolving the session through this repository. A narrow `Pick` rather than the
+   * whole `JobRepository` — the socket needs exactly one read from it, and naming
+   * that read is what keeps this dependency honest about its purpose.
+   */
+  jobs: Pick<JobRepository, "findByIdForProject">;
   hub: LiveHub;
   onError?: (message: string) => void;
   path?: string;
@@ -313,9 +326,22 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
         return;
       }
 
+      if (frame.type === "unsubscribe_design") {
+        deps.hub.unsubscribe(connection, liveTopicForDesignSession(frame.sessionId));
+        safeSend(connection, { type: "unsubscribed_design", sessionId: frame.sessionId });
+        return;
+      }
+
       // Awaited rather than fired and forgotten: `subscribe` does an
       // authorisation query, and returning before it resolves is what let a
-      // later frame overtake it (see the note on `queueFrame`).
+      // later frame overtake it (see the note on `queueFrame`). Same for the
+      // design-session variant, which is why it is awaited here too rather than
+      // dispatched independently.
+      if (frame.type === "subscribe_design") {
+        await subscribeDesignSession(connection, frame.projectId, frame.sessionId);
+        return;
+      }
+
       await subscribe(connection, frame.projectId, frame.featureId);
     }
 
@@ -382,6 +408,54 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
 
     deps.hub.subscribe(connection, liveTopicForFeature(featureId));
     safeSend(connection, { type: "subscribed", featureId });
+  }
+
+  /**
+   * The design-session peer of `subscribe` above (issue #25).
+   *
+   * Deliberately parallel rather than factored together, because the two differ in
+   * exactly the three places that matter and each should read next to its own
+   * REST route: the authoriser (`authorizeDesignSessionSubscription` mirrors
+   * `GET .../designs/:sessionId/events`; `authorizeSubscription` mirrors the
+   * feature events route), the topic function, and the reply frame. A shared
+   * helper taking those three as arguments would hide the correspondence that is
+   * the whole point of this file.
+   *
+   * The one thing it does *not* duplicate is the refresh semantics: like the
+   * feature case this adds the socket to a topic and returns. It sends no state,
+   * so the Web page's REST read stays the only state path (ADR 019 item 7).
+   */
+  async function subscribeDesignSession(
+    connection: AuthedConnection,
+    projectId: string,
+    sessionId: string,
+  ): Promise<void> {
+    let decision;
+    try {
+      // Re-authorised on every frame, never remembered from an earlier frame on
+      // the same socket — the rule the feature path follows, for the same reason:
+      // a socket that unsubscribes and resubscribes must re-authorise.
+      decision = await authorizeDesignSessionSubscription(deps, {
+        userId: connection.userId,
+        projectId,
+        sessionId,
+      });
+    } catch (error) {
+      report(`live socket design subscribe failed: ${describe(error)}`);
+      safeSend(connection, { type: "error", message: "Subscription failed" });
+      return;
+    }
+
+    if (!decision.ok) {
+      // One message for both refusals, matching the REST route's single 404 for a
+      // project the caller cannot see and a session that is not there — the same
+      // non-disclosure rule as the feature path (ADR 019 item 3).
+      safeSend(connection, { type: "error", message: "Design session not found" });
+      return;
+    }
+
+    deps.hub.subscribe(connection, liveTopicForDesignSession(sessionId));
+    safeSend(connection, { type: "subscribed_design", sessionId });
   }
 
   return {

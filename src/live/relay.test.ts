@@ -13,11 +13,15 @@ import { LIVE_JOB_EVENT_DELTAS_CHANNEL, type ServerFrame } from "./types.js";
 const FEATURE_ID = "33333333-3333-4333-8333-333333333333";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
 const EVENT_ID = "44444444-4444-4444-8444-444444444444";
+const SESSION_ID = "88888888-8888-4888-8888-888888888888";
 
 function scope(overrides: Partial<JobEventWithScope> = {}): JobEventWithScope {
   return {
     projectId: PROJECT_ID,
     featureId: FEATURE_ID,
+    // Most cases here are about the feature topic, so the default is the kind
+    // that could own a feature. `design_grill` cases override it.
+    jobKind: "feature_build",
     event: {
       id: EVENT_ID,
       jobId: "job_1",
@@ -118,11 +122,55 @@ describe("relayEnvelopeFor", () => {
     });
   });
 
-  it("returns null for a job that belongs to no feature", () => {
-    // ADR 014's `design_grill` is project-scoped: its jobs carry no feature_id,
-    // so there is no feature topic to route by. Dropping it is correct rather
-    // than a gap — a design session surface would need its own topic shape.
-    expect(relayEnvelopeFor(scope({ featureId: null }))).toBeNull();
+  it("routes a design-session event to its session topic (issue #25)", () => {
+    // ADR 014's `design_grill` is project-scoped, so its events carry no
+    // `feature_id` and used to fall through to null — meaning the design session
+    // view had no signal and could only poll. It now has a topic of its own.
+    const envelope = relayEnvelopeFor(
+      scope({ featureId: null, jobKind: "design_grill", event: { ...scope().event, jobId: SESSION_ID } }),
+    );
+
+    expect(envelope?.topic).toBe(`design:${SESSION_ID}`);
+    // A distinct frame type, not a `job_event` carrying a session id in a field
+    // named `featureId` — the frame should say which topic shape it arrived on.
+    expect(envelope?.frame).toEqual({
+      type: "design_session_event",
+      sessionId: SESSION_ID,
+      event: expect.objectContaining({ id: EVENT_ID, type: "agent_text" }),
+    });
+  });
+
+  it("carries the session id once, since it is also the job id", () => {
+    // The REST route resolves a session as `findByIdForProject(projectId, sessionId)`,
+    // i.e. the session id *is* the job id. Carrying both on the frame would be two
+    // spellings of one value for a reader to wonder about.
+    const envelope = relayEnvelopeFor(
+      scope({ featureId: null, jobKind: "design_grill", event: { ...scope().event, jobId: SESSION_ID } }),
+    );
+
+    expect(envelope?.frame).not.toHaveProperty("featureId");
+    expect((envelope?.frame as { event: { jobId: string } }).event.jobId).toBe(SESSION_ID);
+  });
+
+  it("still returns null for a feature-less job that is not a design session", () => {
+    // A *scheduled* `test_run` is the real instance: it carries no feature_id and
+    // does produce events, so this null is a live case rather than a leftover.
+    // Dropping it is honest — there is no surface subscribed to it — and inventing
+    // a topic nobody reads would be noise pretending to be a feature. Filed
+    // separately rather than solved here.
+    expect(relayEnvelopeFor(scope({ featureId: null, jobKind: "test_run" }))).toBeNull();
+  });
+
+  it("prefers the feature topic when a job somehow has both", () => {
+    // Not a shape that exists today. If one ever did, the feature topic is the
+    // safer answer: it is the one an existing authoriser already covers, so
+    // routing there cannot hand an event to a socket that was never authorised
+    // for it. Asserted so a future reordering of these branches is a failing test
+    // rather than a quiet change of who receives what.
+    const envelope = relayEnvelopeFor(scope({ jobKind: "design_grill" }));
+
+    expect(envelope?.topic).toBe(`feature:${FEATURE_ID}`);
+    expect(envelope?.frame).toMatchObject({ type: "job_event" });
   });
 });
 

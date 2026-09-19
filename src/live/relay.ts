@@ -4,6 +4,7 @@ import {
   deltaFromPayload,
   LIVE_JOB_EVENT_DELTAS_CHANNEL,
   LIVE_JOB_EVENTS_CHANNEL,
+  liveTopicForDesignSession,
   liveTopicForFeature,
   toLiveJobEvent,
   type ServerFrame,
@@ -62,28 +63,70 @@ export interface LiveRelayHandle {
 export const LIVE_RELAY_RETRY_MS = 5000;
 
 /**
- * Maps a loaded event to the frame its feature's subscribers should receive,
- * or null when there is nothing to deliver.
+ * Maps a loaded event to the frame its subscribers should receive, or null when
+ * there is nothing to deliver.
  *
  * Split out as a pure function so "which event goes to which topic" — the only
  * routing decision in the relay — is testable without a socket, a database, or
- * a Postgres connection. Null covers both harmless cases: the job was deleted
- * before the listener read it, and a job with no feature at all (ADR 014's
- * project-scoped `design_grill`, which has no feature to route by).
+ * a Postgres connection.
+ *
+ * **Two topics, decided by the job's scope (issue #25).** A feature-scoped event
+ * goes to its feature's topic, as it always has. A `design_grill` event goes to
+ * its session's topic, which is new: it is *project*-scoped (ADR 014), so it has
+ * no `featureId` and used to fall into the null case here — meaning the design
+ * session view had no signal at all and could only poll.
+ *
+ * **The feature case is checked first and stays unconditional.** A job that has
+ * both a feature and a design id is not a thing today, and if one ever existed the
+ * feature topic is the safer answer: it is the one already covered by the
+ * feature authoriser, so routing it there cannot hand an event to a socket that
+ * was never authorised for it.
+ *
+ * **Null still covers a real case, deliberately.** A job with no feature that is
+ * not a design session — a *scheduled* `test_run` produces events and has no
+ * `feature_id` — is dropped rather than guessed onto a topic, because there is no
+ * surface subscribed to it and inventing a topic nobody reads would be noise
+ * pretending to be a feature. Filing that as its own issue is the honest move;
+ * see the note on `JobEventWithScope.jobKind`.
  */
 export function relayEnvelopeFor(
   scope: JobEventWithScope,
 ): { topic: string; frame: ServerFrame } | null {
-  if (!scope.featureId) return null;
-  return {
-    topic: liveTopicForFeature(scope.featureId),
-    frame: {
-      type: "job_event",
-      featureId: scope.featureId,
-      jobId: scope.event.jobId,
-      event: toLiveJobEvent(scope.event),
-    },
-  };
+  if (scope.featureId) {
+    return {
+      topic: liveTopicForFeature(scope.featureId),
+      frame: {
+        type: "job_event",
+        featureId: scope.featureId,
+        jobId: scope.event.jobId,
+        event: toLiveJobEvent(scope.event),
+      },
+    };
+  }
+
+  if (scope.jobKind === "design_grill") {
+    return {
+      topic: liveTopicForDesignSession(scope.event.jobId),
+      // A distinct frame type rather than reusing `job_event`, whose only scope
+      // field is named `featureId`. Putting a session id in a field called
+      // `featureId` would be a lie an over-eager reader could act on, and the
+      // alternative — making `featureId` nullable on the shared frame — would be a
+      // breaking change to a shape every existing client parses. Naming the frame
+      // makes it explicit which topic shape it arrived on.
+      //
+      // `sessionId` alone, not `sessionId` *and* `jobId`: the session id **is** the
+      // job id (that is how the REST route resolves it), and carrying both would
+      // be two spellings of one value for a reader to wonder about. The event
+      // inside already carries `jobId`.
+      frame: {
+        type: "design_session_event",
+        sessionId: scope.event.jobId,
+        event: toLiveJobEvent(scope.event),
+      },
+    };
+  }
+
+  return null;
 }
 
 /**

@@ -4,6 +4,7 @@ import {
   LIVE_DELTA_MAX_PAYLOAD_BYTES,
   deltaFromPayload,
   encodeDeltaPayload,
+  liveTopicForDesignSession,
   liveTopicForFeature,
   parseClientFrame,
   toLiveJobEvent,
@@ -11,6 +12,7 @@ import {
 import type { JobEvent } from "../jobs/events-repository.js";
 
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
+const SESSION_ID = "88888888-8888-4888-8888-888888888888";
 const FEATURE_ID = "22222222-2222-4222-8222-222222222222";
 
 describe("parseClientFrame", () => {
@@ -62,6 +64,60 @@ describe("parseClientFrame", () => {
       JSON.stringify({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID }),
     );
     expect(frame).not.toBeNull();
+  });
+});
+
+describe("liveTopicForDesignSession (issue #25)", () => {
+  it("namespaces the session id", () => {
+    // A second topic *shape*, which is what the `feature:` prefix exists to make
+    // safe: the hub treats a topic as an opaque string, so the prefix is the only
+    // thing keeping a session id from colliding with a feature id.
+    expect(liveTopicForDesignSession(SESSION_ID)).toBe(`design:${SESSION_ID}`);
+  });
+
+  it("cannot collide with a feature topic for the same id", () => {
+    // The ids are both uuids from the same space, so this is the property that
+    // matters rather than the literal string: whatever value is passed, the two
+    // topic families are disjoint.
+    expect(liveTopicForDesignSession(FEATURE_ID)).not.toBe(liveTopicForFeature(FEATURE_ID));
+    expect(liveTopicForDesignSession(FEATURE_ID)).toBe(`design:${FEATURE_ID}`);
+  });
+});
+
+describe("parseClientFrame for design sessions (issue #25)", () => {
+  it("parses a design subscribe and unsubscribe", () => {
+    expect(
+      parseClientFrame(
+        JSON.stringify({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: SESSION_ID }),
+      ),
+    ).toEqual({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: SESSION_ID });
+    expect(
+      parseClientFrame(JSON.stringify({ type: "unsubscribe_design", sessionId: SESSION_ID })),
+    ).toEqual({ type: "unsubscribe_design", sessionId: SESSION_ID });
+  });
+
+  it("rejects non-uuid ids the same way the feature frames do", () => {
+    // Validated at the boundary, and a parsed frame is still not proof of access —
+    // the subscription is authorised separately (see `authorizeSubscription`).
+    expect(
+      parseClientFrame(JSON.stringify({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: "not-a-uuid" })),
+    ).toBeNull();
+    expect(
+      parseClientFrame(JSON.stringify({ type: "subscribe_design", projectId: "nope", sessionId: SESSION_ID })),
+    ).toBeNull();
+    expect(
+      parseClientFrame(JSON.stringify({ type: "unsubscribe_design", sessionId: "nope" })),
+    ).toBeNull();
+  });
+
+  it("does not accept a design frame that omits the session", () => {
+    // The shape is not interchangeable with `subscribe`: a client that sends the
+    // wrong field gets a protocol error rather than a silently feature-scoped
+    // subscription. This is why the two are separate frame types.
+    expect(
+      parseClientFrame(JSON.stringify({ type: "subscribe_design", projectId: PROJECT_ID })),
+    ).toBeNull();
+    expect(parseClientFrame(JSON.stringify({ type: "subscribe_design", sessionId: SESSION_ID }))).toBeNull();
   });
 });
 
