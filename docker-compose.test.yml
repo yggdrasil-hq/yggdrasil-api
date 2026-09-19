@@ -25,6 +25,59 @@ services:
       context: .
       dockerfile: deploy/Dockerfile.test
     volumes:
+      # Issue #102: the source is mounted **read-only** so the suite can only ever
+      # run the tree that is on disk.
+      #
+      # **What goes wrong without this.** `deploy/Dockerfile.test` does `COPY . .`,
+      # which bakes the source into the image. Only `test-results/` is mounted, so
+      # `docker compose run test` without `--build` silently reuses the cached
+      # image and reports on the **previous** build — a source edit is simply not
+      # in the container and nothing says so. That is a false *negative* on a
+      # guard: the mutation is really in the file, `grep` confirms it, the suite
+      # passes because it ran an old build, and the conclusion drawn is "the check
+      # does not catch this" — which leads to a working check being rewritten or
+      # deleted. It cost a false result during #100's work, and the mirror-image
+      # mistake (a correct guard read as broken) happened during wave 13.
+      #
+      # **Why enumerated paths rather than `.` as one mount.** A single `.:/app:ro`
+      # is tidier and gap-free, and it was tried first. What was *observed*:
+      #   1. `scripts/run-tests.sh` lost its executable bit. Git tracks it `100644`,
+      #      so the bind mount shadows the image's `RUN chmod +x` and the
+      #      container's CMD dies with `ERR_UNKNOWN_FILE_EXTENSION` on `.sh`. Fixed
+      #      at source in this same change — the script is `100755` in git now, so
+      #      the Dockerfile's chmod is redundant rather than load-bearing.
+      #   2. Vitest writes a timestamped temp config *beside* `vitest.config.ts`
+      #      (`/app/vitest.config.ts.timestamp-*.mjs`), so a read-only `/app` fails
+      #      with `EROFS: read-only file system`. The repo root has to stay
+      #      writable for that file, and a mount cannot be both.
+      # And one reason it is wrong even where it happens to work, verified by
+      # mechanism rather than left as a suspicion: mounting `.` shadows the image's
+      # `node_modules` with the host's — a marker file created in the host's
+      # `node_modules` is visible under a `.:/app` mount — so the suite would run
+      # against a *different dependency tree* than the image's install produced,
+      # trading a stale-source bug for a stale-deps bug. (The web harness hits a
+      # third, repo-specific one:
+      # its tsconfig sets `incremental`, so `tsc --noEmit` writes
+      # `tsconfig.tsbuildinfo` at the root.)
+      #
+      # **The rule this list follows.** Every path the suite *reads* is mounted
+      # `:ro`; anything not listed comes from the image build and will be stale
+      # after an edit. Adding a new top-level directory of source means adding it
+      # here. `package.json` / `package-lock.json` are deliberately **not**
+      # mounted: they are what the image's `node_modules` was installed from, and
+      # mounting them live would pair a new manifest with the old installed tree.
+      #
+      # The enumeration has an unwritten gap — a path added to the repo and not
+      # listed here silently reverts to the build — which is what `run-tests.sh`'s
+      # "source under test" digest is for: it makes the tree a run actually saw
+      # visible in the log.
+      - ./src:/app/src:ro
+      - ./scripts:/app/scripts:ro
+      - ./tsconfig.json:/app/tsconfig.json:ro
+      - ./vitest.config.ts:/app/vitest.config.ts:ro
+      # Writable, and the only writable path: the JSON report and the summary
+      # script both write here, and a run must not be able to dirty the tree —
+      # issue #34 was an untracked `tsconfig.tsbuildinfo` doing exactly that.
       - ./test-results:/app/test-results
     # Issue #30: the object-storage contract tests in src/storage/client.test.ts
     # talk to this MinIO, so the service has to be started before them. No
