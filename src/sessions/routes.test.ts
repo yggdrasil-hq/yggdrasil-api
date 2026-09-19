@@ -3,7 +3,7 @@ import express from "express";
 import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { createSessionsRouter } from "./routes.js";
-import type { JobSession, JobSessionContent } from "./types.js";
+import type { JobForkPoints, JobSession, JobSessionContent } from "./types.js";
 
 const PROJECT_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_PROJECT_ID = "55555555-5555-4555-8555-555555555555";
@@ -35,6 +35,7 @@ function buildApp(
     session?: JobSession | null;
     content?: JobSessionContent | null;
     jobFound?: boolean;
+    forkPoints?: JobForkPoints | null;
   } = {},
 ) {
   const app = express();
@@ -65,6 +66,11 @@ function buildApp(
       overrides.session === undefined ? makeSession() : overrides.session,
     ),
     findContent: vi.fn(async () => overrides.content ?? null),
+    // ADR 032 item 2. Defaulted to **null** rather than to a captured-empty record,
+    // because null is `unknown` — the state a run with no fork-point report is in —
+    // and a double that defaulted to `captured: []` would let every test pass while
+    // asserting the opposite of the distinction this field exists for.
+    findForkPoints: vi.fn(async () => overrides.forkPoints ?? null),
   };
 
   app.use(
@@ -239,5 +245,81 @@ describe("GET /projects/:projectId/jobs/:jobId/session/content", () => {
   it("404s when nothing was ever stored", async () => {
     const { app } = buildApp({ content: null });
     expect((await get(app, contentUrl)).status).toBe(404);
+  });
+});
+
+/**
+ * ADR 032 items 2/3's read side (#103): the fork points, and the distinction between
+ * "there are none" and "we could not find out".
+ *
+ * This is the user-facing half of the honesty requirement, which is why it gets its
+ * own block: the state is what a page renders, and rendering an empty list for an
+ * unanswered question tells a user there is nothing to resume from on the strength of
+ * a question nobody asked.
+ */
+describe("GET .../session fork points (#103)", () => {
+  it("reports no fork-point record as unknown, not as an answered empty list", async () => {
+    const { app } = buildApp({ forkPoints: null });
+    const res = await get(app, url);
+
+    expect(res.status).toBe(200);
+    // `unknown` and `captured: []` are different claims, and the default double
+    // returns null precisely so this cannot pass by accident.
+    expect(res.body.session.forkPoints.state).toBe("unknown");
+    expect(res.body.session.forkPoints.points).toBeNull();
+    // ...and the wording says so, rather than borrowing the "none" case's.
+    expect(res.body.forkPointsExplanation).toContain("No resumable points were reported");
+  });
+
+  it("reports captured points, keeping Pi's order", async () => {
+    const points = [
+      { entryId: "a1b2c3d4", text: "First reply" },
+      { entryId: "c3d4e5f6", text: "Second reply" },
+    ];
+    const { app } = buildApp({
+      forkPoints: {
+        jobId: JOB_ID,
+        state: "captured",
+        outcome: "captured",
+        points,
+        capturedAt: new Date(),
+      },
+    });
+    const res = await get(app, url);
+
+    expect(res.body.session.forkPoints.state).toBe("captured");
+    expect(res.body.session.forkPoints.points).toEqual(points);
+  });
+
+  it("reports an answered empty list as captured with nothing, not as unavailable", async () => {
+    const { app } = buildApp({
+      forkPoints: {
+        jobId: JOB_ID,
+        state: "captured",
+        outcome: "captured",
+        points: [],
+        capturedAt: new Date(),
+      },
+    });
+    const res = await get(app, url);
+
+    expect(res.body.session.forkPoints.state).toBe("captured");
+    expect(res.body.session.forkPoints.points).toEqual([]);
+  });
+
+  it("reports an unanswered capture as unavailable, with its own wording", async () => {
+    const { app } = buildApp({
+      forkPoints: {
+        jobId: JOB_ID,
+        state: "unavailable",
+        outcome: "unavailable",
+        points: null,
+        capturedAt: new Date(),
+      },
+    });
+    const res = await get(app, url);
+
+    expect(res.body.session.forkPoints.state).toBe("unavailable");
+    expect(res.body.forkPointsExplanation).toContain("could not be determined");
   });
 });

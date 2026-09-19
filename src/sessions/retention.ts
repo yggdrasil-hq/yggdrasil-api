@@ -128,6 +128,68 @@ export function permitsFork(state: SessionState): boolean {
 export const SESSION_CONTENT_TYPE = "application/x-ndjson";
 
 /**
+ * The two things `get_fork_messages` can have happened to it (ADR 032 item 2).
+ *
+ * The strings are the Orchestrator's own wire values verbatim
+ * (`worker.ForkPointOutcome`), deliberately, so neither service needs a mapping
+ * table — the same rule `SESSION_OUTCOMES` follows.
+ *
+ * Note that **an unanswered question is not a failure of the run**, which is why
+ * these are not the session's three outcomes: a session is `collected` or one of
+ * two kinds of no, whereas this question was either answered or not. "This run has
+ * no fork points" is not an outcome here — it is `captured` with an empty list.
+ */
+export const FORK_POINT_OUTCOMES = ["captured", "unavailable"] as const;
+export type ForkPointOutcome = (typeof FORK_POINT_OUTCOMES)[number];
+
+/** Whether a value posted as a fork-points outcome is one this API accepts. */
+export function isForkPointOutcome(value: string): value is ForkPointOutcome {
+  return (FORK_POINT_OUTCOMES as readonly string[]).includes(value);
+}
+
+/**
+ * What this API knows about a run's fork points — the stored outcome, or `unknown`
+ * for a run it was never told anything about.
+ *
+ * **Three states, and the third is the one that matters.** `captured` with an
+ * empty list and `unavailable` are different facts (Pi said there are none; nobody
+ * found out), and `unknown` is a third — this API holds no record at all, which is
+ * what an install with session collection switched off produces and what a capture
+ * that never reached the API leaves behind. Folding any two of them together would
+ * tell a user "there is nothing to resume from" on the strength of a question that
+ * was never asked, which is the collapse ADR 032 item 5 exists to prevent.
+ */
+export type ForkPointState = ForkPointOutcome | "unknown";
+
+/** The state for a job this API holds no fork-points row for at all. */
+export const UNKNOWN_FORK_POINT_STATE: ForkPointState = "unknown";
+
+/**
+ * Why a fork-point capture was refused, or null when it is acceptable.
+ *
+ * The outcomes take opposite bodies and the table's CHECK enforces it, so this
+ * exists to give the Orchestrator a *reason* it can log rather than a constraint
+ * violation it cannot read — the same posture as `rejectSessionUpload`, which the
+ * Orchestrator also treats as "log it and finish the job normally".
+ *
+ * An empty list is explicitly **acceptable** for `captured`: it is Pi saying this
+ * session has no previous user messages to fork from, which a real Pi 0.84.4 does
+ * answer with `{"messages":[]}`. Refusing it would be refusing a fact because it
+ * was inconvenient, and it would push the caller towards not reporting at all —
+ * which loses the distinction the state exists for.
+ */
+export function rejectForkPointUpload(input: {
+  outcome: ForkPointOutcome;
+  pointCount: number;
+}): string | null {
+  if (input.outcome === "captured") return null;
+  if (input.pointCount > 0) {
+    return `An outcome of "${input.outcome}" cannot carry fork points`;
+  }
+  return null;
+}
+
+/**
  * Why a session upload was refused, or null when it is acceptable.
  *
  * Returned as a reason rather than thrown, because the Orchestrator treats every
