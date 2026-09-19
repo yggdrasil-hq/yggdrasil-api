@@ -3,7 +3,7 @@ import pg from "pg";
 import { runSchedulerTick } from "./scheduler.js";
 import { JobRepository } from "../jobs/repository.js";
 import { JobEventRepository } from "../jobs/events-repository.js";
-import { relayEnvelopeFor } from "../live/relay.js";
+import { relayEnvelopesFor } from "../live/relay.js";
 import { runMigrations } from "../db/migrate.js";
 import { livePostgresSkipWarning, probeLivePostgres } from "../testing/live-postgres.js";
 
@@ -181,8 +181,8 @@ describe.skipIf(!reachability.ok)(
       // guards is a *missing* column rather than a wrong one: `findByIdWithScope`
       // has its own column list against a join, so a `j.test_id` added to the
       // interface but not to the SELECT would typecheck and return `undefined` at
-      // runtime — leaving `relayEnvelopeFor` to fall through to null and the event
-      // to reach no socket, which is exactly the bug #90 describes.
+      // runtime — leaving `relayEnvelopesFor` to return nothing and the event to
+      // reach no socket, which is exactly the bug #90 describes.
       const jobId = await ensureScheduledRun();
 
       const events = new JobEventRepository(pool);
@@ -201,12 +201,18 @@ describe.skipIf(!reachability.ok)(
       expect(scoped?.featureId).toBeNull();
 
       // The topic string a Web client has to build, asserted from the real row.
-      const envelope = relayEnvelopeFor(scoped!);
-      expect(envelope?.topic).toBe(`test:${testId}`);
+      //
+      // `toHaveLength(1)` and not "contains": this job has a `test_id` and no
+      // `feature_id`, so the test topic is its *only* surface. Issue #100 made the
+      // relay able to return more than one scope, so the count is now part of the
+      // claim — a job with one id must not acquire a second destination.
+      const envelopes = relayEnvelopesFor(scoped!);
+      expect(envelopes).toHaveLength(1);
+      expect(envelopes[0].topic).toBe(`test:${testId}`);
       // ADR 033 §1: one `event` frame for every scope, with the scope as a value.
       // Asserted through the *scope* rather than a frame name, because the name no
       // longer says which topic an event arrived on.
-      expect(envelope?.frame).toMatchObject({
+      expect(envelopes[0].frame).toMatchObject({
         type: "event",
         scope: { kind: "test", id: testId },
       });

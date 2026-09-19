@@ -18,6 +18,13 @@ const JOB_ID = "55555555-5555-4555-8555-555555555555";
 // Issue #25: a `design_grill` job with no feature — so its events reach nobody
 // through the feature topic and must arrive on `design:<id>` instead.
 const DESIGN_JOB_ID = "77777777-7777-4777-8777-777777777777";
+// Issue #90: the `tests` row, and a scheduled `test_run` pointing at it with no
+// feature — the shape whose events reached no socket before `test:` existed.
+const TEST_ID = "99999999-9999-4999-8999-999999999999";
+const SCHEDULED_TEST_JOB_ID = "88888888-8888-4888-8888-888888888888";
+// Issue #100: a **feature-driven** `test_run`, carrying both a `feature_id` and a
+// `test_id`. One job with two surfaces, so one event must reach two topics.
+const FEATURE_DRIVEN_TEST_JOB_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const IDLE_SECONDS = Number(process.env.IDLE_SECONDS || 90);
 
 const results = [];
@@ -48,16 +55,18 @@ async function waitFor(frames, predicate, timeoutMs) {
  */
 const FEATURE_SCOPE = { kind: "feature", id: FEATURE_ID };
 const DESIGN_SCOPE = { kind: "design_session", id: DESIGN_JOB_ID };
+const TEST_SCOPE = { kind: "test", id: TEST_ID };
 
 /**
  * Subscribes, returning the socket and its frames.
  *
- * `target` selects the scope to send, because the three carry different resources with
- * different authorisation rules. One frame shape serves all three now (ADR 033 §1), so
- * this is the scope that varies rather than the frame name. Defaulted to the feature so
- * the existing calls read unchanged.
+ * `scope` **is** the parameter now, where this used to take a `{type, id}` and map it
+ * onto a scope name inside. ADR 033 §1's conclusion applied to the harness: one frame
+ * shape serves every scope, so the scope is the only thing that varies and passing it
+ * directly removes a translation step that could disagree with the wire. Defaulted to
+ * the feature so the calls that predate the `test` scope read unchanged.
  */
-async function subscribe(wsUrl, target = { type: "feature", id: FEATURE_ID }) {
+async function subscribe(wsUrl, scope = FEATURE_SCOPE) {
   const frames = [];
   let closed = null;
   const ws = new WebSocket(wsUrl, { headers: { Cookie: COOKIE } });
@@ -85,10 +94,6 @@ async function subscribe(wsUrl, target = { type: "feature", id: FEATURE_ID }) {
   // app happens to wait for `ready`, which is why this has never surfaced.
   const ready = await waitFor(frames, (f) => f.type === "ready", 15000);
   if (!ready) throw new Error("no `ready` frame on " + wsUrl + "; frames=" + JSON.stringify(frames));
-  const scope =
-    target.type === "design"
-      ? { kind: "design_session", id: target.id }
-      : { kind: "feature", id: target.id };
   ws.send(JSON.stringify({ type: "subscribe", projectId: PROJECT_ID, scope }));
   // The confirmation is one frame name carrying the scope, so it is matched on the
   // *scope* rather than on a per-scope frame name — the check is what stops a
@@ -162,7 +167,7 @@ async function storedEventCrossProcess({ name, wsUrl, writeUrl }) {
  * asserting, since there is no longer a type difference to catch it.
  */
 async function designSessionCrossProcess({ name, wsUrl, writeUrl }) {
-  const { ws, frames } = await subscribe(wsUrl, { type: "design", id: DESIGN_JOB_ID });
+  const { ws, frames } = await subscribe(wsUrl, DESIGN_SCOPE);
   try {
     const marker = nextMarker();
     const { status } = await postEvent(
@@ -211,7 +216,7 @@ async function designSessionCrossProcess({ name, wsUrl, writeUrl }) {
  * exercised rather than a same-process publish.
  */
 async function featureEventStaysOffTheDesignTopic({ name, wsUrl, writeUrl }) {
-  const { ws, frames } = await subscribe(wsUrl, { type: "design", id: DESIGN_JOB_ID });
+  const { ws, frames } = await subscribe(wsUrl, DESIGN_SCOPE);
   try {
     const marker = nextMarker();
     const { status } = await postEvent(writeUrl, { type: "agent_text", message: marker });
@@ -227,6 +232,133 @@ async function featureEventStaysOffTheDesignTopic({ name, wsUrl, writeUrl }) {
       name,
       !leaked,
       leaked ? "LEAKED onto the design topic" : "stayed off the design topic",
+    );
+  } finally { ws.close(); }
+}
+
+/*
+ * Issue #90: the `test:` topic, cross-process, for a **scheduled** run.
+ *
+ * The shape is a `test_id` and no `feature_id`, so before the `test` scope existed
+ * this job's events reached no socket at all — the page could only poll. Cross-process
+ * like every other positive here, because a routing mistake is unobservable within a
+ * single process.
+ *
+ * Written to `agent_text` rather than a `report_test_step`: the internal route accepts
+ * both on a `test_run`, and `agent_text` has no side effect on the feature, which keeps
+ * this check about the *route to the topic* rather than about what the event does.
+ */
+async function scheduledTestRunCrossProcess({ name, wsUrl, writeUrl }) {
+  const { ws, frames } = await subscribe(wsUrl, TEST_SCOPE);
+  try {
+    const marker = nextMarker();
+    const { status } = await postEvent(
+      writeUrl,
+      { type: "agent_text", message: marker },
+      SCHEDULED_TEST_JOB_ID,
+    );
+    if (status !== 201) { record(name, false, "event write returned " + status); return; }
+
+    const frame = await waitFor(
+      frames,
+      (f) => f.type === "event" && sameScope(f.scope, TEST_SCOPE) && f.event && f.event.message === marker,
+      15000,
+    );
+    record(name, Boolean(frame),
+      frame ? "delivered on test topic (socket=" + host(wsUrl) + ", write=" + host(writeUrl) + ")"
+            : "NOT delivered within 15s (socket=" + host(wsUrl) + ", write=" + host(writeUrl) + ")");
+  } finally { ws.close(); }
+}
+
+/*
+ * Issue #100: **one write, two topics** — the whole claim, and it is a conjunction.
+ *
+ * Two sockets on two different topics, one event posted to a job that carries both a
+ * `feature_id` and a `test_id`. Both halves are asserted from the same write, because
+ * "the second delivery was added" and "the first was kept" are separate claims and a
+ * fix that traded one for the other would satisfy either alone. The detail line names
+ * whichever half failed, so a failure says *which* surface went dark.
+ *
+ * The scope check is what pins the decision's "one envelope per scope, each carrying
+ * its own tag" rather than one frame with two scopes: a `test:` socket is matched on
+ * `scope.kind === "test"`, so a frame that named the feature — or that carried both —
+ * would not satisfy it. That is also the failure the Web client would suffer, since
+ * `eventFromFrame` drops a frame whose scope is not its own.
+ *
+ * Cross-process like the rest: written by one replica, observed on sockets held by the
+ * other, so the LISTEN/NOTIFY fan-out is exercised rather than a same-process publish.
+ */
+async function featureDrivenTestRunReachesBothTopics({ name, featureWsUrl, testWsUrl, writeUrl }) {
+  const feature = await subscribe(featureWsUrl, FEATURE_SCOPE);
+  const test = await subscribe(testWsUrl, TEST_SCOPE);
+  try {
+    const marker = nextMarker();
+    const { status } = await postEvent(
+      writeUrl,
+      { type: "agent_text", message: marker },
+      FEATURE_DRIVEN_TEST_JOB_ID,
+    );
+    if (status !== 201) { record(name, false, "event write returned " + status); return; }
+
+    const onFeature = await waitFor(
+      feature.frames,
+      (f) => f.type === "event" && sameScope(f.scope, FEATURE_SCOPE) && f.event && f.event.message === marker,
+      15000,
+    );
+    const onTest = await waitFor(
+      test.frames,
+      (f) => f.type === "event" && sameScope(f.scope, TEST_SCOPE) && f.event && f.event.message === marker,
+      15000,
+    );
+
+    record(
+      name,
+      Boolean(onFeature) && Boolean(onTest),
+      "one write -> featureTopic=" + (onFeature ? "received" : "MISSING") +
+        " testTopic=" + (onTest ? "received" : "MISSING") +
+        " (feature socket=" + host(featureWsUrl) + ", test socket=" + host(testWsUrl) +
+        ", write=" + host(writeUrl) + ")",
+    );
+  } finally {
+    feature.ws.close();
+    test.ws.close();
+  }
+}
+
+/**
+ * The negative half for issue #100, and it is aimed at the mistake the *plural* return
+ * makes newly possible: fanning out too far.
+ *
+ * A job with a feature and **no** `test_id` (`JOB_ID`, the `spec_grill` fixture) must
+ * not reach any test topic. The project *does* have a test and the feature *does* have a
+ * feature-driven run pointing at it, so "publish to every topic this project has" — or a
+ * `test:` branch keyed on the job's kind instead of on `test_id` being present — would
+ * show up exactly here and nowhere else.
+ *
+ * Watching the **test** topic while writing a **feature-only** job's event is the
+ * direction that can actually fail. Aiming it the other way round (watching the feature
+ * topic for a scheduled run) could never fail, because such a job has no feature to
+ * mis-route to — the same mistake the design-topic negative's comment records making
+ * once already. A negative case that cannot fail is worse than none, because it reads as
+ * coverage.
+ */
+async function featureOnlyJobStaysOffTheTestTopic({ name, wsUrl, writeUrl }) {
+  const { ws, frames } = await subscribe(wsUrl, TEST_SCOPE);
+  try {
+    const marker = nextMarker();
+    const { status } = await postEvent(writeUrl, { type: "agent_text", message: marker });
+    if (status !== 201) { record(name, false, "feature event write returned " + status); return; }
+
+    // The positive cases' own window, so "nothing arrived" is a real absence rather
+    // than a race this assertion happened to win.
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const leaked = frames.some(
+      (f) => f.type === "event" && f.event && f.event.message === marker,
+    );
+    record(
+      name,
+      !leaked,
+      leaked ? "LEAKED onto the test topic" : "stayed off the test topic",
     );
   } finally { ws.close(); }
 }
@@ -474,6 +606,27 @@ async function main() {
   // feature's events on the design topic.
   await featureEventStaysOffTheDesignTopic({
     name: "feature event stays off the design topic",
+    wsUrl: WS_A, writeUrl: API_B,
+  });
+
+  // Issue #90: the third topic shape, and the one whose authorisation is newest —
+  // a scheduled run, which has a `test_id` and no feature to route by.
+  await scheduledTestRunCrossProcess({
+    name: "scheduled test_run: event across replicas on the test topic",
+    wsUrl: WS_A, writeUrl: API_B,
+  });
+
+  // Issue #100: the fan-out. One job with two surfaces, so one write must arrive on
+  // both topics — the check that fails if either delivery is lost.
+  await featureDrivenTestRunReachesBothTopics({
+    name: "feature-driven test_run: one write reaches both the feature topic and the test topic",
+    featureWsUrl: WS_A, testWsUrl: WS_B, writeUrl: API_B,
+  });
+
+  // And its negative: a job with no `test_id` must not reach a test topic, which is
+  // the mistake a plural return makes newly possible.
+  await featureOnlyJobStaysOffTheTestTopic({
+    name: "feature-only job stays off the test topic",
     wsUrl: WS_A, writeUrl: API_B,
   });
 

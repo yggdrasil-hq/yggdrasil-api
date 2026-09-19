@@ -178,9 +178,11 @@ export class JobRepository {
       // ADR 033 §5 / issue #95: the delta path was feature-scoped end to end, which
       // is why a job with no feature had its deltas dropped. Returning the same
       // routing fields the stored-event path reads lets both go through one
-      // `liveScopeForJob`, so a streaming chunk and the event that supersedes it
-      // cannot land on different topics. One `RETURNING` already on this row, so
-      // this costs no extra query.
+      // cascade, so a streaming chunk and the event that supersedes it cannot land
+      // on different topics — the delta path takes the *primary* scope and the
+      // stored path fans out over all of them (issue #100), and both are the same
+      // ordered list. One `RETURNING` already on this row, so this costs no extra
+      // query.
       testId: row.test_id,
       jobKind: row.kind,
       // pg returns bigint as a string to avoid precision loss above 2^53. These

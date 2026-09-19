@@ -172,13 +172,14 @@ export interface JobEventWithScope {
    * `GET /projects/:projectId/designs/:sessionId/events`, which resolves the
    * session as `findByIdForProject(projectId, sessionId)` and requires
    * `kind === "design_grill"`), so the id alone does not say what it is — the kind
-   * does. Passing the kind keeps `relayEnvelopeFor` the one place that decides
+   * does. Passing the kind keeps `relayEnvelopesFor` the one place that decides
    * which topic an event belongs to, which is what its doc comment claims, instead
    * of pushing that decision into SQL as a computed topic column.
    *
-   * It is also the field a later generalisation needs: a feature-less job of
-   * another kind (a scheduled `test_run` produces events and has no feature
-   * either) currently routes nowhere, and that is a decision about kinds.
+   * It is also the field that made the generalisations possible: a feature-less
+   * job of another kind was unroutable until `jobKind` travelled with the row —
+   * a scheduled `test_run` has no feature either (issue #90), and the design
+   * branch needs the kind rather than an id's presence.
    */
   jobKind: JobKind;
   /**
@@ -188,13 +189,20 @@ export interface JobEventWithScope {
    * `test_run` carries a `test_id` and no `feature_id`, and `test_id` names the
    * surface — the standalone Testing product's run history, which reads
    * `GET /projects/:projectId/tests/:testId/runs`. So the id alone is enough for
-   * `relayEnvelopeFor` to pick the topic, exactly as a `featureId` is.
+   * `relayEnvelopesFor` to pick the topic, exactly as a `featureId` is.
    *
-   * Only a `test_run` is created with one (`dispatchScheduledRun` and the manual
-   * "run now" route both pass `testId`; every other kind leaves it null), but
-   * that is a fact about today's callers rather than something this read should
-   * enforce — the column is a foreign key and the topic's meaning is "events for
-   * this Test", which is true of whatever job carries it.
+   * **A feature-driven `test_run` carries this *and* a `feature_id`** (issue
+   * #100): the Testing gate dispatches it for a feature, and it is also one of the
+   * runs this Test's history lists, so its events belong to two topics. That is
+   * why the relay reads this field even when `featureId` is set — the id's
+   * presence is not a tie-break to be skipped, it is a second destination.
+   *
+   * Only a `test_run` is created with one (`dispatchScheduledRun`, the manual
+   * "run now" route and the Testing gate's probe runs all pass `testId`; every
+   * other kind leaves it null), but that is a fact about today's callers rather
+   * than something this read should enforce — the column is a foreign key and the
+   * topic's meaning is "events for this Test", which is true of whatever job
+   * carries it.
    */
   testId: string | null;
 }

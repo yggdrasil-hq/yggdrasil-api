@@ -7,6 +7,7 @@ import {
   encodeDeltaPayload,
   isLiveScopeKind,
   liveScopeForJob,
+  liveScopesForJob,
   liveTopicForScope,
   parseClientFrame,
   parseLiveScope,
@@ -104,6 +105,105 @@ describe("liveTopicForScope", () => {
   });
 });
 
+describe("liveScopesForJob (issue #100)", () => {
+  it("gives a feature-driven test_run both of its surfaces, feature first", () => {
+    // The whole of issue #100. One job, two pages: the feature's Testing stage and
+    // the Test entity's run history. Before this the feature won outright and the
+    // second page got no signal at all.
+    expect(
+      liveScopesForJob({
+        jobId: JOB_ID,
+        featureId: FEATURE_ID,
+        jobKind: "test_run",
+        testId: TEST_ID,
+      }),
+    ).toEqual([
+      { kind: "feature", id: FEATURE_ID },
+      { kind: "test", id: TEST_ID },
+    ]);
+  });
+
+  it("keeps the feature topic first, so a single-scope path is unchanged", () => {
+    // Ordering is the contract: `liveScopeForJob` is the first element, so the
+    // delta path and anything else that can carry one scope keeps the routing it
+    // has always had. Asserted as a *pair* of the two functions so they cannot
+    // drift apart.
+    const job = {
+      jobId: JOB_ID,
+      featureId: FEATURE_ID,
+      jobKind: "test_run" as const,
+      testId: TEST_ID,
+    };
+    expect(liveScopesForJob(job)[0]).toEqual(liveScopeForJob(job));
+  });
+
+  it("does not widen a job that has only one scope", () => {
+    // The direction that matters in the other way: this is a fan-out, not a
+    // broadcast. A feature's job must not acquire a test topic it has no test id
+    // for, and a scheduled run must not acquire a feature topic it has no feature
+    // for — either would deliver a project's events to a page that never asked for
+    // them.
+    expect(
+      liveScopesForJob({
+        jobId: JOB_ID,
+        featureId: FEATURE_ID,
+        jobKind: "spec_grill",
+        testId: null,
+      }),
+    ).toEqual([{ kind: "feature", id: FEATURE_ID }]);
+
+    expect(
+      liveScopesForJob({
+        jobId: JOB_ID,
+        featureId: null,
+        jobKind: "test_run",
+        testId: TEST_ID,
+      }),
+    ).toEqual([{ kind: "test", id: TEST_ID }]);
+  });
+
+  it("keeps the design session's single topic, keyed by the job id", () => {
+    expect(
+      liveScopesForJob({
+        jobId: JOB_ID,
+        featureId: null,
+        jobKind: "design_grill",
+        testId: null,
+      }),
+    ).toEqual([{ kind: "design_session", id: JOB_ID }]);
+  });
+
+  it("does not give a job with a feature a design topic as well", () => {
+    // Refused rather than fanned out: a design session's scope id is the *job*
+    // id, so a `design_grill` that somehow carried a feature would be handed
+    // `design:<jobId>` for a design session that does not exist. Version 1 was
+    // unreachable there too (it tested the feature and returned), so this is the
+    // same reading made explicit — and it is the one place the plural could
+    // otherwise fabricate a second destination.
+    expect(
+      liveScopesForJob({
+        jobId: JOB_ID,
+        featureId: FEATURE_ID,
+        jobKind: "design_grill",
+        testId: null,
+      }),
+    ).toEqual([{ kind: "feature", id: FEATURE_ID }]);
+  });
+
+  it("returns an empty list for a job nothing reads", () => {
+    // The array's null: dropping is honest, because inventing a topic nobody reads
+    // would be noise pretending to be a signal.
+    expect(
+      liveScopesForJob({
+        jobId: JOB_ID,
+        featureId: null,
+        jobKind: "deploy",
+        testId: null,
+      }),
+    ).toEqual([]);
+  });
+});
+
 describe("liveScopeForJob", () => {
   it("routes a feature's job to the feature scope", () => {
     expect(
@@ -125,12 +225,11 @@ describe("liveScopeForJob", () => {
     ).toEqual({ kind: "test", id: TEST_ID });
   });
 
-  it("keeps a feature-driven test_run on the feature scope", () => {
-    // One job, two surfaces: a feature-driven `test_run` carries both ids, and
-    // feature wins so the routing it has always had does not change. The
-    // consequence — the Test entity's page gets no socket signal for
-    // feature-driven runs — is a pre-existing gap filed as its own issue, and it
-    // is pinned here because this function is where the ordering lives now.
+  it("keeps a feature-driven test_run on the feature scope as its primary", () => {
+    // One job, two surfaces: a feature-driven `test_run` carries both ids, and the
+    // primary is feature so the single-scope routing it has always had does not
+    // change. The second delivery to the Test entity's page is
+    // `liveScopesForJob`'s, above (issue #100).
     expect(
       liveScopeForJob({ jobId: JOB_ID, featureId: FEATURE_ID, jobKind: "test_run", testId: TEST_ID }),
     ).toEqual({ kind: "feature", id: FEATURE_ID });
