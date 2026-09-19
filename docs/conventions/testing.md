@@ -37,12 +37,16 @@ did not catch.
 
 **Both numbers are measured and environment-dependent** (issue #105): they count the
 cases that cannot reach a database from wherever the suite is running, so a host
-that *can* reach one — CI can — skips fewer and has less for the script to recover.
-They are quoted with their recipe rather than as a constant:
+that *can* reach one skips fewer and has less for the script to recover. The same
+invocation in CI reports `103 passed (103)` files and `1550 passed (1550)` tests —
+**zero skips**, because GitHub's runners reach both services. The dev-host 77 is
+that host's number, not a property of the suite; it is what makes this script worth
+running, and it is also why a figure quoted here without naming its environment is
+misleading. They are quoted with their recipe rather than as a constant:
 
 ```bash
 docker compose -f docker-compose.test.yml up --build \
-  --abort-on-container-exit --exit-code-from test | tail -3   # reports "... | 77 skipped"
+  --abort-on-container-exit --exit-code-from test | tail -3   # "... | 77 skipped" here, 0 in CI
 ./scripts/test-against-real-db.sh                            # reports "... | 10 skipped"
 ```
 
