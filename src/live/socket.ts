@@ -9,11 +9,7 @@ import type { ProjectRepository } from "../projects/repository.js";
 import type { TestRepository } from "../tests/repository.js";
 import type { UserRepository } from "../users/repository.js";
 import { readCookie } from "./cookies.js";
-import {
-  authorizeDesignSessionSubscription,
-  authorizeSubscription,
-  authorizeTestSubscription,
-} from "./authorization.js";
+import { authorizeScopeSubscription, SCOPE_AUTHORIZERS } from "./authorization.js";
 import { FrameBudget, type FrameBudgetOptions } from "./limits.js";
 import type { LiveConnection, LiveHub } from "./hub.js";
 import {
@@ -22,10 +18,9 @@ import {
   LIVE_CLOSE_UNAUTHORIZED,
   LIVE_PROTOCOL_VERSION,
   LIVE_SOCKET_PATH,
-  liveTopicForDesignSession,
-  liveTopicForFeature,
-  liveTopicForTest,
+  liveTopicForScope,
   parseClientFrame,
+  type LiveScope,
   type ServerFrame,
 } from "./types.js";
 
@@ -333,39 +328,18 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
       }
 
       if (frame.type === "unsubscribe") {
-        deps.hub.unsubscribe(connection, liveTopicForFeature(frame.featureId));
-        safeSend(connection, { type: "unsubscribed", featureId: frame.featureId });
-        return;
-      }
-
-      if (frame.type === "unsubscribe_design") {
-        deps.hub.unsubscribe(connection, liveTopicForDesignSession(frame.sessionId));
-        safeSend(connection, { type: "unsubscribed_design", sessionId: frame.sessionId });
-        return;
-      }
-
-      if (frame.type === "unsubscribe_test") {
-        deps.hub.unsubscribe(connection, liveTopicForTest(frame.testId));
-        safeSend(connection, { type: "unsubscribed_test", testId: frame.testId });
+        // Synchronous, deliberately: unsubscribing needs no authorisation query,
+        // and `queueFrame` serialises on *completion*, so a preceding `subscribe`
+        // has already finished its query by the time this runs.
+        deps.hub.unsubscribe(connection, liveTopicForScope(frame.scope));
+        safeSend(connection, { type: "unsubscribed", scope: frame.scope });
         return;
       }
 
       // Awaited rather than fired and forgotten: `subscribe` does an
       // authorisation query, and returning before it resolves is what let a
-      // later frame overtake it (see the note on `queueFrame`). Same for the
-      // design-session and test variants, which is why they are awaited here too
-      // rather than dispatched independently.
-      if (frame.type === "subscribe_design") {
-        await subscribeDesignSession(connection, frame.projectId, frame.sessionId);
-        return;
-      }
-
-      if (frame.type === "subscribe_test") {
-        await subscribeTest(connection, frame.projectId, frame.testId);
-        return;
-      }
-
-      await subscribe(connection, frame.projectId, frame.featureId);
+      // later frame overtake it (see the note on `queueFrame`).
+      await subscribe(connection, frame.projectId, frame.scope);
     }
 
     /**
@@ -402,19 +376,41 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
     early.claim(queueFrame);
   }
 
+  /**
+   * Handles one `subscribe` frame, for whichever scope it names (ADR 033 §2).
+   *
+   * **One function where version 1 had three**, and the difference is the point of
+   * ADR 033: the per-scope copies differed in exactly three places — the authoriser,
+   * the topic function and the reply frame — and each of those is now selected by
+   * the scope's `kind` from a registry rather than by a branch written here. So a
+   * new scope does not edit this function at all, which is what made the third
+   * scope cheap rather than the fourth copy of a shape.
+   *
+   * What it deliberately still does *not* abstract is the authorisation itself:
+   * `authorizeScopeSubscription` selects one of three authorisers that each resolve
+   * their resource inside a project the caller is a member of. A shared
+   * `(projectId, id)` check would be the looser gate ADR 033 §2 forbids.
+   *
+   * It sends no state on success: it adds the socket to a topic and returns, leaving
+   * the page's REST read as the only state path (ADR 019 item 7). The reply echoes
+   * the scope, so the client can confirm that *this* subscription was accepted
+   * rather than inferring it from the frame's type — which is the check that replaces
+   * version 1's per-scope confirmation frame names.
+   */
   async function subscribe(
     connection: AuthedConnection,
     projectId: string,
-    featureId: string,
+    scope: LiveScope,
   ): Promise<void> {
+    const authorizer = SCOPE_AUTHORIZERS[scope.kind];
     let decision;
     try {
-      // Re-authorised on every subscribe frame, never remembered from an
-      // earlier frame on the same socket (see authorizeSubscription).
-      decision = await authorizeSubscription(deps, {
+      // Re-authorised on every subscribe frame, never remembered from an earlier
+      // frame on the same socket (see `authorizeScopeSubscription`).
+      decision = await authorizeScopeSubscription(deps, {
         userId: connection.userId,
         projectId,
-        featureId,
+        scope,
       });
     } catch (error) {
       report(`live socket subscribe failed: ${describe(error)}`);
@@ -423,110 +419,17 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
     }
 
     if (!decision.ok) {
-      // One message for both refusals, matching the REST route's 404 for a
-      // project that does not exist and one the caller cannot see.
-      safeSend(connection, { type: "error", message: "Feature not found" });
+      // One message per scope, and one for both of that scope's refusals — matching
+      // the REST route's single 404 for a project the caller cannot see and a
+      // resource that is not there, the same non-disclosure rule as before
+      // (ADR 019 item 3). The kind is not a secret, so naming it costs nothing and
+      // keeps a refusal diagnosable; the *reason* is logged rather than sent.
+      safeSend(connection, { type: "error", message: authorizer.refusalMessage });
       return;
     }
 
-    deps.hub.subscribe(connection, liveTopicForFeature(featureId));
-    safeSend(connection, { type: "subscribed", featureId });
-  }
-
-  /**
-   * The design-session peer of `subscribe` above (issue #25).
-   *
-   * Deliberately parallel rather than factored together, because the two differ in
-   * exactly the three places that matter and each should read next to its own
-   * REST route: the authoriser (`authorizeDesignSessionSubscription` mirrors
-   * `GET .../designs/:sessionId/events`; `authorizeSubscription` mirrors the
-   * feature events route), the topic function, and the reply frame. A shared
-   * helper taking those three as arguments would hide the correspondence that is
-   * the whole point of this file.
-   *
-   * The one thing it does *not* duplicate is the refresh semantics: like the
-   * feature case this adds the socket to a topic and returns. It sends no state,
-   * so the Web page's REST read stays the only state path (ADR 019 item 7).
-   */
-  async function subscribeDesignSession(
-    connection: AuthedConnection,
-    projectId: string,
-    sessionId: string,
-  ): Promise<void> {
-    let decision;
-    try {
-      // Re-authorised on every frame, never remembered from an earlier frame on
-      // the same socket — the rule the feature path follows, for the same reason:
-      // a socket that unsubscribes and resubscribes must re-authorise.
-      decision = await authorizeDesignSessionSubscription(deps, {
-        userId: connection.userId,
-        projectId,
-        sessionId,
-      });
-    } catch (error) {
-      report(`live socket design subscribe failed: ${describe(error)}`);
-      safeSend(connection, { type: "error", message: "Subscription failed" });
-      return;
-    }
-
-    if (!decision.ok) {
-      // One message for both refusals, matching the REST route's single 404 for a
-      // project the caller cannot see and a session that is not there — the same
-      // non-disclosure rule as the feature path (ADR 019 item 3).
-      safeSend(connection, { type: "error", message: "Design session not found" });
-      return;
-    }
-
-    deps.hub.subscribe(connection, liveTopicForDesignSession(sessionId));
-    safeSend(connection, { type: "subscribed_design", sessionId });
-  }
-
-  /**
-   * The Test-entity peer of `subscribe` (issue #90).
-   *
-   * Parallel rather than factored together, deliberately and for the reason its
-   * design-session sibling gives: each scope differs in exactly the three places
-   * that carry the meaning — the authoriser, the topic function and the reply
-   * frame — and each should read next to the REST route it mirrors. This one
-   * mirrors `GET /projects/:projectId/tests/:testId/runs`, which is why it
-   * resolves a `tests` row rather than a job.
-   *
-   * Like the other two it sends no state on success: it adds the socket to a topic
-   * and returns, leaving the page's REST read as the only state path (ADR 019
-   * item 7). That matters more here than elsewhere, because a run's progress is
-   * exactly the kind of derived thing a second implementation in the browser
-   * would get subtly wrong.
-   */
-  async function subscribeTest(
-    connection: AuthedConnection,
-    projectId: string,
-    testId: string,
-  ): Promise<void> {
-    let decision;
-    try {
-      // Re-authorised on every frame, never remembered from an earlier frame on
-      // the same socket — the rule both other paths follow, for the same reason.
-      decision = await authorizeTestSubscription(deps, {
-        userId: connection.userId,
-        projectId,
-        testId,
-      });
-    } catch (error) {
-      report(`live socket test subscribe failed: ${describe(error)}`);
-      safeSend(connection, { type: "error", message: "Subscription failed" });
-      return;
-    }
-
-    if (!decision.ok) {
-      // One message for both refusals, matching the REST route's single 404 for a
-      // project the caller cannot see and a test that is not there — the same
-      // non-disclosure rule as the feature and session paths (ADR 019 item 3).
-      safeSend(connection, { type: "error", message: "Test not found" });
-      return;
-    }
-
-    deps.hub.subscribe(connection, liveTopicForTest(testId));
-    safeSend(connection, { type: "subscribed_test", testId });
+    deps.hub.subscribe(connection, liveTopicForScope(scope));
+    safeSend(connection, { type: "subscribed", scope });
   }
 
   return {

@@ -19,7 +19,7 @@ import {
 } from "../secrets/model-config.js";
 import type { JobUsageRepository } from "../usage/repository.js";
 import { NOOP_LIVE_PUBLISHER, type LivePublisher } from "../live/deltas.js";
-import { LIVE_DELTA_MAX_PAYLOAD_BYTES, deltaTextFitsPayload } from "../live/types.js";
+import { LIVE_DELTA_MAX_PAYLOAD_BYTES, deltaTextFitsPayload, liveScopeForJob } from "../live/types.js";
 import { config } from "../config.js";
 import { summarizeGrillTranscript } from "./grill-context.js";
 import { UNKNOWN_CAPABILITIES, type JobKindCapabilities } from "./capabilities.js";
@@ -662,7 +662,21 @@ async function publishDelta(
       jobId,
       Buffer.byteLength(text),
     );
-    if (!recorded || !recorded.featureId) return;
+    if (!recorded) return;
+
+    // ADR 033 §5: the scope is resolved from the job rather than taken from the
+    // body, and through the *same* function the stored-event path uses
+    // (`liveScopeForJob`), so a streaming chunk and the `agent_text` that
+    // supersedes it cannot be routed to different topics. Version 1 returned early
+    // on `!recorded.featureId`, which is exactly why a design session's prose
+    // arrived per message instead of per token (issue #95).
+    const scope = liveScopeForJob({
+      jobId,
+      featureId: recorded.featureId,
+      jobKind: recorded.jobKind,
+      testId: recorded.testId,
+    });
+    if (!scope) return;
 
     // `0` means the ceiling is switched off, matching the convention
     // `RECORDING_MAX_BYTES` already sets in this codebase: 0 is a meaningful
@@ -680,7 +694,7 @@ async function publishDelta(
       return;
     }
 
-    await live.publishDelta({ featureId: recorded.featureId, jobId, text });
+    await live.publishDelta({ scope, jobId, text });
   } catch (error) {
     console.error(`failed to relay event delta for job ${jobId}:`, error);
   }

@@ -4,9 +4,8 @@ import {
   deltaFromPayload,
   LIVE_JOB_EVENT_DELTAS_CHANNEL,
   LIVE_JOB_EVENTS_CHANNEL,
-  liveTopicForDesignSession,
-  liveTopicForFeature,
-  liveTopicForTest,
+  liveScopeForJob,
+  liveTopicForScope,
   toLiveJobEvent,
   type ServerFrame,
 } from "./types.js";
@@ -71,95 +70,43 @@ export const LIVE_RELAY_RETRY_MS = 5000;
  * routing decision in the relay — is testable without a socket, a database, or
  * a Postgres connection.
  *
- * **Two topics, decided by the job's scope (issue #25).** A feature-scoped event
- * goes to its feature's topic, as it always has. A `design_grill` event goes to
- * its session's topic, which is new: it is *project*-scoped (ADR 014), so it has
- * no `featureId` and used to fall into the null case here — meaning the design
- * session view had no signal at all and could only poll.
+ * **Three topics, one rule: the job's scope (ADR 033 §2).** The decision lives in
+ * `liveScopeForJob`, shared with the delta path so a stored event and a streaming
+ * chunk for one job cannot reach different topics — which would leave half a
+ * message's text on a topic nobody is reading. This function's remaining job is to
+ * turn that scope into a topic and a frame, and to drop an unscopable job.
  *
- * **The feature case is checked first and stays unconditional.** A job that has
- * both a feature and a design id is not a thing today, and if one ever existed the
- * feature topic is the safer answer: it is the one already covered by the
- * feature authoriser, so routing it there cannot hand an event to a socket that
- * was never authorised for it.
+ * **What this replaced, and why the indirection is worth it.** Version 1 branched
+ * here on the job's fields, picked one of three `liveTopicFor*` functions and built
+ * one of three frame types. That meant each new scope edited this function, and the
+ * frames it emitted were shaped so a reader could tell them apart *by type* — the
+ * protection ADR 033 §1 moves into the scope tag. The scenario the branches
+ * guarded, stated once so it is not re-derived: the two id spaces are both uuids
+ * from the same source, so a router that confused them would deliver a feature's
+ * events to a design session's subscribers with no error anywhere.
  *
- * **Null still covers a real case, deliberately.** A job with no feature that is
- * not a design session and has no test either — nothing produces one today — is
- * dropped rather than guessed onto a topic, because inventing a topic nobody
- * reads would be noise pretending to be a signal.
- *
- * **Three topics, decided by the scope the job carries (issue #90).** A test
- * scope is keyed on `testId`'s presence, exactly as the feature case is keyed on
- * `featureId`'s — because `test_id` *is* a routing key that names the resource, so
- * unlike the design case it needs no kind check to be interpreted. A scheduled
- * `test_run` carries a `test_id` and no `feature_id`, so it reaches the topic its
- * own surface reads (`GET /projects/:projectId/tests/:testId/runs`) instead of
- * falling into the null case as it did before.
- *
- * **Ordering is part of the contract, not an implementation detail.** Feature is
- * checked first and unconditionally, so a **feature-driven** `test_run` — which
- * carries both a `feature_id` and a `test_id`, being one job with two surfaces —
- * keeps routing to `feature:` where it has always gone. The Test entity's
- * run-history page therefore receives no socket signal for feature-driven runs,
- * only for scheduled ones. That is a pre-existing gap (#90's decision comment
- * records it as out of scope) and it is stated here because this is the function
- * where a reader would otherwise have to infer it.
+ * **Ordering lives in `liveScopeForJob` now**, including the case that matters: a
+ * **feature-driven** `test_run` carries both a `feature_id` and a `test_id`, is one
+ * job with two surfaces, and keeps routing to `feature:` where it has always gone.
+ * The Test entity's run-history page therefore receives no socket signal for
+ * feature-driven runs, only for scheduled ones — a pre-existing gap, filed as its
+ * own issue.
  */
 export function relayEnvelopeFor(
   scope: JobEventWithScope,
 ): { topic: string; frame: ServerFrame } | null {
-  if (scope.featureId) {
-    return {
-      topic: liveTopicForFeature(scope.featureId),
-      frame: {
-        type: "job_event",
-        featureId: scope.featureId,
-        jobId: scope.event.jobId,
-        event: toLiveJobEvent(scope.event),
-      },
-    };
-  }
+  const live = liveScopeForJob({
+    jobId: scope.event.jobId,
+    featureId: scope.featureId,
+    jobKind: scope.jobKind,
+    testId: scope.testId,
+  });
+  if (!live) return null;
 
-  if (scope.jobKind === "design_grill") {
-    return {
-      topic: liveTopicForDesignSession(scope.event.jobId),
-      // A distinct frame type rather than reusing `job_event`, whose only scope
-      // field is named `featureId`. Putting a session id in a field called
-      // `featureId` would be a lie an over-eager reader could act on, and the
-      // alternative — making `featureId` nullable on the shared frame — would be a
-      // breaking change to a shape every existing client parses. Naming the frame
-      // makes it explicit which topic shape it arrived on.
-      //
-      // `sessionId` alone, not `sessionId` *and* `jobId`: the session id **is** the
-      // job id (that is how the REST route resolves it), and carrying both would
-      // be two spellings of one value for a reader to wonder about. The event
-      // inside already carries `jobId`.
-      frame: {
-        type: "design_session_event",
-        sessionId: scope.event.jobId,
-        event: toLiveJobEvent(scope.event),
-      },
-    };
-  }
-
-  if (scope.testId) {
-    return {
-      topic: liveTopicForTest(scope.testId),
-      // Distinct from `job_event` for the same reason as the design frame: the
-      // scope id here names a `tests` row, and `job_event.featureId` would be the
-      // wrong name for it. `testId` and the event's own `jobId` are both carried
-      // because they are genuinely two different values — one names the surface
-      // that should refresh, the other the run whose event it is.
-      frame: {
-        type: "test_run_event",
-        testId: scope.testId,
-        jobId: scope.event.jobId,
-        event: toLiveJobEvent(scope.event),
-      },
-    };
-  }
-
-  return null;
+  return {
+    topic: liveTopicForScope(live),
+    frame: { type: "event", scope: live, event: toLiveJobEvent(scope.event) },
+  };
 }
 
 /**
