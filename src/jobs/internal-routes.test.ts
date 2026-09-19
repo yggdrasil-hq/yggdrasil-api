@@ -1370,6 +1370,29 @@ describe("POST /internal/jobs/:jobId/events (streaming deltas, ADR 019 item 13)"
         .set("Authorization", "Bearer test-internal-api-token")
         .send({ type: "agent_text_delta", message });
 
+    /*
+     * Issue #78's caller-visible half. The route's delta schema carries a
+     * carefully-worded refine message ("Delta text is too large to relay (over N
+     * bytes once serialised)"), and this asserts the caller actually receives
+     * *that* — rather than falling through to the stored-event schema, which
+     * rejects the type and would report a confusing enum error for what is
+     * really an oversize payload.
+     */
+    it("tells the caller a delta is too large, rather than reporting a bad event type", async () => {
+      const publishDelta = vi.fn(async () => undefined);
+      const app = buildApp({ publishDelta, findById: async () => makeJob({ id: JOB_ID, featureId: "feature_42" }) });
+
+      // Over the delta payload ceiling (7000 bytes serialised), and deliberately
+      // *under* 100kb: this harness's `express.json()` sets no limit, so it takes
+      // Express's default while production passes `2mb` — a larger body would be
+      // rejected by the parser with 413 and never reach the route being tested.
+      const res = await postDelta(app, "x".repeat(20_000));
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/too large to relay/i);
+      expect(publishDelta).not.toHaveBeenCalled();
+    });
+
     it("relays deltas that keep the job under the ceiling", async () => {
       const publishDelta = vi.fn(async () => undefined);
       const app = buildApp({
