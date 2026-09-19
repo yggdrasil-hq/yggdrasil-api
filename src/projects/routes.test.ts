@@ -174,6 +174,14 @@ interface BuildAppOptions {
   knownRevisions?: number[];
   /** Issue #26: the ref recorded for the revision a rollback targets. */
   refForRevision?: string | null;
+  /*
+   * Issue #28 part 2: the job a job-scoped events read resolves, and the raw
+   * grill-run rows the list route summarises. `null` from `findByIdForProject`
+   * drives the 404 paths; `featureId` on the job is what the route's extra
+   * assertion compares against the path.
+   */
+  jobForEvents?: { id: string; featureId: string | null; kind?: string; status?: string; lastError?: string | null; restartedFromEventId?: string | null } | null;
+  grillRuns?: unknown[];
   /** Issue #31: whether the target test already has a run in flight. */
   testHasActiveRun?: boolean;
   /** Issue #59: the feature's most recent `submit_review` event, or null. */
@@ -290,6 +298,11 @@ function buildApp(opts: BuildAppOptions) {
     cancelActiveForFeature: vi.fn(async () => undefined),
     // Issue #31: "Run now" refuses while this test already has a run in flight.
     hasActiveRunForTest: vi.fn(async () => opts.testHasActiveRun ?? false),
+    // Issue #28 part 2. `findByIdForProject` binds a job to a *project* only,
+    // which is exactly why the job-scoped events route asserts the feature too —
+    // these fakes mirror that split rather than hiding it.
+    findByIdForProject: vi.fn(async () => opts.jobForEvents ?? null),
+    listFeatureGrillRuns: vi.fn(async () => opts.grillRuns ?? []),
   };
   const notifications = { create: vi.fn(async () => undefined) };
   const installations = {
@@ -2622,5 +2635,199 @@ describe("GET /:projectId/features/:featureId/events — the open question's age
     );
 
     expect(res.status).toBe(404);
+  });
+});
+
+/*
+ * Issue #28 part 2: reading back a superseded run.
+ *
+ * Two routes, and the reason they need route-level tests at all is the
+ * authorisation split rather than the happy path: the job-scoped read resolves a
+ * job through `findByIdForProject` (project-scoped) and then has to assert the
+ * job's *feature* matches the path. Without that assertion a caller could read any
+ * job in the project by pasting a uuid into a path naming an unrelated feature —
+ * and a grill transcript is a whole prior conversation, including anything a
+ * person typed into it. The fake mirrors the repository's real split, so a missing
+ * assertion here fails rather than being masked.
+ *
+ * The list route's own rule lives in `jobs/grill-runs.ts` and is unit-tested
+ * there; these cases check that the route *delegates* to it and guards access,
+ * rather than re-asserting the rule through HTTP.
+ */
+describe("GET /:projectId/features/:featureId/jobs/:jobId/events (issue #28 part 2)", () => {
+  const project = makeProject();
+  const feature = makeFeature({ status: "spec_ready" });
+  const jobId = "44444444-4444-4444-8444-444444444444";
+
+  const grillJob = (overrides: Record<string, unknown> = {}) => ({
+    id: jobId,
+    featureId: feature.id,
+    kind: "spec_grill",
+    status: "completed",
+    lastError: null,
+    restartedFromEventId: null,
+    ...overrides,
+  });
+
+  const url = `/projects/${project.id}/features/${feature.id}/jobs/${jobId}/events`;
+
+  it("returns one run's transcript, identified by job id", async () => {
+    const { app } = buildApp({
+      project,
+      feature,
+      jobForEvents: grillJob(),
+      transcriptEvents: [{ id: "evt_1", type: "ask_user", question: "Which database?" }],
+    });
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(200);
+    expect(res.body.jobKind).toBe("spec_grill");
+    expect(res.body.events).toHaveLength(1);
+    // Deliberately absent: "is a human being waited on right now" is a property of
+    // the *current* run, and this read exists for runs that were left behind.
+    expect(res.body).not.toHaveProperty("awaitingReply");
+  });
+
+  it("404s when the job belongs to a different feature in the same project", async () => {
+    // The assertion the route adds on top of the project-scoped lookup. Without
+    // it this request would return another feature's conversation.
+    const { app } = buildApp({
+      project,
+      feature,
+      jobForEvents: grillJob({ featureId: "99999999-9999-4999-8999-999999999999" }),
+      transcriptEvents: [
+        { id: "evt_other", type: "agent_text", message: "another feature's talk" },
+      ],
+    });
+
+    const res = await authedRequest(app).get(url);
+
+    // 404 rather than 403: a caller who may read the project but not this job
+    // should not be told whether the job exists.
+    expect(res.status).toBe(404);
+    expect(res.body).not.toHaveProperty("events");
+  });
+
+  it("404s for a job with no feature at all, rather than treating null as a match", async () => {
+    // `job.featureId !== featureId` is the comparison, so a null feature must fail
+    // it. Written as a case because `null === null` is exactly the kind of
+    // accident that would let a deploy or a scheduled run through this route.
+    const { app } = buildApp({
+      project,
+      feature,
+      jobForEvents: grillJob({ featureId: null, kind: "deploy" }),
+    });
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(404);
+  });
+
+  it("404s for an unknown job, and for a malformed one", async () => {
+    const unknown = buildApp({ project, feature, jobForEvents: null });
+    expect((await authedRequest(unknown.app).get(url)).status).toBe(404);
+
+    const malformed = buildApp({ project, feature, jobForEvents: grillJob() });
+    expect(
+      (
+        await authedRequest(malformed.app).get(
+          `/projects/${project.id}/features/${feature.id}/jobs/not-a-uuid/events`,
+        )
+      ).status,
+    ).toBe(404);
+  });
+
+  it("404s for a feature that does not belong to the project", async () => {
+    const { app } = buildApp({ project, feature: null, jobForEvents: grillJob() });
+
+    expect((await authedRequest(app).get(url)).status).toBe(404);
+  });
+
+  it("404s for a project the caller cannot reach", async () => {
+    const { app } = buildApp({ project: null, feature, jobForEvents: grillJob() });
+
+    expect(
+      (
+        await authedRequest(app).get(
+          `/projects/99999999-9999-4999-8999-999999999999/features/${feature.id}/jobs/${jobId}/events`,
+        )
+      ).status,
+    ).toBe(404);
+  });
+});
+
+describe("GET /:projectId/features/:featureId/grill-runs (issue #28 part 2)", () => {
+  const project = makeProject();
+  const feature = makeFeature({ status: "spec_ready" });
+  const url = `/projects/${project.id}/features/${feature.id}/grill-runs`;
+
+  const run = (overrides: Record<string, unknown> = {}) => ({
+    jobId: "44444444-4444-4444-8444-444444444444",
+    status: "completed" as const,
+    createdAt: new Date("2026-09-01T10:00:00.000Z"),
+    restartedFromEventId: null,
+    supersedesJobId: null,
+    ...overrides,
+  });
+
+  it("returns the earlier runs and excludes the current one", async () => {
+    const { app } = buildApp({
+      project,
+      feature,
+      grillRuns: [
+        run({ jobId: "a" }),
+        run({
+          jobId: "b",
+          createdAt: new Date("2026-09-02T10:00:00.000Z"),
+          restartedFromEventId: "event-in-a",
+          supersedesJobId: "a",
+        }),
+      ],
+    });
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(200);
+    // `earlierRuns`, not `runs`: the key says what it holds, so a client cannot
+    // mistake this for "all runs" and slice it itself.
+    expect(res.body.earlierRuns).toEqual([
+      {
+        jobId: "a",
+        status: "completed",
+        createdAt: "2026-09-01T10:00:00.000Z",
+        restartedFromEventId: null,
+        supersededByJobId: "b",
+      },
+    ]);
+  });
+
+  it("returns an empty list rather than 404 for a feature with one run", async () => {
+    // A single run means nothing was ever superseded — a normal state, not an
+    // error, so the page renders no section instead of a failure.
+    const { app } = buildApp({ project, feature, grillRuns: [run()] });
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(200);
+    expect(res.body.earlierRuns).toEqual([]);
+  });
+
+  it("404s for a feature that does not belong to the project", async () => {
+    const { app } = buildApp({ project, feature: null, grillRuns: [run()] });
+
+    expect((await authedRequest(app).get(url)).status).toBe(404);
+  });
+
+  it("404s for a project the caller cannot reach", async () => {
+    const { app } = buildApp({ project: null, feature, grillRuns: [run()] });
+
+    expect(
+      (
+        await authedRequest(app).get(
+          `/projects/99999999-9999-4999-8999-999999999999/features/${feature.id}/grill-runs`,
+        )
+      ).status,
+    ).toBe(404);
   });
 });

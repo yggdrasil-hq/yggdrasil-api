@@ -25,6 +25,7 @@ import { toPublicTestRunExecution } from "../tests/report-types.js";
 import { toPublicTestRunHistoryEntry } from "../tests/run-history.js";
 import { toPublicAgenticReview } from "../features/review-types.js";
 import { deriveAwaitingReply } from "../jobs/grill-wait.js";
+import { earlierGrillRuns } from "../jobs/grill-runs.js";
 import { isValidTimeZone } from "../scheduling/timezone.js";
 import {
   isValidCronExpression,
@@ -2400,6 +2401,123 @@ export function createProjectsRouter(deps: {
       events,
     });
   });
+
+  // ADR 024 item 8 / issue #28 part 2: a **specific** run's curated event history,
+  // by job id — so a superseded run's transcript can be read back.
+  //
+  // The sibling route above resolves its job as `findLatestJob(featureId)`: one job,
+  // the newest. That is what a live surface wants, and it is also why a rewound
+  // conversation was unreachable — the earlier run still exists, but no route would
+  // ever hand it over. This is that route.
+  //
+  // `jobKind` and `jobStatus` are returned for the same reason the sibling returns
+  // them: the reader needs to know whether the transcript it got is a grill at all,
+  // and whether the run ended. `awaitingReply` is deliberately absent — it answers
+  // "is a human being waited on right now", which is a property of the *current*
+  // run; this read exists for runs that have been left behind.
+  router.get(
+    "/:projectId/features/:featureId/jobs/:jobId/events",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      if (!featureId) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      const feature = await deps.features.findById(project.id, featureId);
+      if (!feature) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      const jobId = routeParam(req.params.jobId);
+      if (!isUuid(jobId)) {
+        res.status(404).json({ error: "Job not found" });
+        return;
+      }
+
+      const job = await deps.jobs.findByIdForProject(project.id, jobId);
+      if (!job) {
+        res.status(404).json({ error: "Job not found" });
+        return;
+      }
+
+      /*
+       * The extra assertion this route needs, and the reason it is not optional.
+       *
+       * `findByIdForProject` binds a job to a *project*, so on its own it would let a
+       * caller read any job in the project by pasting its uuid into a path that names
+       * an unrelated feature — and a grill transcript is the whole prior conversation,
+       * including anything a human typed into it. Requiring the job's own `featureId`
+       * to be the requested one closes that: the path's two ids must agree with each
+       * other and with the row.
+       *
+       * 404 rather than 403, matching the sibling route's treatment of "not reachable
+       * through this path": a caller who may read the project but not this job should
+       * not be told whether the job exists.
+       */
+      if (job.featureId !== featureId) {
+        res.status(404).json({ error: "Job not found" });
+        return;
+      }
+
+      const events = await deps.jobEvents.listByJob(job.id);
+      res.json({
+        jobStatus: job.status,
+        lastError: job.lastError,
+        jobKind: job.kind,
+        restartedFromEventId: job.restartedFromEventId,
+        events,
+      });
+    },
+  );
+
+  // ADR 024 item 8 / issue #28 part 2: the feature's **earlier** grill runs, so the
+  // Spec page can offer what a rewind discarded.
+  //
+  // Returns earlier runs *only*, and says so in the response key rather than leaving
+  // a client to drop the last element itself. "Which run is current" is a rule the
+  // API owns — `earlierGrillRuns` applies it, and the sibling `/events` route already
+  // answers the current run — so a client that filtered this array would be
+  // re-implementing a rule, which is how the readiness predicate came to be derived
+  // in the browser twice (#35/#89).
+  //
+  // Ordering, what counts as earlier, and which run superseded which all live in
+  // `jobs/grill-runs.ts`, where they are unit-tested as rules rather than asserted
+  // through HTTP.
+  router.get(
+    "/:projectId/features/:featureId/grill-runs",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      if (!featureId) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      const feature = await deps.features.findById(project.id, featureId);
+      if (!feature) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      const runs = await deps.jobs.listFeatureGrillRuns(featureId);
+      res.json({ earlierRuns: earlierGrillRuns(runs) });
+    },
+  );
 
   router.get("/:projectId/tests", requireAuth, async (req, res) => {
     const project = await getOwnedProject(req, routeParam(req.params.projectId));
