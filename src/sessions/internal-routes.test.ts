@@ -34,6 +34,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     completedAt: new Date("2026-09-18T10:05:00.000Z"),
     targetRevision: null,
     restartedFromEventId: null,
+    forkFromJobId: null,
     ...overrides,
   } as Job;
 }

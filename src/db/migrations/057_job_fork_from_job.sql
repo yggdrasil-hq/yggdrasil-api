@@ -1,0 +1,47 @@
+-- ADR 032 item 3: per-message grill "resume from here" (a true fork).
+--
+-- Records that a spec_grill job was seeded from an *earlier run's stored Pi
+-- session* rather than from a reconstruction, and which run that was. The fork
+-- ids themselves still travel in jobs.spec_context, because the Orchestrator reads
+-- them from there — this column exists so the fact is a first-class, queryable
+-- property of the job rather than a flag buried inside an opaque JSONB blob that
+-- the public API deliberately does not expose. Exactly the split migration 037
+-- draws for ADR 024's rewind, and for the same reason.
+--
+-- ## Why this cannot be derived, which is the whole test for adding a column
+--
+-- "Is this run a fork, and of what?" is *not* recoverable from anything already
+-- stored. Job ordering does not imply it: a feature accumulates many sequential
+-- spec_grill runs — a first attempt, ADR 012's retry, ADR 024's rewind, and now a
+-- fork — and every one of them is simply "a newer job row". The transcript does not
+-- say it either: a fork's own events begin at its first turn, and the branch point
+-- is a Pi entry id that never becomes a curated event, so nothing in `job_events`
+-- records where the conversation was taken from. Nor can the session artifacts be
+-- asked: the forked run's session is a *new* file whose header carries
+-- `parentSession` (a pod-local path, not a Yggdrasil id), and it does not exist at
+-- all until the run ends.
+--
+-- So without this column the Spec page cannot tell a resumed run from a retried
+-- one, and those two gestures are the difference ADR 032 item 3 exists to make
+-- visible: a resume continues the agent's own state and leaves the earlier
+-- conversation readable, whereas a retry starts over. A page that rendered both the
+-- same would be collapsing a distinction the user is entitled to see.
+--
+-- ## Why the entry id is deliberately *not* a second column
+--
+-- `get_fork_messages`' entry id is in `spec_context` (`forkEntryId`) because that is
+-- what the Orchestrator reads, and copying it here would be a second record of one
+-- fact — free to disagree with the first, which is the shape this suite keeps
+-- finding. The API does not need it: the fork relationship is what a surface
+-- displays, and the *text* of the branch point is reachable from the source run's
+-- stored fork points, which are addressed by job id.
+--
+-- ## ON DELETE SET NULL
+--
+-- A fork is not undone because the run it forked from went away, and a job must not
+-- be destroyed by a retention sweep of its source. (Nothing deletes jobs today; the
+-- clause is what keeps that from becoming a trap if something ever does, matching
+-- 037's `restarted_from_event_id`.)
+ALTER TABLE jobs
+  ADD COLUMN IF NOT EXISTS fork_from_job_id UUID
+    REFERENCES jobs(id) ON DELETE SET NULL;

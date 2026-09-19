@@ -32,6 +32,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     completedAt: null,
     targetRevision: null,
     restartedFromEventId: null,
+    forkFromJobId: null,
     ...overrides,
   };
 }

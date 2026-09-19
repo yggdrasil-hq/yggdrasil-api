@@ -103,4 +103,20 @@ export interface Job {
    * (it can carry a whole previous ADR and transcript).
    */
   restartedFromEventId: string | null;
+  /**
+   * ADR 032 item 3: the earlier run whose stored Pi session this run forked from,
+   * when it came from a per-message "resume from here". Null for every other run.
+   *
+   * The sibling of `restartedFromEventId`, and the two are **not**
+   * interchangeable: that one names a `job_events` turn (ADR 024's rewind), this
+   * one names a job. They record two different gestures which share a job kind and
+   * a state transition but not an implementation — a rewind re-renders the earlier
+   * conversation into a prompt, a fork restores the session itself.
+   *
+   * A column rather than only a `specContext` entry because the relationship is not
+   * derivable: every spec_grill run is a newer job row, so ordering cannot
+   * distinguish a fork from a retry or a rewind, and neither the transcript nor the
+   * forked session file names the run it came from. See migration 057.
+   */
+  forkFromJobId: string | null;
 }

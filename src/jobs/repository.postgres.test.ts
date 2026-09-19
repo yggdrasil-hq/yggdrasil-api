@@ -295,6 +295,88 @@ describe.skipIf(!reachability.ok)("JobRepository.listFeatureGrillRuns against a 
     // unresolvable link must not cost a user the transcript they came to read.
     expect(runs[0].supersedesJobId).toBeNull();
   });
+
+  /*
+   * ADR 032 item 3: the fork source column (migration 057).
+   *
+   * Exercised against the real database because a fake pool has no opinion about
+   * whether `fork_from_job_id` exists as a column, is named correctly in the INSERT,
+   * or carries the constraint it claims. `jobColumns` now selects it on **every**
+   * job read, so a typo there breaks reads app-wide while a unit test asserting a SQL
+   * string would stay green — the failure mode issue #43 and #61 both shipped.
+   */
+  describe("create with a fork source", () => {
+    it("round-trips both fork fields, and defaults the rewind marker to null", async () => {
+      const source = await insertJob({
+        kind: "spec_grill",
+        createdAt: "2026-09-10T00:00:00Z",
+      });
+
+      const created = await repository.create({
+        projectId: ids.project,
+        kind: "spec_grill",
+        featureId,
+        specContext: { forkFromJobId: source, forkEntryId: "a1b2c3d4" },
+        forkFromJobId: source,
+      });
+
+      // Read back through the repository rather than trusting the returned row, so the
+      // SELECT in `jobColumns` is exercised too.
+      const readBack = await repository.findById(created.id);
+      expect(readBack).toMatchObject({ forkFromJobId: source, restartedFromEventId: null });
+
+      // The two markers are independent, and a fork must not set the rewind one: a page
+      // reading `restartedFromEventId` would otherwise announce a rewind over a fork.
+      expect(readBack?.restartedFromEventId).toBeNull();
+    });
+
+    it("leaves the fork source null for an ordinary run", async () => {
+      const created = await repository.create({
+        projectId: ids.project,
+        kind: "spec_grill",
+        featureId,
+      });
+
+      expect((await repository.findById(created.id))?.forkFromJobId).toBeNull();
+    });
+
+    it("refuses a fork source that is not a job, so a bad id cannot be stored", async () => {
+      // The foreign key is what makes "the run this forked from" a real relationship
+      // rather than a free-text id. Without it a typo would be indistinguishable from a
+      // source that was later deleted — and only one of those is normal.
+      await expect(
+        repository.create({
+          projectId: ids.project,
+          kind: "spec_grill",
+          featureId,
+          forkFromJobId: "00000000-0000-4000-8000-000000000000",
+        }),
+      ).rejects.toMatchObject({ code: "23503" });
+    });
+
+    it("keeps the fork when its source row is deleted, with the link cleared", async () => {
+      // `ON DELETE SET NULL` (migration 057). Nothing deletes jobs today, so this is
+      // asserted rather than assumed: a fork is not undone because the run it came from
+      // went away, and the fork's own row must survive.
+      const source = await repository.create({
+        projectId: ids.project,
+        kind: "spec_grill",
+        featureId,
+      });
+      const forked = await repository.create({
+        projectId: ids.project,
+        kind: "spec_grill",
+        featureId,
+        forkFromJobId: source.id,
+      });
+
+      await pool.query("DELETE FROM jobs WHERE id = $1", [source.id]);
+
+      const readBack = await repository.findById(forked.id);
+      expect(readBack).not.toBeNull();
+      expect(readBack?.forkFromJobId).toBeNull();
+    });
+  });
 });
 
 /**

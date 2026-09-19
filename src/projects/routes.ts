@@ -9,8 +9,11 @@ import {
   buildGrillRestartSeed,
   canRestartFromMessage,
   messageRestartRefusal,
-  MESSAGE_RESTART_STATUSES,
+  GRILL_REDO_STATUSES,
 } from "../jobs/grill-context.js";
+import { resumeFromSessionRefusal } from "../jobs/grill-resume.js";
+import { permitsFork, storedSessionState, UNKNOWN_FORK_POINT_STATE } from "../sessions/retention.js";
+import type { JobSessionRepository } from "../sessions/repository.js";
 import type { JobEventRepository } from "../jobs/events-repository.js";
 import type { JobMessageRepository } from "../jobs/messages-repository.js";
 import type { NotificationRepository } from "../notifications/repository.js";
@@ -146,6 +149,17 @@ const restartFromMessageSchema = z.object({
   eventId: z.string().uuid(),
 });
 
+/**
+ * ADR 032 item 3. A Pi entry id, not a transcript event id — a different id space,
+ * which is why this is its own schema rather than a reuse of the one above. Pi's
+ * ids are short opaque tokens (an observed one is `a1b2c3d4`), so the bound is
+ * generous rather than tight; what matters is that the value is non-empty and
+ * bounded, since it is compared against stored points and never parsed.
+ */
+const resumeFromMessageSchema = z.object({
+  entryId: z.string().trim().min(1).max(128),
+});
+
 const createDesignSchema = z.object({
   name: z.string().trim().min(1).max(128),
   description: z.string().trim().min(1).max(4000),
@@ -198,6 +212,7 @@ export function createProjectsRouter(deps: {
   tests: TestRepository;
   testRunReports: TestRunReportRepository;
   jobs: JobRepository;
+  jobSessions: JobSessionRepository;
   jobEvents: JobEventRepository;
   jobMessages: JobMessageRepository;
   notifications: NotificationRepository;
@@ -1907,10 +1922,15 @@ export function createProjectsRouter(deps: {
   //
   // The feature re-enters `draft` and a NEW spec_grill run is dispatched —
   // ADR 012's precedent, a new job row every time, the old one kept as
-  // history — seeded with the conversation *before* the chosen turn. This is
-  // the only per-message control; "resume from here" is deliberately absent
-  // because a live session is already steered by ADR 006's mid-run reply, and
-  // this route refuses to run underneath one.
+  // history — seeded with the conversation *before* the chosen turn. This route
+  // refuses to run underneath a live grill.
+  //
+  // **The sibling below is a different gesture, not a variant of this one.**
+  // ADR 032 item 3 adds "resume from here", which forks a stored Pi session. It is
+  // not offered from *this* route because the two discard different things: this one
+  // renders the earlier conversation into the new run's prompt and keeps the
+  // discarded turns only as job history, while a fork restores the session itself and
+  // leaves the original artifact readable. `resume-from-message` is where that lives.
   router.post(
     "/:projectId/features/:featureId/restart-from-message",
     requireAuth,
@@ -1976,9 +1996,9 @@ export function createProjectsRouter(deps: {
 
       // Guarded on the allowed set, so a feature that moved on between the
       // checks above and here is refused rather than silently rewound.
-      const rewound = await deps.features.resetForMessageRestart(
+      const rewound = await deps.features.resetForGrillRedo(
         featureId,
-        MESSAGE_RESTART_STATUSES,
+        GRILL_REDO_STATUSES,
       );
       if (!rewound) {
         res.status(409).json({ error: "Feature is not in a restartable state" });
@@ -2006,6 +2026,154 @@ export function createProjectsRouter(deps: {
       });
 
       res.status(201).json(toPublicFeature(rewound));
+    },
+  );
+
+  // ADR 032 item 3: resumes a feature's Spec interview from a stored Pi session
+  // ("resume from here") — a true fork, and the non-destructive counterpart to the
+  // rewind above.
+  //
+  // **What this does, and what it deliberately does not.** The feature goes back to
+  // `draft` and a NEW spec_grill run is dispatched, exactly as a rewind does and for
+  // the same reason — the interview is being redone from an earlier point, so nothing
+  // the feature holds as a settled spec is settled any more. What is *not* touched is
+  // the source run: its session artifact is left where it is and its transcript stays
+  // readable, which is the property ADR 032 item 3 calls non-destructive. The two
+  // gestures therefore share `resetForGrillRedo` and differ in what the dispatched job
+  // carries, not in the state transition.
+  //
+  // `adr_approved` has to be cleared rather than left set, and that is a correctness
+  // requirement rather than tidiness: the fork's terminal `submit_adr` overwrites
+  // `adr_markdown` and `setSpecReady` does not touch the flag, so a surviving approval
+  // would let `queueBuild` launch a build against an ADR nobody approved.
+  //
+  // **The source run is resolved server-side.** The caller sends only the resume point;
+  // a client that could name an arbitrary earlier job could branch a conversation that
+  // is not on screen, which is the same hazard the rewind route avoids by requiring its
+  // turn to belong to the feature's latest job. Here that is structural instead of
+  // checked: there is no job id to get wrong.
+  router.post(
+    "/:projectId/features/:featureId/resume-from-message",
+    requireAuth,
+    async (req, res) => {
+      const project = await getOwnedProject(req, routeParam(req.params.projectId));
+      if (!project) {
+        res.status(404).json({ error: "Project not found" });
+        return;
+      }
+
+      const featureId = parseFeatureId(routeParam(req.params.featureId));
+      if (!featureId) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      const parsed = parseBody(resumeFromMessageSchema, req.body);
+      if (!parsed.success) {
+        res.status(400).json({ error: parsed.error });
+        return;
+      }
+
+      const feature = await deps.features.findById(project.id, featureId);
+      if (!feature) {
+        res.status(404).json({ error: "Feature not found" });
+        return;
+      }
+
+      // The run whose transcript is on screen, and therefore the only run whose stored
+      // session may be branched from — the same resolution the events read and the
+      // rewind route both use, so the resume points a page offers are the ones the API
+      // will accept.
+      const latestJob = await deps.jobs.findLatestJob(featureId);
+      const activeJob = await deps.jobs.findActiveSpecGrillJob(featureId);
+
+      const session = latestJob ? await deps.jobSessions.findByJob(latestJob.id) : null;
+      const availability = storedSessionState(session, new Date());
+      const storedPoints = latestJob
+        ? await deps.jobSessions.findForkPoints(latestJob.id)
+        : null;
+
+      const refusal = resumeFromSessionRefusal({
+        featureStatus: feature.status,
+        latestJobKind: latestJob?.kind ?? null,
+        hasActiveGrillJob: activeJob !== null,
+        sessionState: availability,
+        forkPointState: storedPoints?.state ?? UNKNOWN_FORK_POINT_STATE,
+        forkPoints: storedPoints?.points ?? null,
+        entryId: parsed.data.entryId,
+      });
+      if (refusal) {
+        res.status(refusal.status).json({ error: refusal.error });
+        return;
+      }
+
+      // Narrowed by the refusal above (`permitsFork(availability)` and a captured
+      // capture are both required), restated as explicit guards so the dispatch below
+      // cannot be reached on a null job by a future edit reordering the checks.
+      if (!latestJob || !permitsFork(availability)) {
+        res.status(409).json({ error: "This run's session cannot be resumed." });
+        return;
+      }
+
+      const modelConfigError = await assertModelConfigResolvable(
+        project,
+        "spec_grill",
+        feature.id,
+      );
+      if (modelConfigError) {
+        res.status(400).json({ error: modelConfigError });
+        return;
+      }
+
+      // The atomic guard, shared with the rewind: a feature that moved on between the
+      // checks above and here is refused rather than silently redone.
+      const redone = await deps.features.resetForGrillRedo(featureId, GRILL_REDO_STATUSES);
+      if (!redone) {
+        res.status(409).json({ error: "Feature is not in a state a grill can be resumed from" });
+        return;
+      }
+
+      await dispatchJob(deps.jobs, {
+        projectId: project.id,
+        kind: "spec_grill",
+        featureId: redone.id,
+        /*
+         * **Exactly two fields, and no seed.** The Orchestrator reads these two from
+         * `spec_context` to place the session and branch it, and for a fork it replaces
+         * the run's first prompt with the fork point's own text — so a transcript
+         * summary here would be built into a prompt that is then discarded, which is the
+         * "marshalled and never read" shape this codebase keeps finding. The restored
+         * session already *is* the earlier conversation, which is the whole difference
+         * from a rewind.
+         *
+         * Two ids because neither is derivable from the other (ADR 032 item 2): the job
+         * names where the bytes are, the entry id where in that session to branch, and
+         * they are different id spaces.
+         */
+        specContext: { forkFromJobId: latestJob.id, forkEntryId: parsed.data.entryId },
+        // The queryable record of the same relationship — see migration 057 for why the
+        // fork is both a wire field and a column, and why the entry id is only the former.
+        forkFromJobId: latestJob.id,
+      });
+
+      await deps.audit.record(res, {
+        organizationId: project.organizationId,
+        projectId: project.id,
+        actorUserId: req.currentUser!.id,
+        action: AUDIT_ACTIONS.featureGrillResumedFromMessage,
+        targetType: "feature",
+        targetId: redone.id,
+        // Both ids, because a resume has no single "how far" — it names the run the
+        // conversation came from *and* the point within it, and either alone would leave
+        // the trail unable to describe what was resumed.
+        metadata: {
+          title: redone.title,
+          forkFromJobId: latestJob.id,
+          forkEntryId: parsed.data.entryId,
+        },
+      });
+
+      res.status(201).json(toPublicFeature(redone));
     },
   );
 
@@ -2362,6 +2530,7 @@ export function createProjectsRouter(deps: {
         lastError: null,
         jobKind: null,
         restartedFromEventId: null,
+        forkFromJobId: null,
         // Issue #92: present exactly when a human owes an answer, so this mirrors
         // the no-job case honestly — a feature with no job is waiting on nothing.
         awaitingReply: null,
@@ -2374,7 +2543,9 @@ export function createProjectsRouter(deps: {
     // jobKind lets the caller tell whether this transcript is a grill at all
     // (ADR 024's per-message restart only applies to one);
     // restartedFromEventId says this run is a rewind of an earlier one, so the
-    // page can explain why its transcript starts mid-conversation.
+    // page can explain why its transcript starts mid-conversation; and forkFromJobId
+    // says it is a *fork* of an earlier one, which is a different explanation (see
+    // the field below).
     res.json({
       jobStatus: job.status,
       lastError: job.lastError,
@@ -2395,6 +2566,18 @@ export function createProjectsRouter(deps: {
        */
       jobId: job.id,
       restartedFromEventId: job.restartedFromEventId,
+      /**
+       * ADR 032 item 3: the earlier run this one forked from, when its Spec interview
+       * was *resumed* rather than restarted — null otherwise.
+       *
+       * Beside `restartedFromEventId` because the two are the same generation of
+       * information and a reader needs both to tell the gestures apart: a rewind is
+       * "the transcript was truncated here", a fork is "this run continues that run's
+       * own session". A page that showed neither would render a resumed run exactly
+       * like a retried one, and the difference — whether the earlier conversation is
+       * still readable — is the point of the control.
+       */
+      forkFromJobId: job.forkFromJobId,
       /**
        * Issue #92: how long this grill has been waiting on an unanswered
        * question, or null when it is not waiting.
@@ -2489,6 +2672,10 @@ export function createProjectsRouter(deps: {
         lastError: job.lastError,
         jobKind: job.kind,
         restartedFromEventId: job.restartedFromEventId,
+        // ADR 032 item 3, for the same reason the live read above carries it: a
+        // superseded-run view has to be able to say whether *this* run was a fork, and
+        // nothing else in the response says so.
+        forkFromJobId: job.forkFromJobId,
         events,
       });
     },

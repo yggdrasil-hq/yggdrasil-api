@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   buildGrillRestartSeed,
   canRestartFromMessage,
-  isMessageRestartableStatus,
+  isGrillRedoableStatus,
   isGrillTranscriptJob,
   isRestartableEvent,
   MAX_GRILL_CONTEXT_CHARS,
   messageRestartRefusal,
-  MESSAGE_RESTART_STATUSES,
+  GRILL_REDO_STATUSES,
   restartBoundaryIndex,
   summarizeGrillTranscript,
   type GrillContextEvent,
@@ -202,21 +202,21 @@ describe("isGrillTranscriptJob", () => {
   });
 });
 
-describe("isMessageRestartableStatus", () => {
+describe("isGrillRedoableStatus", () => {
   it("allows the states where no agreed work is in flight", () => {
     for (const status of ["draft", "spec_ready", "failed", "cancelled"]) {
-      expect(isMessageRestartableStatus(status)).toBe(true);
+      expect(isGrillRedoableStatus(status)).toBe(true);
     }
   });
 
   it("refuses once work is in flight or past review", () => {
     for (const status of ["queued", "running", "testing", "agentic_review", "in_review", "merged", "returned"]) {
-      expect(isMessageRestartableStatus(status)).toBe(false);
+      expect(isGrillRedoableStatus(status)).toBe(false);
     }
   });
 
   it("exposes exactly the set the route passes to the guarded update", () => {
-    expect([...MESSAGE_RESTART_STATUSES]).toEqual(["draft", "spec_ready", "failed", "cancelled"]);
+    expect([...GRILL_REDO_STATUSES]).toEqual(["draft", "spec_ready", "failed", "cancelled"]);
   });
 });
 

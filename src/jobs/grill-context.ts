@@ -76,26 +76,58 @@ export function summarizeGrillTranscript(
 export const RESTARTABLE_EVENT_TYPES = ["agent_text", "ask_user", "user_message"] as const;
 
 /**
- * The feature states a per-message restart may start from.
+ * The feature states a per-message gesture on the Spec interview may start from —
+ * shared by ADR 024's restart and ADR 032 item 3's resume.
  *
  * `queued`/`running`/`testing`/`agentic_review`/`in_review`/`merged` are
- * excluded because work is either in flight or already past review — rewinding
+ * excluded because work is either in flight or already past review — rewriting
  * the interview under them would discard agreed scope behind the user's back.
  * `returned` is excluded for the same reason: ADR 015 gives it its own explicit
  * resume/kickback affordances. `failed` and `cancelled` are included, but only
  * together with the check that the feature's latest job really is the grill
- * (see `canRestartFromMessage`) — a *build* that failed also lands here, and
+ * (see `grillRedoBlock`) — a *build* that failed also lands here, and
  * its transcript is not a grill conversation.
  */
-export const MESSAGE_RESTART_STATUSES = [
+export const GRILL_REDO_STATUSES = [
   "draft",
   "spec_ready",
   "failed",
   "cancelled",
 ] as const;
 
-export function isMessageRestartableStatus(status: string): boolean {
-  return (MESSAGE_RESTART_STATUSES as readonly string[]).includes(status);
+export function isGrillRedoableStatus(status: string): boolean {
+  return (GRILL_REDO_STATUSES as readonly string[]).includes(status);
+}
+
+/**
+ * Which condition, if any, blocks a per-message gesture on a spec grill — or null
+ * when the feature is in a state that permits one.
+ *
+ * **Two gestures, one set of conditions.** ADR 024's "restart from here" (a rewind)
+ * and ADR 032 item 3's "resume from here" (a fork) are different operations, but the
+ * reasons a feature can refuse one are the same three, and they are the same three
+ * because the *hazard* is the same: rewriting the Spec interview underneath something
+ * that depends on it. So the conditions live here once, and each gesture supplies its
+ * own wording for each block.
+ *
+ * Wording is per-gesture deliberately, and is not a duplication: the sentence a user
+ * is shown has to describe the gesture they attempted (a rewind discards turns; a
+ * resume does not), so a single shared sentence would misdescribe one of them. What
+ * must not be duplicated is the decision, which is what made a comment in this file
+ * say a second copy of the logic "would eventually disagree about which condition
+ * failed, and the user would be told the wrong reason".
+ */
+export type GrillRedoBlock = "status" | "latest_job_kind" | "active_grill_job";
+
+export function grillRedoBlock(input: {
+  status: string;
+  latestJobKind: string | null;
+  hasActiveGrillJob: boolean;
+}): GrillRedoBlock | null {
+  if (!isGrillRedoableStatus(input.status)) return "status";
+  if (!isGrillTranscriptJob(input.latestJobKind)) return "latest_job_kind";
+  if (input.hasActiveGrillJob) return "active_grill_job";
+  return null;
 }
 
 /** Whether an event can serve as a restart boundary. */
@@ -204,7 +236,7 @@ export function canRestartFromMessage(input: {
   latestJobKind: string | null;
   hasActiveGrillJob: boolean;
 }): boolean {
-  return messageRestartRefusal(input) === null;
+  return grillRedoBlock(input) === null;
 }
 
 /**
@@ -214,24 +246,25 @@ export function canRestartFromMessage(input: {
  * Deliberately the implementation *behind* `canRestartFromMessage` rather than
  * a second set of conditions beside it: two copies of this logic would
  * eventually disagree about which condition failed, and the user would be told
- * the wrong reason.
+ * the wrong reason. The conditions now come from `grillRedoBlock`, which the
+ * resume gesture shares.
  */
 export function messageRestartRefusal(input: {
   status: string;
   latestJobKind: string | null;
   hasActiveGrillJob: boolean;
 }): string | null {
-  if (!isMessageRestartableStatus(input.status)) {
-    return (
-      `A grill can only be rewound while the feature is still in Spec, or in a stopped ` +
-      `state — this one is ${input.status}.`
-    );
+  switch (grillRedoBlock(input)) {
+    case null:
+      return null;
+    case "status":
+      return (
+        `A grill can only be rewound while the feature is still in Spec, or in a stopped ` +
+        `state — this one is ${input.status}.`
+      );
+    case "latest_job_kind":
+      return "This feature's most recent run is not a grill session.";
+    case "active_grill_job":
+      return "A grill session is already running for this feature.";
   }
-  if (!isGrillTranscriptJob(input.latestJobKind)) {
-    return "This feature's most recent run is not a grill session.";
-  }
-  if (input.hasActiveGrillJob) {
-    return "A grill session is already running for this feature.";
-  }
-  return null;
 }
