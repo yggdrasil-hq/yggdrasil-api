@@ -13,6 +13,10 @@ import type { OrgRole } from "./types.js";
 import { testClusterConnection } from "./cluster-connection-test.js";
 import { AUDIT_ACTIONS } from "../audit/actions.js";
 import type { AuditRecorder } from "../audit/record.js";
+import type { OrgProviderRepository } from "../model-config/provider-repository.js";
+import type { OrgModelRepository } from "../model-config/model-repository.js";
+import type { JobModelDefaultRepository } from "../model-config/job-default-repository.js";
+import { evaluateEntryReadiness } from "./readiness.js";
 
 const roleSchema = z.enum(ORG_ROLES);
 
@@ -41,6 +45,15 @@ export function createOrganizationsRouter(deps: {
   clusters: OrganizationClusterRepository;
   orgSecrets: OrgSecretRepository;
   audit: AuditRecorder;
+  /**
+   * Issue #35: the model-config repositories, so the onboarding entry check can ask
+   * whether every agent job kind has a resolvable default (ADR 018 item 6a). These
+   * are exactly the repositories the shared predicate in `./readiness.ts` needs —
+   * the same one the create gate uses — and no others.
+   */
+  providers: OrgProviderRepository;
+  models: OrgModelRepository;
+  jobDefaults: JobModelDefaultRepository;
 }): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(deps.sessions, deps.users);
@@ -65,6 +78,29 @@ export function createOrganizationsRouter(deps: {
       roleDisplayNames: ROLE_DISPLAY_NAMES,
       capabilities,
     });
+  });
+
+  /**
+   * Issue #35: whether this user should be let past onboarding, and what is
+   * outstanding if not.
+   *
+   * A **user-scoped** read (no `:organizationId`), because the question the client
+   * has is about the user's whole membership: "can I reach the app at all, and if
+   * not, what do I fix?" Answering per-org would make the client re-implement the
+   * entry rule, which is the kind of duplicated decision this issue exists to
+   * remove.
+   *
+   * **Registered before `/:organizationId`** (as `/roles` is above), or Express
+   * would match `/readiness` as an org id and 404 on the UUID check.
+   *
+   * Deliberately *not* folded into `GET /auth/me`: that is the session bootstrap
+   * every page load hits, while this costs a defaults read plus one model
+   * resolution per org. It is only meaningful at the entry gate, so it is only
+   * asked there.
+   */
+  router.get("/readiness", requireAuth, async (req, res) => {
+    const readiness = await evaluateEntryReadiness(deps, req.currentUser!.id);
+    res.json(readiness);
   });
 
   router.get("/", requireAuth, async (req, res) => {

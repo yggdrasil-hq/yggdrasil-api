@@ -16,6 +16,7 @@ before reading the body.
 | Doc | Read this when |
 |-----|----------------|
 | [`concepts/authentication.md`](concepts/authentication.md) | Auth routes, sessions, OAuth, migrations. |
+| [`concepts/onboarding-readiness.md`](concepts/onboarding-readiness.md) | You touch the onboarding entry gate, `POST /projects`'s org gates, or a fresh signup reports a dead end. |
 | [`concepts/live-relay-limits.md`](concepts/live-relay-limits.md) | You touch `src/live/`, the delta ingest, or an install reports live updates stopped. |
 | [`concepts/run-artifacts.md`](concepts/run-artifacts.md) | You touch recordings/screenshots, a job's `recordingPath`/`screenshotPath`, or an artifact looks missing or broken. |
 

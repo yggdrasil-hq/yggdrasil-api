@@ -7,6 +7,7 @@ import type { Project } from "./types.js";
 import type { Feature } from "../features/types.js";
 import type { SessionRecord } from "../auth/sessions.js";
 import type { User } from "../users/types.js";
+import { AGENT_JOB_KINDS } from "../model-config/types.js";
 
 const OWNER_ID = "user_1";
 
@@ -95,7 +96,15 @@ const ORG_DEFAULT_MODEL_ID = "model_org_default";
  * semantics closely enough for these tests, which don't exercise per-job-kind
  * variation.
  */
-function fakeModelConfigDeps(bundle: Record<string, string> = {}) {
+function fakeModelConfigDeps(
+  bundle: Record<string, string> = {},
+  overrides: {
+    /** Replaces the derived all-five-kinds list, for tests about partial coverage. */
+    jobDefaults?: BuildAppOptions["jobDefaults"];
+    /** false => the default's catalog model no longer exists. */
+    catalogModelExists?: boolean;
+  } = {},
+) {
   const complete = Boolean(bundle.MODEL_BASE_URL && bundle.MODEL_API_KEY && bundle.MODEL_ID);
   const providers = {
     decryptApiKey: vi.fn(async () => bundle.MODEL_API_KEY ?? null),
@@ -103,13 +112,35 @@ function fakeModelConfigDeps(bundle: Record<string, string> = {}) {
   };
   const models = {
     findById: vi.fn(async (_orgId: string, modelId: string) =>
-      complete && modelId === ORG_DEFAULT_MODEL_ID
-        ? { id: modelId, providerId: "provider_1", modelId: bundle.MODEL_ID }
-        : null,
+      overrides.catalogModelExists === false
+        ? null
+        : complete && modelId === ORG_DEFAULT_MODEL_ID
+          ? { id: modelId, providerId: "provider_1", modelId: bundle.MODEL_ID }
+          : null,
     ),
   };
   const jobDefaults = {
     findForJobKind: vi.fn(async () => (complete ? { modelId: ORG_DEFAULT_MODEL_ID } : null)),
+    /*
+     * Issue #35: the create gate now asks for **all five** agent job kinds (ADR 018
+     * item 6a), not `spec_grill` alone, so the fixture has to answer the list query
+     * too. `complete` keeps the fixture's existing meaning — a resolvable org config
+     * covers every kind — which is what makes the tightened gate a no-op for these
+     * tests rather than a rewrite of them.
+     */
+    listForOrganization: vi.fn(
+      async () =>
+        overrides.jobDefaults ??
+        (complete
+          ? AGENT_JOB_KINDS.map((jobKind) => ({
+              organizationId: "org_1",
+              jobKind,
+              modelId: ORG_DEFAULT_MODEL_ID,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            }))
+          : []),
+    ),
   };
   const projectOverrides = {
     findForJobKind: vi.fn(async () => null),
@@ -152,6 +183,22 @@ interface BuildAppOptions {
   transcriptEvents?: unknown[];
   /** Forces `resetForMessageRestart` to report the feature moved on before the rewind landed. */
   resetForMessageRestartRefused?: boolean;
+  /*
+   * Issue #35: the two knobs that let a create-gate test vary the org's model
+   * coverage. Both default to "all five kinds configured and resolvable", which is
+   * what keeps every pre-existing test in this file about its own subject rather
+   * than about readiness.
+   */
+  /** Replaces the derived all-five-kinds default list, for partial-coverage tests. */
+  jobDefaults?: Array<{
+    organizationId: string;
+    jobKind: string;
+    modelId: string;
+    createdAt: Date;
+    updatedAt: Date;
+  }>;
+  /** false => the configured default's catalog model no longer exists. */
+  catalogModelExists?: boolean;
 }
 
 function buildApp(opts: BuildAppOptions) {
@@ -172,7 +219,10 @@ function buildApp(opts: BuildAppOptions) {
   const secrets = fakeSecrets(opts.projectSecrets);
   const orgSecrets = fakeUserSecrets(opts.orgSecrets);
   const { providers, models, jobDefaults, projectOverrides, featureOverrides, featureSecrets } =
-    fakeModelConfigDeps(opts.orgSecrets);
+    fakeModelConfigDeps(opts.orgSecrets, {
+      jobDefaults: opts.jobDefaults,
+      catalogModelExists: opts.catalogModelExists,
+    });
 
   const users = {
     findById: vi.fn(async () => ({ id: OWNER_ID } as User)),
@@ -407,6 +457,55 @@ describe("model configuration gate (ADR 007)", () => {
 
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/model configuration/i);
+    });
+
+    /*
+     * Issue #35's behaviour change, asserted deliberately.
+     *
+     * The gate used to require a default for `spec_grill` alone, so an org with
+     * four of five kinds could create a project and then have its
+     * `agentic_review` (here) jobs fail at run time on a missing model. ADR 018 item
+     * 6a says partial coverage blocks, and the gate now implements that — so this
+     * test is the one that would fail if someone weakened it back.
+     */
+    it("400s on partial model coverage, naming the kind that is missing (ADR 018 item 6a)", async () => {
+      const project = makeProject({ status: "initializing" });
+      const { app } = buildApp({
+        project,
+        // All five configured except one — enough to pass the old spec_grill-only
+        // check, and exactly the state item 6a exists to reject.
+        jobDefaults: AGENT_JOB_KINDS.filter((kind) => kind !== "agentic_review").map((kind) => ({
+          organizationId: "org_1",
+          jobKind: kind,
+          modelId: ORG_DEFAULT_MODEL_ID,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })),
+        orgSecrets: { MODEL_BASE_URL: "u", MODEL_API_KEY: "k", MODEL_ID: "m" },
+      });
+
+      const res = await authedRequest(app).post("/projects").send(createBody());
+
+      expect(res.status).toBe(400);
+      // The message has to name it: an admin who has set four of five needs to know
+      // which one is missing, not to be told to "set a default model configuration".
+      expect(res.body.error).toContain("Agentic review");
+    });
+
+    it("400s and says a default stopped resolving, rather than that none is set", async () => {
+      const project = makeProject({ status: "initializing" });
+      const { app } = buildApp({
+        project,
+        // A row exists for every kind, but its catalog model is gone — the admin
+        // must not be sent to fill in a field that already has a value.
+        catalogModelExists: false,
+        orgSecrets: { MODEL_BASE_URL: "u", MODEL_API_KEY: "k", MODEL_ID: "m" },
+      });
+
+      const res = await authedRequest(app).post("/projects").send(createBody());
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain("no longer resolves");
     });
 
     it("400s when the org's cluster isn't configured yet (ADR 016 gate)", async () => {
