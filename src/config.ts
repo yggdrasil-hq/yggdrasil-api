@@ -1,3 +1,83 @@
+import { parseGoDurationMs } from "./shared/duration.js";
+
+/**
+ * Issue #92: the bound on one unanswered grill question, as the **API's mirror**
+ * of the Orchestrator's own `GRILL_REPLY_TIMEOUT`.
+ *
+ * **Why the API holds a copy at all.** The bound is owned by the Orchestrator
+ * (`orchestrator/internal/worker/replytimeout.go`, `defaultReplyTimeout`) and
+ * enforced by it when `ask_user` goes unanswered (issue #82). A surface that says
+ * "expires in 18h" needs the same number, and there is no endpoint, no shared
+ * table and no shared `.env` between the two services — `deploy/
+ * docker-compose.dev.yml` gives each its own `env_file`. So the choice is a second
+ * copy here or no countdown at all.
+ *
+ * **Why a copy is acceptable here, given this burn-down's history with drift.**
+ * Every "declaration disagreeing with reality" bug found in this work (#75, #86,
+ * and the four field-drops in #38/#59/#73/#88) shared one shape: two records of
+ * one fact, and nothing that fails when they diverge. So this copy ships with the
+ * three things that keep such a pair honest rather than merely documented:
+ *
+ * 1. **The same variable name and the same syntax.** `GRILL_REPLY_TIMEOUT=24h`
+ *    parses identically on both sides (`parseGoDurationMs` implements Go's
+ *    grammar deliberately), so the value an operator writes for the Orchestrator
+ *    can be pasted here verbatim. A different syntax or name would have made the
+ *    duplicate practically un-settable, which is the version of this that *is*
+ *    indefensible.
+ * 2. **The same default, pinned by a test.** `config.test.ts` asserts the shipped
+ *    default equals `DEFAULT_GRILL_REPLY_TIMEOUT_MS` and that the constant carries
+ *    the Orchestrator's value in its comment, following the precedent
+ *    `capabilities.DefaultReportInterval` set in #63 (an interval in one repo
+ *    asserted against the other repo's trust window, declared locally because
+ *    neither side's suite can see the other). A change to either default has to be
+ *    a deliberate change here too.
+ * 3. **Provenance on the wire.** The read reports `timeoutSource`, so a client can
+ *    tell a configured value from the shipped default and is never told an
+ *    assumption is a statement of fact.
+ *
+ * **What none of that fixes, stated rather than hidden.** An operator who raises
+ * the bound on the Orchestrator only will see the API still report 24h, because
+ * this process cannot read the other's environment. `timeoutSource: "default"` is
+ * that client's signal to hedge or omit the countdown; the API cannot detect the
+ * disagreement itself. The mirror note on the Orchestrator side is filed
+ * separately, since this repo does not own that file.
+ */
+export const DEFAULT_GRILL_REPLY_TIMEOUT_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * The variable the Orchestrator reads (`orchestrator/cmd/server/main.go`,
+ * `resolveReplyTimeout`). Spelled once here because two spellings of an env var
+ * name is its own small drift.
+ */
+export const GRILL_REPLY_TIMEOUT_ENV = "GRILL_REPLY_TIMEOUT";
+
+/**
+ * Turns the raw environment value into the bound this service reports, and says
+ * where it came from.
+ *
+ * Split out of the `config` object (and exported) so the *configured* path is
+ * reachable from a test. `config` is built at module load from `process.env`, so
+ * anything only reachable through it can be observed in its unset state and no
+ * other — which would leave the interesting half, what a given string resolves to,
+ * unverified.
+ *
+ * Non-positive is treated as unset, mirroring `replyTimeout()`, which returns the
+ * default for any value `<= 0`. A zero or negative bound describes a question that
+ * is already expired, so it is not something this can honestly display, and the
+ * Orchestrator does not honour it either — the two sides have to agree on what a
+ * value *means*, or the mirror is worse than absent.
+ */
+export function resolveGrillReplyTimeout(raw: string | undefined): {
+  timeoutMs: number;
+  source: "configured" | "default";
+} {
+  const parsed = parseGoDurationMs(raw ?? "");
+  if (parsed === null || parsed <= 0) {
+    return { timeoutMs: DEFAULT_GRILL_REPLY_TIMEOUT_MS, source: "default" };
+  }
+  return { timeoutMs: parsed, source: "configured" };
+}
+
 function required(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback;
   if (!value) {
@@ -202,6 +282,32 @@ export const config = {
       Math.floor(Number(process.env.SCREENSHOT_SWEEP_INTERVAL_MS)) || 15 * 60_000,
     ),
   },
+  /**
+   * Issue #92: the bound on one unanswered grill question, mirrored from the
+   * Orchestrator. See `DEFAULT_GRILL_REPLY_TIMEOUT_MS` for the decision, why a
+   * copy is tolerable, and what it cannot fix.
+   *
+   * Parsed with `parseGoDurationMs` rather than `Number`, and **non-positive is
+   * treated as unset** — both mirroring `resolveReplyTimeout` exactly, which passes
+   * zero (unset, unparseable or non-positive) through as "use the default". A bound
+   * of zero or less would describe a question that is already expired, so it is not
+   * a value this can meaningfully display, and the Orchestrator does not honour it
+   * either. Mirroring that rule is the point: the two must agree on what a given
+   * value *means*, or this copy is worse than absent.
+   *
+   * An unparseable value therefore falls back silently rather than warning. That is
+   * deliberate and matches the Orchestrator's own choice (a typo must not remove
+   * the bound), and the fallback is not invisible — it surfaces as
+   * `timeoutSource: "default"` on every read, which is a better signal than a
+   * start-up line nobody is looking at.
+   */
+  grills: (() => {
+    const resolved = resolveGrillReplyTimeout(process.env[GRILL_REPLY_TIMEOUT_ENV]);
+    return {
+      replyTimeoutMs: resolved.timeoutMs,
+      replyTimeoutSource: resolved.source,
+    };
+  })(),
   /**
    * Issue #30: where binary artifacts are stored.
    *
