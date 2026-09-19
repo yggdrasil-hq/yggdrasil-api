@@ -2,12 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 import {
   authorizeDesignSessionSubscription,
   authorizeSubscription,
+  authorizeTestSubscription,
 } from "./authorization.js";
 
 const USER_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_PROJECT_ID = "99999999-9999-4999-8999-999999999999";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
 const FEATURE_ID = "33333333-3333-4333-8333-333333333333";
+/** Issue #90: a `tests` row id — the resource the `test:` scope names. */
+const TEST_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 /**
  * Builds the two repositories the decision consults. The defaults model a
@@ -238,5 +241,126 @@ describe("authorizeDesignSessionSubscription (issue #25)", () => {
     });
 
     expect(decision).toEqual({ ok: true });
+  });
+});
+
+/**
+ * Builds the two repositories the test decision consults: the project through
+ * `findByIdForUser` (the org-membership join) and the test through
+ * `tests.findById`, scoped by project. The same default shape as the other two,
+ * so each test only has to describe what is wrong.
+ */
+function buildTestDeps(
+  options: {
+    /** null models a non-member (or a project that does not exist). */
+    project?: { id: string } | null;
+    /** null models a test id that is not in that project. */
+    test?: { id: string } | null;
+  } = {},
+) {
+  const findByIdForUser = vi.fn(async () =>
+    options.project === undefined ? { id: PROJECT_ID } : options.project,
+  );
+  const findById = vi.fn(async () =>
+    options.test === undefined ? { id: TEST_ID } : options.test,
+  );
+  return {
+    deps: {
+      projects: { findByIdForUser } as never,
+      tests: { findById } as never,
+    },
+    findByIdForUser,
+    findById,
+  };
+}
+
+describe("authorizeTestSubscription (issue #90)", () => {
+  it("allows a member of the project's organization to watch its test", async () => {
+    const { deps } = buildTestDeps();
+    const decision = await authorizeTestSubscription(deps, {
+      userId: USER_ID,
+      projectId: PROJECT_ID,
+      testId: TEST_ID,
+    });
+    expect(decision).toEqual({ ok: true });
+  });
+
+  it("resolves the test inside the authorised project, scoped to the user", async () => {
+    // This ordering is the reason `test:<testId>` was chosen over `job:<jobId>`:
+    // it mirrors `GET /projects/:projectId/tests/:testId/runs` one-to-one, so the
+    // socket is neither stricter nor looser than the read it signals.
+    const { deps, findByIdForUser, findById } = buildTestDeps();
+    await authorizeTestSubscription(deps, {
+      userId: USER_ID,
+      projectId: PROJECT_ID,
+      testId: TEST_ID,
+    });
+
+    expect(findByIdForUser).toHaveBeenCalledWith(PROJECT_ID, USER_ID);
+    // The project's *resolved* id, not the request's — which is what makes a
+    // project the caller cannot see unable to authorise anything. `tests.findById`
+    // scopes by project, so another organization's test id cannot resolve.
+    expect(findById).toHaveBeenCalledWith(PROJECT_ID, TEST_ID);
+  });
+
+  it("refuses a non-member without revealing whether the test exists", async () => {
+    const { deps, findById } = buildTestDeps({ project: null });
+    const decision = await authorizeTestSubscription(deps, {
+      userId: USER_ID,
+      projectId: OTHER_PROJECT_ID,
+      testId: TEST_ID,
+    });
+
+    expect(decision).toEqual({ ok: false, reason: "project" });
+    // The test is never looked up on this path.
+    expect(findById).not.toHaveBeenCalled();
+  });
+
+  it("refuses a test id that is not in the project", async () => {
+    const { deps } = buildTestDeps({ test: null });
+    const decision = await authorizeTestSubscription(deps, {
+      userId: USER_ID,
+      projectId: PROJECT_ID,
+      testId: TEST_ID,
+    });
+
+    expect(decision).toEqual({ ok: false, reason: "test" });
+  });
+
+  it("refuses ids that are not uuids without touching the database", async () => {
+    // The route parses its path parameter before any query, so a malformed id is
+    // a 404 there rather than a Postgres invalid-uuid error. Same here.
+    for (const request of [
+      { projectId: "not-a-uuid", testId: TEST_ID },
+      { projectId: PROJECT_ID, testId: "not-a-uuid" },
+    ]) {
+      const { deps, findByIdForUser, findById } = buildTestDeps();
+      const decision = await authorizeTestSubscription(deps, {
+        userId: USER_ID,
+        ...request,
+      });
+
+      expect(decision).toEqual({ ok: false, reason: "test" });
+      expect(findByIdForUser).not.toHaveBeenCalled();
+      expect(findById).not.toHaveBeenCalled();
+    }
+  });
+
+  it("re-authorises on every call rather than caching a decision", async () => {
+    // The socket calls this once per `subscribe_test` frame. A cache here would
+    // let a socket that unsubscribed and resubscribed keep access it had lost.
+    const { deps, findByIdForUser } = buildTestDeps();
+    await authorizeTestSubscription(deps, {
+      userId: USER_ID,
+      projectId: PROJECT_ID,
+      testId: TEST_ID,
+    });
+    await authorizeTestSubscription(deps, {
+      userId: USER_ID,
+      projectId: PROJECT_ID,
+      testId: TEST_ID,
+    });
+
+    expect(findByIdForUser).toHaveBeenCalledTimes(2);
   });
 });

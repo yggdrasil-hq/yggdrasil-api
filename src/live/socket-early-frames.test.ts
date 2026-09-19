@@ -82,6 +82,11 @@ async function withRelay(
       }),
     } as never,
     features: { findById: vi.fn(async () => ({ id: FEATURE_ID, projectId: PROJECT_ID })) } as never,
+    // Issue #90 put a `tests` read on this dependency (a Test entity resolves
+    // through its own repository). This file is about the pre-auth window, not
+    // the test scope, so the fake refuses everything — a subscribe_test here
+    // would be a refusal, which no case in this file sends.
+    tests: { findById: vi.fn(async () => null) } as never,
     hub,
     onError: () => {},
   });

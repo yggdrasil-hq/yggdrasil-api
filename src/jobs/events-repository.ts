@@ -153,6 +153,7 @@ interface JobEventRow {
 interface JobEventScopeRow extends JobEventRow {
   project_id: string;
   feature_id: string | null;
+  test_id: string | null;
   kind: JobKind;
 }
 
@@ -180,6 +181,22 @@ export interface JobEventWithScope {
    * either) currently routes nowhere, and that is a decision about kinds.
    */
   jobKind: JobKind;
+  /**
+   * The `tests` row a job belongs to, or null (issue #90).
+   *
+   * **A routing key, like `featureId` and unlike `jobKind`.** A scheduled
+   * `test_run` carries a `test_id` and no `feature_id`, and `test_id` names the
+   * surface — the standalone Testing product's run history, which reads
+   * `GET /projects/:projectId/tests/:testId/runs`. So the id alone is enough for
+   * `relayEnvelopeFor` to pick the topic, exactly as a `featureId` is.
+   *
+   * Only a `test_run` is created with one (`dispatchScheduledRun` and the manual
+   * "run now" route both pass `testId`; every other kind leaves it null), but
+   * that is a fact about today's callers rather than something this read should
+   * enforce — the column is a foreign key and the topic's meaning is "events for
+   * this Test", which is true of whatever job carries it.
+   */
+  testId: string | null;
 }
 
 /** The event columns, spelled once so every read returns the same shape. */
@@ -350,7 +367,7 @@ export class JobEventRepository {
       `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
          e.status, e.pr_url, e.summary, e.verdict, e.question_form, e.review_findings,
          e.action_items, e.design_snapshot,
-         e.created_at, j.project_id, j.feature_id, j.kind
+         e.created_at, j.project_id, j.feature_id, j.test_id, j.kind
        FROM job_events e
        INNER JOIN jobs j ON j.id = e.job_id
        WHERE e.id = $1`,
@@ -363,6 +380,7 @@ export class JobEventRepository {
       projectId: row.project_id,
       featureId: row.feature_id,
       jobKind: row.kind,
+      testId: row.test_id,
     };
   }
 

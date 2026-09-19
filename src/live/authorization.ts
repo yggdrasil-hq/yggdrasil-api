@@ -2,14 +2,15 @@ import { isUuid } from "../shared/uuid.js";
 import type { FeatureRepository } from "../features/repository.js";
 import type { JobRepository } from "../jobs/repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
+import type { TestRepository } from "../tests/repository.js";
 
 /**
- * Why a subscription was refused. Kept as three values for logging only — the
+ * Why a subscription was refused. Kept as four values for logging only — the
  * client is told "not found" for all of them, because distinguishing them would
- * leak whether a project, feature or session the caller cannot see exists
+ * leak whether a project, feature, session or test the caller cannot see exists
  * (ADR 019 item 3).
  */
-export type SubscriptionRefusal = "project" | "feature" | "session";
+export type SubscriptionRefusal = "project" | "feature" | "session" | "test";
 
 export type SubscriptionDecision = { ok: true } | { ok: false; reason: SubscriptionRefusal };
 
@@ -29,6 +30,17 @@ export interface DesignSessionSubscriptionRequest {
    * match that route's parameter, not because it is a different kind of value.
    */
   sessionId: string;
+}
+
+/** Issue #90: the Test-entity peer of `SubscriptionRequest`. */
+export interface TestSubscriptionRequest {
+  userId: string;
+  projectId: string;
+  /**
+   * The `tests` row id, matching `GET /projects/:projectId/tests/:testId/runs`.
+   * Not a job id — unlike the design-session case this is the resource's own id.
+   */
+  testId: string;
 }
 
 /**
@@ -124,6 +136,64 @@ export async function authorizeDesignSessionSubscription(
   const job = await deps.jobs.findByIdForProject(project.id, request.sessionId);
   if (!job || job.kind !== "design_grill") {
     return { ok: false, reason: "session" };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Decides whether a socket may receive a Test entity's run events (issue #90).
+ *
+ * Mirrors `GET /projects/:projectId/tests/:testId/runs` — `projects/routes.ts` —
+ * in the same order and with the same two conditions:
+ *
+ * ```ts
+ * const project = await getOwnedProject(req, req.params.projectId);   // findByIdForUser
+ * const test = await deps.tests.findById(project.id, testId);
+ * if (!test) 404
+ * ```
+ *
+ * This is the whole reason `test:<testId>` was chosen over `job:<jobId>`: there
+ * is a REST read to mirror, and mirroring it is a one-to-one translation. Two
+ * properties follow, and both are required rather than incidental:
+ *
+ * - **The project is resolved first, and the test inside it.** `findByIdForUser`
+ *   joins `organization_memberships` (ADR 016), and `tests.findById` scopes by
+ *   `project_id`, so another organization's test id is a refusal and not a leak.
+ *   This is the property `job:<jobId>` could not have offered: its natural check,
+ *   `findByIdForProject`, binds a job to a project *only*, which is looser than
+ *   both existing topics.
+ * - **No kind or existence check beyond the test itself.** The route tests only
+ *   that the test is in the project, so this does too. Adding "and the caller may
+ *   see some run of it" would make the socket stricter than the read it signals,
+ *   which ADR 019 item 7 calls out as its own failure: the page would look
+ *   subscribed while its events were refused, with nothing saying why.
+ *
+ * `testId` is validated as a uuid before the first query, matching the route's
+ * own parse of the path parameter — a malformed id is a refusal, not a query with
+ * a value Postgres would reject as an invalid uuid literal.
+ *
+ * Re-checked on every `subscribe_test` frame, never cached across frames: a
+ * socket that unsubscribes and resubscribes re-authorises, the same rule both
+ * other paths follow. Both refusals collapse to one client message, as both are
+ * a 404 there.
+ */
+export async function authorizeTestSubscription(
+  deps: { projects: ProjectRepository; tests: Pick<TestRepository, "findById"> },
+  request: TestSubscriptionRequest,
+): Promise<SubscriptionDecision> {
+  if (!isUuid(request.projectId) || !isUuid(request.testId)) {
+    return { ok: false, reason: "test" };
+  }
+
+  const project = await deps.projects.findByIdForUser(request.projectId, request.userId);
+  if (!project) {
+    return { ok: false, reason: "project" };
+  }
+
+  const test = await deps.tests.findById(project.id, request.testId);
+  if (!test) {
+    return { ok: false, reason: "test" };
   }
 
   return { ok: true };
