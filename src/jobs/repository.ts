@@ -134,8 +134,8 @@ export class JobRepository {
    * && totalBytes > ceiling` to detect the transition.
    *
    * `null` means the job does not exist, which is the same "nothing to relay"
-   * outcome a job with no feature produces (its `featureId` comes back null), so
-   * the caller handles both by returning.
+   * outcome a job carrying no scope produces (its scope resolves to null), so the
+   * caller handles both by returning.
    *
    * Both parameters are cast. `$2` appears twice — as an addend and as a
    * subtrahend — and without the casts Postgres has to deduce one type from a
@@ -146,9 +146,17 @@ export class JobRepository {
   async recordRelayedDeltaBytes(
     jobId: string,
     bytes: number,
-  ): Promise<{ featureId: string | null; totalBytes: number; previousBytes: number } | null> {
+  ): Promise<{
+    featureId: string | null;
+    testId: string | null;
+    jobKind: JobKind;
+    totalBytes: number;
+    previousBytes: number;
+  } | null> {
     const result = await this.db.query<{
       feature_id: string | null;
+      test_id: string | null;
+      kind: JobKind;
       total_bytes: string | number;
       previous_bytes: string | number;
     }>(
@@ -156,6 +164,8 @@ export class JobRepository {
        SET delta_bytes = delta_bytes + $2::bigint
        WHERE id = $1
        RETURNING feature_id,
+                 test_id,
+                 kind,
                  delta_bytes AS total_bytes,
                  (delta_bytes - $2::bigint) AS previous_bytes`,
       [jobId, bytes],
@@ -165,6 +175,14 @@ export class JobRepository {
     if (!row) return null;
     return {
       featureId: row.feature_id,
+      // ADR 033 §5 / issue #95: the delta path was feature-scoped end to end, which
+      // is why a job with no feature had its deltas dropped. Returning the same
+      // routing fields the stored-event path reads lets both go through one
+      // `liveScopeForJob`, so a streaming chunk and the event that supersedes it
+      // cannot land on different topics. One `RETURNING` already on this row, so
+      // this costs no extra query.
+      testId: row.test_id,
+      jobKind: row.kind,
       // pg returns bigint as a string to avoid precision loss above 2^53. These
       // are byte counts, so the conversion is safe by many orders of magnitude —
       // but it is done explicitly rather than left to `Number()` coercion

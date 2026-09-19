@@ -1,11 +1,12 @@
 import { isUuid } from "../shared/uuid.js";
 import type { JobEvent, JobEventActionItem } from "../jobs/events-repository.js";
+import type { JobKind } from "../jobs/types.js";
 
 /**
  * The wire protocol for the live job-event relay (ADR 019).
  *
  * The relay is a *change signal*, not a second source of truth: a frame says
- * "a job event was appended for this feature", and the Web app answers it by
+ * "a job event was appended for this scope", and the Web app answers it by
  * re-reading the existing REST endpoint. That is deliberate — derived state
  * (`features.awaiting_user_input`, the feature's own status, `jobs.last_error`)
  * is computed server-side and is not in the event, so duplicating that
@@ -19,8 +20,175 @@ import type { JobEvent, JobEventActionItem } from "../jobs/events-repository.js"
  * so a client can tell an older API apart from a protocol it understands —
  * the relay is additive and optional, so a mismatch should degrade to polling
  * rather than throw.
+ *
+ * **Version 2 is ADR 033, and it replaced version 1 rather than sitting beside
+ * it.** Version 1 named the scope in the frame (`job_event`,
+ * `design_session_event`, `subscribe_design`, …), so every new scope cost a new
+ * frame name and a second reader on both sides. Version 2 tags each frame with a
+ * `scope` value instead, which is why `subscribed`, `event` and `delta` here
+ * carry one and why there is no `job_event` any more.
+ *
+ * A version-1 client meeting this server sends `subscribe` with a `featureId` and
+ * no `scope`, which `parseClientFrame` refuses; the server answers
+ * `{type:"error"}`, and the Web client treats an `error` frame as terminal and
+ * falls back to its poll (see `web/lib/features/live-relay.ts`). That degradation
+ * is *proved by running*, not assumed — `scripts/verify-live-relay/verify.cjs`
+ * drives a version-1 frame at this socket, because a mismatched-protocol path is
+ * otherwise reached only during a bad upgrade window and would rot unexercised.
  */
-export const LIVE_PROTOCOL_VERSION = 1;
+export const LIVE_PROTOCOL_VERSION = 2;
+
+/**
+ * The kinds of thing a socket can subscribe to — **a closed union**, and the key
+ * of both registries below (ADR 033 §2).
+ *
+ * Closed rather than a caller-supplied string is the whole safety property. The
+ * thing a generalisation of this protocol must *not* become is a generic
+ * `(projectId, resourceId)` subscription: that is a **looser** gate than any REST
+ * route here, because each real route resolves its resource *inside* a project
+ * the caller is a member of (ADR 019 item 7). Keying the registries by an enum
+ * makes the looser shape unrepresentable — there is no branch that could accept
+ * an unknown kind, and adding one requires adding an entry to every registry,
+ * which is a visible edit rather than a silent widening.
+ */
+export type LiveScopeKind = "feature" | "design_session" | "test";
+
+/**
+ * The runtime list, and the one place the union is enumerated as a value.
+ *
+ * `Record<LiveScopeKind, …>` over the registry below is what makes the two
+ * stay in step: a kind added to the type without a topic builder fails to
+ * compile. This list exists for the *runtime* direction — validating an id from
+ * the wire cannot be done by the type system.
+ */
+export const LIVE_SCOPE_KINDS = ["feature", "design_session", "test"] as const;
+
+/**
+ * One subscription: what kind of thing, and which one.
+ *
+ * **The tag travels with the id, which is the point of ADR 033 §1.** The framing
+ * this replaces put a design session's job id into a field named `featureId` —
+ * which the old code refused to do, at the cost of a second frame name and a
+ * second reader on both sides. A reader that does not understand a kind now
+ * rejects the frame instead of misreading the id, and there is no field whose
+ * *name* claims a kind its contents might not have.
+ */
+export interface LiveScope {
+  kind: LiveScopeKind;
+  id: string;
+}
+
+export function isLiveScopeKind(value: unknown): value is LiveScopeKind {
+  return (
+    typeof value === "string" &&
+    (LIVE_SCOPE_KINDS as readonly string[]).includes(value)
+  );
+}
+
+/**
+ * Validates a scope off the wire, returning null for anything unrecognised.
+ *
+ * An unknown `kind` is refused rather than ignored, deliberately: a client that
+ * sends `job` (never a topic here) must not be answered with a subscription to
+ * some other topic, and a frame the server cannot interpret is a protocol error
+ * the client can act on. The id must be a uuid for the same reason the three
+ * per-scope ids were validated at this boundary before — so an authoriser never
+ * hands Postgres a string it will reject as an invalid uuid literal.
+ */
+export function parseLiveScope(value: unknown): LiveScope | null {
+  if (typeof value !== "object" || value === null) return null;
+  const candidate = value as Record<string, unknown>;
+  if (!isLiveScopeKind(candidate.kind)) return null;
+  if (typeof candidate.id !== "string" || !isUuid(candidate.id)) return null;
+  return { kind: candidate.kind, id: candidate.id };
+}
+
+/** Whether two scopes name the same subscription. */
+export function scopesEqual(a: LiveScope, b: LiveScope): boolean {
+  return a.kind === b.kind && a.id === b.id;
+}
+
+/**
+ * The relay's subscription topic for a scope — **the topic registry** (ADR 033
+ * §2), replacing `liveTopicForFeature` / `liveTopicForDesignSession` /
+ * `liveTopicForTest`.
+ *
+ * The hub treats a topic as an opaque string, so this is only the vocabulary that
+ * keeps two scopes from colliding. Each prefix is namespaced and none is a bare
+ * uuid, which is what makes that true.
+ *
+ * **Keyed by the closed union, so exhaustiveness is a compile error.** A `Record`
+ * over `LiveScopeKind` means adding a kind without deciding its topic does not
+ * build — which is the property that turns "a new scope is data" from a claim
+ * into something the compiler enforces. The suffix is not always the kind's name:
+ * `design_session`'s topic is `design:`, because that is the prefix issue #25
+ * shipped and a topic is a cross-process contract (the API's listener and, via
+ * the client, the page all agree on the string).
+ *
+ * **Two of the three ids are the resource; one is a job.** `feature:` takes a
+ * feature id and `test:` takes a `tests` row id — both are routing keys that name
+ * the surface. `design:` takes the *job* id, because a design session **is** a
+ * `design_grill` job (ADR 014) and that is how
+ * `GET /projects/:projectId/designs/:sessionId/events` resolves its
+ * `:sessionId`, so it is the value a client already holds from that read. The
+ * kind tag is what makes carrying two different kinds of id in one vocabulary
+ * safe.
+ */
+const LIVE_TOPIC_BY_KIND: Record<LiveScopeKind, (id: string) => string> = {
+  feature: (id) => `feature:${id}`,
+  design_session: (id) => `design:${id}`,
+  test: (id) => `test:${id}`,
+};
+
+export function liveTopicForScope(scope: LiveScope): string {
+  return LIVE_TOPIC_BY_KIND[scope.kind](scope.id);
+}
+
+/**
+ * The fields of a job row that decide which scope its events belong to.
+ *
+ * A structural input rather than `JobEventWithScope` or a `Job`, so that the
+ * *stored-event* path and the *delta* path can both use one function. That is the
+ * reason this exists at all: `relayEnvelopeFor` decides the topic of a stored
+ * event and `publishDelta` decides the topic of a streaming chunk, and if the two
+ * disagreed, half a message's text would reach a topic nobody is reading. One
+ * function means they cannot.
+ */
+export interface JobScopeFields {
+  /** The owning job's id. Needed because a design session's scope id *is* its job id. */
+  jobId: string;
+  featureId: string | null;
+  jobKind: JobKind;
+  testId: string | null;
+}
+
+/**
+ * Which scope a job's events belong to, or null when nothing reads them.
+ *
+ * **Ordering is the contract, not an implementation detail.** Feature is checked
+ * first and unconditionally, so a **feature-driven** `test_run` — one job with two
+ * surfaces, carrying both a `feature_id` and a `test_id` — keeps routing to
+ * `feature:` where it has always gone. The Test entity's page therefore gets no
+ * socket signal for feature-driven runs, only for scheduled ones; that is a
+ * pre-existing gap, filed as its own issue, and stated here because this is the
+ * function where a reader would otherwise have to infer it.
+ *
+ * **Null is a real answer.** A job with no feature, not a design session and no
+ * test — nothing produces one today — is dropped rather than guessed onto a topic,
+ * because inventing a topic nobody reads would be noise pretending to be a signal.
+ *
+ * **The design branch is keyed on the kind, unlike the other two.** A feature id
+ * and a test id each name a surface on their own, so the id's presence is the
+ * whole test. A design session's id alone does not say what it is — it is a job id,
+ * and a `feature_build` job id looks identical — so the kind is what makes it
+ * interpretable. That asymmetry is why this function takes the kind at all.
+ */
+export function liveScopeForJob(job: JobScopeFields): LiveScope | null {
+  if (job.featureId) return { kind: "feature", id: job.featureId };
+  if (job.jobKind === "design_grill") return { kind: "design_session", id: job.jobId };
+  if (job.testId) return { kind: "test", id: job.testId };
+  return null;
+}
 
 /**
  * Where the upgrade is served. A literal path, not a router mount: `ws`
@@ -96,57 +264,6 @@ export function toLiveJobEvent(event: JobEvent): LiveJobEvent {
 }
 
 /**
- * The relay's subscription topic for a feature. Namespaced rather than a bare
- * feature id so a second topic shape (a design session, say) cannot collide
- * with it — the hub itself treats a topic as an opaque string.
- */
-export function liveTopicForFeature(featureId: string): string {
-  return `feature:${featureId}`;
-}
-
-/**
- * The relay's subscription topic for a design session (issue #25).
- *
- * The sibling of `liveTopicForFeature` the comment above anticipated, and it is a
- * second *shape* rather than a second mechanism: the hub takes an opaque string,
- * so `design:` joining `feature:` is the whole change to the topic vocabulary.
- *
- * **The id is a job id.** A design session is a `design_grill` job (ADR 014), and
- * `GET /projects/:projectId/designs/:sessionId/events` resolves its `:sessionId` as
- * a job id — so this takes the same value a client already has from that REST read,
- * and no new identifier has to be threaded anywhere.
- */
-export function liveTopicForDesignSession(sessionId: string): string {
-  return `design:${sessionId}`;
-}
-
-/**
- * The relay's subscription topic for a Test entity (issue #90).
- *
- * The third topic shape, and the one that closes a hole rather than adding a
- * feature. A *scheduled* `test_run` is project-scoped: it carries a `test_id`
- * and no `feature_id`, so before this it fell into `relayEnvelopeFor`'s null
- * case and its events reached no socket at all. The standalone Testing product's
- * run-history page (`GET /projects/:projectId/tests/:testId/runs`) is the only
- * surface that can show such a run, so `test:` is the scope that page reads.
- *
- * **The id is a `tests` row id, not a job id** — the same kind of value
- * `liveTopicForFeature` takes, and unlike `liveTopicForDesignSession`, whose id
- * is a job id. That is why `relayEnvelopeFor` can key this branch on the id's
- * presence alone: `test_id` is a real routing key that names the resource,
- * whereas a design session's id would not say what it was without the kind.
- *
- * `job:<jobId>` was the alternative and was rejected on authorisation grounds
- * (#90's decision comment): it has no single REST equivalent to mirror, and its
- * natural check binds a job to a *project* only — weaker than the two existing
- * topics, each of which resolves its resource inside the project (ADR 019
- * item 7).
- */
-export function liveTopicForTest(testId: string): string {
-  return `test:${testId}`;
-}
-
-/**
  * `pg_notify`'s hard limit is 8000 bytes. A streaming chunk is a handful of
  * bytes, so this is not a real constraint on deltas — it is a guard so that a
  * pathological value (a bug upstream, or a non-streaming producer misusing the
@@ -167,17 +284,28 @@ export const LIVE_DELTA_MAX_PAYLOAD_BYTES = 7_000;
  * gap twice as wide as the one being fixed, and in the same direction (route
  * accepts, publisher drops).
  */
-const DELTA_PAYLOAD_PLACEHOLDER_FEATURE_ID = "00000000-0000-4000-8000-000000000000";
+const DELTA_PAYLOAD_PLACEHOLDER_SCOPE_ID = "00000000-0000-4000-8000-000000000000";
 const DELTA_PAYLOAD_PLACEHOLDER_JOB_ID = "00000000-0000-4000-8000-000000000000";
+/**
+ * The kind the measurement uses. `feature` because it is the shortest of the
+ * three (`design_session` is six bytes longer), so a payload measured with it is
+ * the *smallest* such envelope — and the bound has to hold for every kind, not
+ * the average one. Named rather than inlined so the reason is visible at the use
+ * site: using a longer kind here would make the measured size exceed the real one
+ * and refuse payloads that would have fitted.
+ */
+const DELTA_PAYLOAD_PLACEHOLDER_SCOPE_KIND: LiveScopeKind = "feature";
 
 /**
  * The exact serialised payload size a given text would produce (issue #78).
  *
  * Exported so the ingest route can bound the *real* thing rather than a proxy for
- * it. The route cannot use the real ids — it does not know the feature id until
+ * it. The route cannot use the real ids — it does not know the scope id until
  * after it has looked the job up, and it must decide before doing any work — but
  * it does not need them: uuids are fixed-width, so substituting same-shaped
- * placeholders gives a byte-identical envelope for any text.
+ * placeholders gives a byte-identical envelope for any text. The same holds for
+ * the scope's `kind`, except there the placeholder is an explicit *choice*: the
+ * shortest kind is used (see `DELTA_PAYLOAD_PLACEHOLDER_SCOPE_KIND`).
  *
  * This is deliberately the same `JSON.stringify` the publisher performs, with the
  * same field order, so the two cannot disagree. Anything that changed the payload
@@ -187,7 +315,10 @@ const DELTA_PAYLOAD_PLACEHOLDER_JOB_ID = "00000000-0000-4000-8000-000000000000";
 export function deltaPayloadBytes(text: string): number {
   return Buffer.byteLength(
     JSON.stringify({
-      featureId: DELTA_PAYLOAD_PLACEHOLDER_FEATURE_ID,
+      scope: {
+        kind: DELTA_PAYLOAD_PLACEHOLDER_SCOPE_KIND,
+        id: DELTA_PAYLOAD_PLACEHOLDER_SCOPE_ID,
+      },
       jobId: DELTA_PAYLOAD_PLACEHOLDER_JOB_ID,
       text,
     }),
@@ -206,11 +337,17 @@ export function deltaTextFitsPayload(text: string): boolean {
   return deltaPayloadBytes(text) <= LIVE_DELTA_MAX_PAYLOAD_BYTES;
 }
 
-
-
-/** The JSON shape `LIVE_JOB_EVENT_DELTAS_CHANNEL`'s payload carries. */
+/**
+ * The JSON shape `LIVE_JOB_EVENT_DELTAS_CHANNEL`'s payload carries.
+ *
+ * `scope` rather than `featureId` (ADR 033 §5): the delta path was feature-scoped
+ * end to end, which is why a design session's prose arrived per message instead of
+ * per token (issue #95). Carrying the scope is the change that makes it a
+ * first-class scope like any other — and it is the *only* change to this shape,
+ * since a second payload shape was the alternative and is what ADR 033 rejects.
+ */
 export interface LiveDeltaPayload {
-  featureId: string;
+  scope: LiveScope;
   jobId: string;
   text: string;
 }
@@ -223,7 +360,11 @@ export interface LiveDeltaPayload {
  * database — the same reason `relayEnvelopeFor` exists for stored events.
  */
 export function encodeDeltaPayload(delta: LiveDeltaPayload): string | null {
-  if (delta.text === "" || delta.featureId === "" || delta.jobId === "") return null;
+  if (delta.text === "" || delta.jobId === "") return null;
+  // Re-validated here rather than trusted from the caller: this function is the
+  // last point before the payload becomes an unparseable box on the wire, and a
+  // scope it cannot round-trip would be a delta delivered to no topic at all.
+  if (delta.scope.id === "" || !isLiveScopeKind(delta.scope.kind)) return null;
   const payload = JSON.stringify(delta);
   // Measured in bytes, not characters: the 8000-byte NOTIFY limit counts the
   // encoded bytes, and a multi-byte character costs more than one.
@@ -252,52 +393,44 @@ export function deltaFromPayload(
   if (typeof parsed !== "object" || parsed === null) return null;
 
   const delta = parsed as Record<string, unknown>;
-  if (typeof delta.featureId !== "string" || delta.featureId === "") return null;
+  const scope = parseLiveScope(delta.scope);
+  if (!scope) return null;
   if (typeof delta.jobId !== "string" || delta.jobId === "") return null;
   if (typeof delta.text !== "string" || delta.text === "") return null;
 
   return {
-    topic: liveTopicForFeature(delta.featureId),
-    frame: {
-      type: "job_event_delta",
-      featureId: delta.featureId,
-      jobId: delta.jobId,
-      text: delta.text,
-    },
+    topic: liveTopicForScope(scope),
+    // `jobId` is deliberately **not** on the frame (ADR 033 §1's table). The
+    // stored-event frame carries it because a reader matching a frame to a run
+    // needs it; a delta is text to append, and the authoritative `agent_text`
+    // that supersedes it carries the job. Keeping it in the payload is what
+    // matters — that is where the ceiling is counted and where a log line about a
+    // dropped delta finds its job.
+    frame: { type: "delta", scope, text: delta.text },
   };
 }
 
+/**
+ * The server's frame vocabulary (ADR 033 §1).
+ *
+ * Four frame names where version 1 had eleven: one subscribed/unsubscribed pair,
+ * one event/delta pair, and the two that were never scope-specific (`ready`,
+ * `error`, `pong`). Every scope-bearing frame carries a `scope`, so a reader knows
+ * what an id means from the frame itself rather than from its `type`.
+ *
+ * The `event` frame is one shape for all scopes, which is a real trade-off and
+ * worth stating: the per-scope frames existed partly to stop a feature reader
+ * acting on a design event, and that protection now rests on the scope tag —
+ * weaker at the *point of reading*, stronger at the point of writing, and enforced
+ * by the tag being a closed union. The client re-checks the scope against the
+ * subscription it made, so a mis-addressed frame is dropped rather than applied.
+ */
 export type ServerFrame =
   | { type: "ready"; protocolVersion: number }
-  | { type: "subscribed"; featureId: string }
-  | { type: "unsubscribed"; featureId: string }
-  /** Issue #25: the design-session peer of `subscribed`, naming a session rather than a feature. */
-  | { type: "subscribed_design"; sessionId: string }
-  | { type: "unsubscribed_design"; sessionId: string }
-  /** Issue #90: the Test-entity peer of `subscribed`, naming the `tests` row. */
-  | { type: "subscribed_test"; testId: string }
-  | { type: "unsubscribed_test"; testId: string }
-  | { type: "job_event"; featureId: string; jobId: string; event: LiveJobEvent }
-  /**
-   * Issue #25: a stored event for a design session.
-   *
-   * Its own type rather than a `job_event` carrying a session id in `featureId`,
-   * so the frame says which topic shape it arrived on. `sessionId` is also the job
-   * id — that is how the REST route resolves a session — so it is carried once and
-   * the event's own `jobId` is the same value.
-   */
-  | { type: "design_session_event"; sessionId: string; event: LiveJobEvent }
-  /**
-   * Issue #90: a stored event for a scheduled `test_run`.
-   *
-   * Distinct for the same reason `design_session_event` is: `job_event`'s only
-   * scope field is called `featureId`, and putting a `tests` row id in a field
-   * with that name would be a lie an over-eager reader could act on. The name
-   * also says which surface the frame belongs to, which is the thing a reader
-   * of a frame log needs to know.
-   */
-  | { type: "test_run_event"; testId: string; jobId: string; event: LiveJobEvent }
-  | { type: "job_event_delta"; featureId: string; jobId: string; text: string }
+  | { type: "subscribed"; scope: LiveScope }
+  | { type: "unsubscribed"; scope: LiveScope }
+  | { type: "event"; scope: LiveScope; event: LiveJobEvent }
+  | { type: "delta"; scope: LiveScope; text: string }
   | { type: "error"; message: string }
   | { type: "pong" };
 
@@ -319,7 +452,7 @@ export type ServerFrame =
 export const LIVE_JOB_EVENTS_CHANNEL = "job_events";
 
 /**
- * Payload: JSON `{featureId, jobId, text}` — self-contained, because a delta is
+ * Payload: JSON `{scope, jobId, text}` — self-contained, because a delta is
  * never stored and therefore cannot be read back. This is also why a delta must
  * not go directly to a single process's in-memory hub: every API replica's
  * listener has to see it so that sockets held by *any* replica receive it
@@ -329,41 +462,22 @@ export const LIVE_JOB_EVENTS_CHANNEL = "job_events";
 export const LIVE_JOB_EVENT_DELTAS_CHANNEL = "job_event_deltas";
 
 export type ClientFrame =
-  | { type: "subscribe"; projectId: string; featureId: string }
-  | { type: "unsubscribe"; featureId: string }
-  /**
-   * Issue #25: subscribe to a design session instead of a feature.
-   *
-   * A distinct frame type rather than an optional field on `subscribe`, and the
-   * reason is that the two carry a *different* resource with a *different*
-   * authorisation rule — a feature is resolved inside its project, a design
-   * session is a job resolved inside its project and then checked for kind. One
-   * frame with both fields would need a precedence rule ("featureId wins if
-   * present"), and a silent precedence rule in an authorisation path is exactly
-   * the kind of thing that is read wrong. Naming the two frames separately makes
-   * the parse unambiguous and each frame's authoriser the obvious one.
-   *
-   * `sessionId` matches the REST path parameter the client already holds
-   * (`/projects/:projectId/designs/:sessionId/events`).
-   */
-  | { type: "subscribe_design"; projectId: string; sessionId: string }
-  | { type: "unsubscribe_design"; sessionId: string }
-  /**
-   * Issue #90: subscribe to a Test entity's runs instead of a feature or a design
-   * session.
-   *
-   * A third frame type rather than an optional field on an existing one, for the
-   * reason the design frame gives: each carries a *different* resource with a
-   * *different* authorisation rule, and folding them together would need a
-   * precedence rule in an authorisation path — exactly the thing that is read
-   * wrong. Three shapes, three answers, no ambiguity about which authoriser ran.
-   *
-   * `testId` matches the REST path parameter the client already holds
-   * (`/projects/:projectId/tests/:testId/runs`).
-   */
-  | { type: "subscribe_test"; projectId: string; testId: string }
-  | { type: "unsubscribe_test"; testId: string }
+  | { type: "subscribe"; projectId: string; scope: LiveScope }
+  | { type: "unsubscribe"; scope: LiveScope }
   | { type: "ping" };
+
+/**
+ * The client's frame vocabulary (ADR 033 §1).
+ *
+ * Version 1 had six `subscribe`/`unsubscribe` frame names — two per scope — and the
+ * comment on the design ones argued for the separate names on the ground that each
+ * carried a different resource with a different authorisation rule, so folding them
+ * together would need a precedence rule in an authorisation path. That reasoning
+ * was sound about a *precedence rule* and is answered rather than overruled here:
+ * a `scope` is not a precedence rule, it is a discriminant with a closed domain, and
+ * the authorisation rule is selected by `kind` in its own registry (see
+ * `authorization.ts`) rather than by which field happens to be present.
+ */
 
 function isUuidValue(value: unknown): value is string {
   return typeof value === "string" && isUuid(value);
@@ -392,28 +506,14 @@ export function parseClientFrame(raw: string): ClientFrame | null {
     return { type: "ping" };
   }
   if (frame.type === "subscribe") {
-    if (!isUuidValue(frame.projectId) || !isUuidValue(frame.featureId)) return null;
-    return { type: "subscribe", projectId: frame.projectId, featureId: frame.featureId };
+    const scope = parseLiveScope(frame.scope);
+    if (!isUuidValue(frame.projectId) || !scope) return null;
+    return { type: "subscribe", projectId: frame.projectId, scope };
   }
   if (frame.type === "unsubscribe") {
-    if (!isUuidValue(frame.featureId)) return null;
-    return { type: "unsubscribe", featureId: frame.featureId };
-  }
-  if (frame.type === "subscribe_design") {
-    if (!isUuidValue(frame.projectId) || !isUuidValue(frame.sessionId)) return null;
-    return { type: "subscribe_design", projectId: frame.projectId, sessionId: frame.sessionId };
-  }
-  if (frame.type === "unsubscribe_design") {
-    if (!isUuidValue(frame.sessionId)) return null;
-    return { type: "unsubscribe_design", sessionId: frame.sessionId };
-  }
-  if (frame.type === "subscribe_test") {
-    if (!isUuidValue(frame.projectId) || !isUuidValue(frame.testId)) return null;
-    return { type: "subscribe_test", projectId: frame.projectId, testId: frame.testId };
-  }
-  if (frame.type === "unsubscribe_test") {
-    if (!isUuidValue(frame.testId)) return null;
-    return { type: "unsubscribe_test", testId: frame.testId };
+    const scope = parseLiveScope(frame.scope);
+    if (!scope) return null;
+    return { type: "unsubscribe", scope };
   }
   return null;
 }

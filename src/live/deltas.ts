@@ -1,5 +1,5 @@
 import type { Queryable } from "../db/pool.js";
-import { encodeDeltaPayload, LIVE_JOB_EVENT_DELTAS_CHANNEL } from "./types.js";
+import { encodeDeltaPayload, LIVE_JOB_EVENT_DELTAS_CHANNEL, type LiveScope } from "./types.js";
 
 /**
  * The API's write side for streaming text deltas (ADR 019 item 13).
@@ -16,7 +16,7 @@ export interface LivePublisher {
    * still arrives over the persisted path (see `EventAgentTextDelta` in
    * `orchestrator/internal/rpc/curated.go`).
    */
-  publishDelta(delta: { featureId: string; jobId: string; text: string }): Promise<void>;
+  publishDelta(delta: { scope: LiveScope; jobId: string; text: string }): Promise<void>;
 }
 
 /** Used when the relay is disabled, and as the default in tests. */
@@ -54,7 +54,7 @@ export class PostgresDeltaPublisher implements LivePublisher {
     private readonly options: DeltaPublisherOptions = {},
   ) {}
 
-  async publishDelta(delta: { featureId: string; jobId: string; text: string }): Promise<void> {
+  async publishDelta(delta: { scope: LiveScope; jobId: string; text: string }): Promise<void> {
     const payload = encodeDeltaPayload(delta);
     if (payload === null) {
       // Either an empty field or an oversize payload. Both are bugs rather than

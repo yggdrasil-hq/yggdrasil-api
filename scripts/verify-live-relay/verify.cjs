@@ -41,11 +41,21 @@ async function waitFor(frames, predicate, timeoutMs) {
 }
 
 /**
+ * The two scopes these checks subscribe to, in ADR 033 §1's shape.
+ *
+ * `design_session`'s id is the **job** id, not a feature id: a design session is a
+ * `design_grill` job, and the REST route resolves its `:sessionId` that way.
+ */
+const FEATURE_SCOPE = { kind: "feature", id: FEATURE_ID };
+const DESIGN_SCOPE = { kind: "design_session", id: DESIGN_JOB_ID };
+
+/**
  * Subscribes, returning the socket and its frames.
  *
- * `target` selects which frame to send, because the two carry different resources
- * with different authorisation rules (issue #25). Defaulted to the feature so the
- * existing calls read unchanged.
+ * `target` selects the scope to send, because the three carry different resources with
+ * different authorisation rules. One frame shape serves all three now (ADR 033 §1), so
+ * this is the scope that varies rather than the frame name. Defaulted to the feature so
+ * the existing calls read unchanged.
  */
 async function subscribe(wsUrl, target = { type: "feature", id: FEATURE_ID }) {
   const frames = [];
@@ -75,17 +85,21 @@ async function subscribe(wsUrl, target = { type: "feature", id: FEATURE_ID }) {
   // app happens to wait for `ready`, which is why this has never surfaced.
   const ready = await waitFor(frames, (f) => f.type === "ready", 15000);
   if (!ready) throw new Error("no `ready` frame on " + wsUrl + "; frames=" + JSON.stringify(frames));
-  const subscribeFrame =
+  const scope =
     target.type === "design"
-      ? { type: "subscribe_design", projectId: PROJECT_ID, sessionId: target.id }
-      : { type: "subscribe", projectId: PROJECT_ID, featureId: target.id };
-  ws.send(JSON.stringify(subscribeFrame));
+      ? { kind: "design_session", id: target.id }
+      : { kind: "feature", id: target.id };
+  ws.send(JSON.stringify({ type: "subscribe", projectId: PROJECT_ID, scope }));
+  // The confirmation is one frame name carrying the scope, so it is matched on the
+  // *scope* rather than on a per-scope frame name — the check is what stops a
+  // confirmation for some other resource being read as this subscription's.
   const first = await waitFor(
     frames,
-    (f) => f.type === "subscribed" || f.type === "subscribed_design" || f.type === "error",
+    (f) =>
+      (f.type === "subscribed" && sameScope(f.scope, scope)) || f.type === "error",
     15000,
   );
-  if (!first || (first.type !== "subscribed" && first.type !== "subscribed_design")) {
+  if (!first || first.type !== "subscribed") {
     throw new Error(
       "subscribe refused on " + wsUrl +
       ": firstFrame=" + JSON.stringify(first) +
@@ -94,6 +108,16 @@ async function subscribe(wsUrl, target = { type: "feature", id: FEATURE_ID }) {
     );
   }
   return { ws, frames };
+}
+
+/** Whether a frame's `scope` field names exactly `scope`. */
+function sameScope(frameScope, scope) {
+  return (
+    typeof frameScope === "object" &&
+    frameScope !== null &&
+    frameScope.kind === scope.kind &&
+    frameScope.id === scope.id
+  );
 }
 
 async function postEvent(baseUrl, body, jobId = JOB_ID) {
@@ -113,7 +137,11 @@ async function storedEventCrossProcess({ name, wsUrl, writeUrl }) {
     const text = nextMarker();
     const { status } = await postEvent(writeUrl, { type: "agent_text", message: text });
     if (status !== 201) { record(name, false, "event write returned " + status); return; }
-    const frame = await waitFor(frames, (f) => f.type === "job_event" && f.event && f.event.message === text, 15000);
+    const frame = await waitFor(
+      frames,
+      (f) => f.type === "event" && sameScope(f.scope, FEATURE_SCOPE) && f.event && f.event.message === text,
+      15000,
+    );
     record(name, Boolean(frame),
       frame ? "delivered (socket=" + host(wsUrl) + ", write=" + host(writeUrl) + ")"
             : "NOT delivered within 15s (socket=" + host(wsUrl) + ", write=" + host(writeUrl) + ")");
@@ -127,9 +155,11 @@ async function storedEventCrossProcess({ name, wsUrl, writeUrl }) {
  * same load-bearing claim #32 measured for the feature topic — and the one that
  * matters for a *new* topic, because a routing mistake here is invisible to a
  * single-process test by construction. The frame type asserted is
- * `design_session_event`, not `job_event`, so this also pins that the two topic
- * families produce different frames rather than the design one borrowing the
- * feature frame and putting a session id in `featureId`.
+ * the *scope*, not the frame name, so this pins that the two topic families produce
+ * differently-scoped frames rather than the design one borrowing the feature scope and
+ * putting a session id where a feature id belongs. Under ADR 033 §1 that distinction
+ * lives in the tag rather than in the frame's name — which is exactly why it needs
+ * asserting, since there is no longer a type difference to catch it.
  */
 async function designSessionCrossProcess({ name, wsUrl, writeUrl }) {
   const { ws, frames } = await subscribe(wsUrl, { type: "design", id: DESIGN_JOB_ID });
@@ -151,8 +181,8 @@ async function designSessionCrossProcess({ name, wsUrl, writeUrl }) {
     const frame = await waitFor(
       frames,
       (f) =>
-        f.type === "design_session_event" &&
-        f.sessionId === DESIGN_JOB_ID &&
+        f.type === "event" &&
+        sameScope(f.scope, DESIGN_SCOPE) &&
         f.event &&
         f.event.snapshot &&
         String(f.event.snapshot["index.html"] || "").includes(marker),
@@ -191,10 +221,7 @@ async function featureEventStaysOffTheDesignTopic({ name, wsUrl, writeUrl }) {
     // than a race the assertion happened to win.
     await new Promise((resolve) => setTimeout(resolve, 3000));
     const leaked = frames.some(
-      (f) =>
-        (f.type === "job_event" || f.type === "design_session_event") &&
-        f.event &&
-        f.event.message === marker,
+      (f) => f.type === "event" && f.event && f.event.message === marker,
     );
     record(
       name,
@@ -204,12 +231,134 @@ async function featureEventStaysOffTheDesignTopic({ name, wsUrl, writeUrl }) {
   } finally { ws.close(); }
 }
 
+/**
+ * ADR 033 §4: a version-1 client meeting a version-2 server must end up **polling,
+ * not dead** — proved over a real WebSocket, which is what the ADR makes a condition of
+ * replacing version 1 rather than keeping it alongside.
+ *
+ * **Why this is a condition and not a claim.** The degradation is the whole argument for
+ * removing version-1's frames instead of maintaining two parsers: the only client ships
+ * in the same image as the server, so a compatibility window would protect a client that
+ * cannot exist. That argument rests on the mismatch path behaving — and a
+ * mismatched-protocol path is reached *only* during a bad upgrade window, which is
+ * precisely the path that never gets exercised and quietly rots. So it is exercised
+ * here, on every run of this harness, rather than reasoned about in a comment.
+ *
+ * The check has three parts, and all three are needed:
+ *
+ *  1. `ready` announces **version 2**, so the version number matches the wire — the
+ *     lever the whole decision uses, and the one thing a client can compare.
+ *  2. A version-1 frame is answered with an `error` frame naming it as unrecognised.
+ *     This is the frame `web/lib/features/live-relay.ts` treats as **terminal**: it
+ *     calls `stop()` and leaves the socket closed, so the page falls back to its own
+ *     fast poll. That is "polling rather than dead".
+ *  3. The socket is left **open and unsubscribed**, not closed. A server that closed it
+ *     with a retryable code would send a client into its reconnect backoff — ten
+ *     attempts over a minute — which is the *dead-ish* outcome this is checking against.
+ *
+ * And a positive control, without which part 3 would pass for a socket that is inert for
+ * some unrelated reason: the same connection then sends the version-2 frame, is
+ * confirmed, and receives a published event.
+ *
+ * The client half of the pairing — that those two frames leave the real client on its
+ * poll rather than live — is asserted against the real client in
+ * `web/src/features/live-relay.test.ts`, using the frame sequence recorded from here.
+ */
+async function version1ClientDegradesToPolling({ name, wsUrl, writeUrl }) {
+  const frames = [];
+  let closeInfo = null;
+  const ws = new WebSocket(wsUrl, { headers: { Cookie: COOKIE } });
+  ws.on("message", (data) => {
+    try { frames.push(JSON.parse(data.toString())); }
+    catch { frames.push({ type: "<unparseable>", raw: data.toString() }); }
+  });
+  ws.on("close", (code, reason) => { closeInfo = { code, reason: reason && reason.toString() }; });
+  ws.on("error", (e) => { closeInfo = { error: e.message }; });
+
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("timed out opening " + wsUrl)), 15000);
+      ws.once("open", () => { clearTimeout(timer); resolve(); });
+      ws.once("error", (e) => { clearTimeout(timer); reject(new Error("socket error on " + wsUrl + ": " + e.message)); });
+    });
+
+    const ready = await waitFor(frames, (f) => f.type === "ready", 15000);
+    if (!ready) { record(name, false, "no `ready` frame on " + wsUrl); return; }
+    if (ready.protocolVersion !== 2) {
+      record(name, false, "`ready` announced protocolVersion " + ready.protocolVersion + ", not 2");
+      return;
+    }
+
+    // Version 1's frame, byte for byte: the scope named by the frame *type* and a bare
+    // `featureId` where a scope belongs.
+    ws.send(JSON.stringify({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID }));
+
+    const error = await waitFor(frames, (f) => f.type === "error", 15000);
+    if (!error) {
+      record(name, false, "a version-1 subscribe frame produced no error frame; frames=" + JSON.stringify(frames));
+      return;
+    }
+
+    // Part 3: inert but alive, not closed. Give the server a moment to close it if it
+    // were going to, then publish and confirm nothing arrives.
+    const text = nextMarker();
+    const { status } = await postEvent(writeUrl, { type: "agent_text", message: text });
+    if (status !== 201) { record(name, false, "event write returned " + status); return; }
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    const delivered = frames.some((f) => f.type === "event" && f.event && f.event.message === text);
+    const stillOpen = ws.readyState === ws.OPEN;
+
+    // Positive control: the same socket speaks version 2 and works.
+    ws.send(JSON.stringify({ type: "subscribe", projectId: PROJECT_ID, scope: FEATURE_SCOPE }));
+    const confirmed = await waitFor(
+      frames,
+      (f) => f.type === "subscribed" && sameScope(f.scope, FEATURE_SCOPE),
+      15000,
+    );
+    const controlText = nextMarker();
+    await postEvent(writeUrl, { type: "agent_text", message: controlText });
+    const controlFrame = await waitFor(
+      frames,
+      (f) => f.type === "event" && f.event && f.event.message === controlText,
+      15000,
+    );
+
+    const ok =
+      !delivered &&
+      stillOpen &&
+      Boolean(confirmed) &&
+      Boolean(controlFrame) &&
+      !closeInfo;
+
+    record(
+      name,
+      ok,
+      ok
+        ? "ready=v2, v1 frame refused with error (" + JSON.stringify(error.message) + "), " +
+          "nothing delivered while unsubscribed, socket still open, and the same socket " +
+          "subscribed and delivered under version 2"
+        : "deliveredWhileUnsubscribed=" + delivered +
+          " stillOpen=" + stillOpen +
+          " confirmedUnderV2=" + Boolean(confirmed) +
+          " controlDelivered=" + Boolean(controlFrame) +
+          " close=" + JSON.stringify(closeInfo),
+    );
+  } finally {
+    ws.close();
+  }
+}
+
 async function deltaCrossProcess({ name, wsUrl, writeUrl, message, expectDelivery }) {
   const { ws, frames } = await subscribe(wsUrl);
   try {
     const text = message || nextMarker();
     const { status } = await postEvent(writeUrl, { type: "agent_text_delta", message: text });
-    const frame = await waitFor(frames, (f) => f.type === "job_event_delta" && f.text === text, 8000);
+    const frame = await waitFor(
+      frames,
+      (f) => f.type === "delta" && sameScope(f.scope, FEATURE_SCOPE) && f.text === text,
+      8000,
+    );
     if (expectDelivery) {
       record(name, Boolean(frame), frame ? "delivered (write=" + host(writeUrl) + ")" : "NOT delivered (write=" + host(writeUrl) + ")");
     } else {
@@ -248,6 +397,13 @@ async function main() {
     if (!(await waitHealthy(n, u, path))) { summary(); return; }
   }
   record("readiness: both replicas and nginx", true, "all answered /health");
+
+  // ADR 033 §4's condition, first because it is the one check here whose failure mode is
+  // "nobody ever runs this path".
+  await version1ClientDegradesToPolling({
+    name: "version-1 client: refused as unrecognised, left subscribed to nothing, and still usable under version 2",
+    wsUrl: WS_A, writeUrl: API_B,
+  });
 
   // Control: without this, a cross-process success could be explained by
   // something other than the fan-out.
@@ -334,7 +490,11 @@ async function main() {
       const pong = await waitFor(frames, (f) => f.type === "pong", 10000);
       const text = nextMarker();
       await postEvent(NGINX_API, { type: "agent_text", message: text });
-      const frame = await waitFor(frames, (f) => f.type === "job_event" && f.event && f.event.message === text, 15000);
+      const frame = await waitFor(
+      frames,
+      (f) => f.type === "event" && sameScope(f.scope, FEATURE_SCOPE) && f.event && f.event.message === text,
+      15000,
+    );
       record("idle " + IDLE_SECONDS + "s through nginx (default read_timeout is 60s), then delivered",
         Boolean(pong) && Boolean(frame),
         pong && frame ? "survived " + Math.round((Date.now() - started) / 1000) + "s idle and still delivered"

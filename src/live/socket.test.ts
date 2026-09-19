@@ -11,8 +11,9 @@ import {
   LIVE_CLOSE_UNAUTHORIZED,
   LIVE_PROTOCOL_VERSION,
   LIVE_SOCKET_PATH,
+  scopesEqual,
 } from "./types.js";
-import type { ServerFrame } from "./types.js";
+import type { LiveScope, ServerFrame } from "./types.js";
 
 const USER_ID = "11111111-1111-4111-8111-111111111111";
 const OTHER_USER_ID = "55555555-5555-4555-8555-555555555555";
@@ -181,9 +182,43 @@ function connect(port: number, cookie?: string): Client {
 async function subscribedClient(port: number): Promise<Client> {
   const client = connect(port, GOOD_COOKIE);
   await waitFor(() => client.frames.length > 0, "ready");
-  client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
-  await waitFor(() => client.frames.some((frame) => frame.type === "subscribed"), "subscribed");
+  client.send(subscribeFrame(featureScope));
+  await waitFor(() => client.frames.some(isSubscribedTo(featureScope)), "subscribed");
   return client;
+}
+
+/*
+ * ADR 033 §1: one frame shape per direction, with the scope as a value. These three
+ * scopes are the fixture resources above, and the helpers below are how the
+ * assertions stay scope-aware — without them, `frame.type === "subscribed"` would
+ * pass for *any* accepted subscription, which is exactly the conflation the tagged
+ * scope exists to prevent.
+ */
+const featureScope: LiveScope = { kind: "feature", id: FEATURE_ID };
+const designScope: LiveScope = { kind: "design_session", id: SESSION_ID };
+const testScope: LiveScope = { kind: "test", id: TEST_ID };
+
+/** A client subscribe frame for a scope, in the one shape the protocol has. */
+function subscribeFrame(scope: LiveScope): Record<string, unknown> {
+  return { type: "subscribe", projectId: PROJECT_ID, scope };
+}
+
+/** Whether a frame confirms a subscription to *this* scope. */
+function isSubscribedTo(scope: LiveScope) {
+  return (frame: ServerFrame): boolean =>
+    frame.type === "subscribed" && scopesEqual(frame.scope, scope);
+}
+
+/** Whether a frame confirms the *removal* of a subscription to this scope. */
+function isUnsubscribedFrom(scope: LiveScope) {
+  return (frame: ServerFrame): boolean =>
+    frame.type === "unsubscribed" && scopesEqual(frame.scope, scope);
+}
+
+/** Whether a frame carries an event for this scope. */
+function isEventFor(scope: LiveScope) {
+  return (frame: ServerFrame): boolean =>
+    frame.type === "event" && scopesEqual(frame.scope, scope);
 }
 
 async function waitFor(predicate: () => boolean, label: string): Promise<void> {
@@ -200,11 +235,17 @@ async function settle(client: Client): Promise<ServerFrame[]> {
   return client.frames;
 }
 
-/** Issue #25: the design-session peer of `jobEventFrame`. */
+/**
+ * A stored event for the design-session scope.
+ *
+ * The scope's id is the session id, which is also the job id — that is how the REST
+ * route resolves a session — so `event.jobId` and `scope.id` are the same value
+ * here, and the frame carries it once.
+ */
 function designSessionFrame(): ServerFrame {
   return {
-    type: "design_session_event",
-    sessionId: SESSION_ID,
+    type: "event",
+    scope: designScope,
     event: {
       id: "design_event_1",
       jobId: SESSION_ID,
@@ -224,9 +265,8 @@ function designSessionFrame(): ServerFrame {
 
 function jobEventFrame(): ServerFrame {
   return {
-    type: "job_event",
-    featureId: FEATURE_ID,
-    jobId: "job_1",
+    type: "event",
+    scope: featureScope,
     event: {
       id: "event_1",
       jobId: "job_1",
@@ -252,9 +292,8 @@ function jobEventFrame(): ServerFrame {
  */
 function testRunFrame(): ServerFrame {
   return {
-    type: "test_run_event",
-    testId: TEST_ID,
-    jobId: "job_run_1",
+    type: "event",
+    scope: testScope,
     event: {
       id: "test_event_1",
       jobId: "job_run_1",
@@ -320,7 +359,7 @@ describe("live socket: subscription authorisation", () => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
 
-      client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+      client.send(subscribeFrame(featureScope));
       await waitFor(
         () => client.frames.some((frame) => frame.type === "subscribed"),
         "subscribed",
@@ -340,7 +379,7 @@ describe("live socket: subscription authorisation", () => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
 
-      client.send({ type: "subscribe", projectId: OTHER_PROJECT_ID, featureId: FEATURE_ID });
+      client.send({ type: "subscribe", projectId: OTHER_PROJECT_ID, scope: featureScope });
       await waitFor(
         () => client.frames.some((frame) => frame.type === "error"),
         "refusal",
@@ -353,7 +392,7 @@ describe("live socket: subscription authorisation", () => {
       // And the crucial half: publishing to that feature reaches nobody.
       expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(0);
       const afterPublish = await settle(client);
-      expect(afterPublish.some((frame) => frame.type === "job_event")).toBe(false);
+      expect(afterPublish.some(isEventFor(featureScope))).toBe(false);
     });
   });
 
@@ -376,7 +415,7 @@ describe("live socket: subscription authorisation", () => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
 
-      client.send({ type: "subscribe", projectId: "nope", featureId: FEATURE_ID });
+      client.send({ type: "subscribe", projectId: "nope", scope: featureScope });
       await waitFor(() => client.frames.some((frame) => frame.type === "error"), "error");
 
       expect(client.closed()).toBeNull();
@@ -393,18 +432,23 @@ describe("live socket: subscription authorisation", () => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
 
-      client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+      client.send(subscribeFrame(featureScope));
       await waitFor(() => client.frames.some((frame) => frame.type === "subscribed"), "subscribed");
 
-      const laterRun = jobEventFrame();
+      const laterRun = jobEventFrame() as Extract<ServerFrame, { type: "event" }>;
       hub.publish(`feature:${FEATURE_ID}`, {
-        ...(laterRun as Extract<ServerFrame, { type: "job_event" }>),
-        jobId: "job_2",
-        event: { ...(laterRun as Extract<ServerFrame, { type: "job_event" }>).event, jobId: "job_2" },
+        ...laterRun,
+        event: { ...laterRun.event, jobId: "job_2" },
       });
 
       const frames = await settle(client);
-      expect(frames).toContainEqual(expect.objectContaining({ type: "job_event", jobId: "job_2" }));
+      expect(frames).toContainEqual(
+        expect.objectContaining({
+          type: "event",
+          scope: featureScope,
+          event: expect.objectContaining({ jobId: "job_2" }),
+        }),
+      );
     });
   });
 });
@@ -425,10 +469,10 @@ describe("live socket: connection lifecycle", () => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
 
-      client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+      client.send(subscribeFrame(featureScope));
       await waitFor(() => client.frames.some((frame) => frame.type === "subscribed"), "subscribed");
 
-      client.send({ type: "unsubscribe", featureId: FEATURE_ID });
+      client.send({ type: "unsubscribe", scope: featureScope });
       await waitFor(
         () => client.frames.some((frame) => frame.type === "unsubscribed"),
         "unsubscribed",
@@ -436,7 +480,7 @@ describe("live socket: connection lifecycle", () => {
 
       expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(0);
       const frames = await settle(client);
-      expect(frames.some((frame) => frame.type === "job_event")).toBe(false);
+      expect(frames.some(isEventFor(featureScope))).toBe(false);
     });
   });
 
@@ -447,7 +491,7 @@ describe("live socket: connection lifecycle", () => {
       await waitFor(() => first.frames.length > 0 && second.frames.length > 0, "ready");
 
       for (const client of [first, second]) {
-        client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+        client.send(subscribeFrame(featureScope));
       }
       await waitFor(() => first.frames.some((f) => f.type === "subscribed"), "subscribed");
       await waitFor(() => second.frames.some((f) => f.type === "subscribed"), "subscribed");
@@ -457,7 +501,7 @@ describe("live socket: connection lifecycle", () => {
       await waitFor(() => hub.subscriberCount(`feature:${FEATURE_ID}`) === 1, "one subscriber");
       expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(1);
       const secondFrames = await settle(second);
-      expect(secondFrames.some((frame) => frame.type === "job_event")).toBe(true);
+      expect(secondFrames.some(isEventFor(featureScope))).toBe(true);
     });
   });
 
@@ -465,7 +509,7 @@ describe("live socket: connection lifecycle", () => {
     await withRelay(async ({ port, hub }) => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
-      client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+      client.send(subscribeFrame(featureScope));
       await waitFor(() => hub.subscriberCount(`feature:${FEATURE_ID}`) === 1, "subscribed");
 
       client.socket.close();
@@ -512,7 +556,7 @@ describe("live socket: connection identity", () => {
       await waitFor(() => first.frames.length > 0 && second.frames.length > 0, "ready");
 
       for (const client of [first, second]) {
-        client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+        client.send(subscribeFrame(featureScope));
       }
       await waitFor(() => hub.subscriberCount(`feature:${FEATURE_ID}`) === 2, "both");
 
@@ -530,7 +574,7 @@ describe("live socket: connection identity", () => {
       await waitFor(() => client.frames.length > 0, "ready");
       expect(client.frames[0]).toEqual({ type: "ready", protocolVersion: LIVE_PROTOCOL_VERSION });
 
-      client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+      client.send(subscribeFrame(featureScope));
       await waitFor(() => client.frames.some((frame) => frame.type === "error"), "refusal");
 
       const frames = await settle(client);
@@ -554,16 +598,16 @@ describe("live socket: connection identity", () => {
 describe("live socket: design-session subscriptions (issue #25)", () => {
   /**
    * Subscribes to the fixture design session over a real socket. Two frames pass
-   * through the budget before this resolves (`ready` and `subscribed_design`),
+   * through the budget before this resolves (`ready` and `subscribed`),
    * which the frame-budget block below accounts for separately.
    */
   async function designClient(port: number, sessionId = SESSION_ID): Promise<Client> {
     const client = connect(port, GOOD_COOKIE);
     await waitFor(() => client.frames.length > 0, "ready");
-    client.send({ type: "subscribe_design", projectId: PROJECT_ID, sessionId });
+    client.send({ type: "subscribe", projectId: PROJECT_ID, scope: { kind: "design_session", id: sessionId } });
     await waitFor(
-      () => client.frames.some((frame) => frame.type === "subscribed_design" || frame.type === "error"),
-      "subscribed_design or refusal",
+      () => client.frames.some((frame) => isSubscribedTo(designScope)(frame) || frame.type === "error"),
+      "subscribed or refusal",
     );
     return client;
   }
@@ -575,7 +619,7 @@ describe("live socket: design-session subscriptions (issue #25)", () => {
     await withRelay(async ({ port, hub }) => {
       const client = await designClient(port);
 
-      expect(client.frames).toContainEqual({ type: "subscribed_design", sessionId: SESSION_ID });
+      expect(client.frames).toContainEqual({ type: "subscribed", scope: designScope });
       expect(hub.publish(`design:${SESSION_ID}`, designSessionFrame())).toBe(1);
 
       const frames = await settle(client);
@@ -586,17 +630,17 @@ describe("live socket: design-session subscriptions (issue #25)", () => {
   it("leaves the design subscription when asked, and then delivers nothing", async () => {
     await withRelay(async ({ port, hub }) => {
       const client = await designClient(port);
-      client.send({ type: "unsubscribe_design", sessionId: SESSION_ID });
+      client.send({ type: "unsubscribe", scope: designScope });
       await waitFor(
-        () => client.frames.some((frame) => frame.type === "unsubscribed_design"),
-        "unsubscribed_design",
+        () => client.frames.some(isUnsubscribedFrom(designScope)),
+        "unsubscribed for the design scope",
       );
 
       // The half that makes unsubscribing mean something: the hub no longer counts
       // this connection, so the event goes nowhere.
       expect(hub.publish(`design:${SESSION_ID}`, designSessionFrame())).toBe(0);
       const frames = await settle(client);
-      expect(frames.some((frame) => frame.type === "design_session_event")).toBe(false);
+      expect(frames.some(isEventFor(designScope))).toBe(false);
     });
   });
 
@@ -604,7 +648,7 @@ describe("live socket: design-session subscriptions (issue #25)", () => {
     await withRelay(async ({ port, hub }) => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
-      client.send({ type: "subscribe_design", projectId: OTHER_PROJECT_ID, sessionId: SESSION_ID });
+      client.send({ type: "subscribe", projectId: OTHER_PROJECT_ID, scope: designScope });
       await waitFor(() => client.frames.some((frame) => frame.type === "error"), "refusal");
 
       expect(client.frames).toContainEqual({
@@ -626,7 +670,7 @@ describe("live socket: design-session subscriptions (issue #25)", () => {
         type: "error",
         message: "Design session not found",
       });
-      expect(client.frames.some((frame) => frame.type === "subscribed_design")).toBe(false);
+      expect(client.frames.some(isSubscribedTo(designScope))).toBe(false);
       expect(hub.publish(`design:${NON_DESIGN_JOB_ID}`, designSessionFrame())).toBe(0);
     });
   });
@@ -652,12 +696,12 @@ describe("live socket: design-session subscriptions (issue #25)", () => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
 
-      client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+      client.send(subscribeFrame(featureScope));
       await waitFor(() => client.frames.some((frame) => frame.type === "subscribed"), "subscribed");
-      client.send({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: SESSION_ID });
+      client.send(subscribeFrame(designScope));
       await waitFor(
-        () => client.frames.some((frame) => frame.type === "subscribed_design"),
-        "subscribed_design",
+        () => client.frames.some(isSubscribedTo(designScope)),
+        "subscribed for the design scope",
       );
 
       expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(1);
@@ -686,7 +730,7 @@ describe("live socket: design-session subscriptions (issue #25)", () => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
 
-      client.send({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: "not-a-uuid" });
+      client.send({ type: "subscribe", projectId: PROJECT_ID, scope: { kind: "design_session", id: "not-a-uuid" } });
       await waitFor(
         () => client.frames.some((frame) => frame.type === "error"),
         "first protocol error",
@@ -694,9 +738,9 @@ describe("live socket: design-session subscriptions (issue #25)", () => {
 
       const frames = await settle(client);
       expect(frames).toContainEqual({ type: "error", message: "Unrecognised frame" });
-      // Not a `subscribed_design`, and no refusal message of its own — the frame
+      // Not a `subscribed` for this scope, and no refusal message of its own — the frame
       // never became a subscription request at all.
-      expect(frames.some((frame) => frame.type === "subscribed_design")).toBe(false);
+      expect(frames.some(isSubscribedTo(designScope))).toBe(false);
       expect(frames.some((frame) => frame.type === "error" && "message" in frame && frame.message === "Design session not found")).toBe(false);
 
       // And it is a real protocol error: reaching the connection's budget closes
@@ -705,7 +749,7 @@ describe("live socket: design-session subscriptions (issue #25)", () => {
       // asserting — my first version hard-coded three and timed out, because the
       // budget is five.
       for (let sent = 1; sent < LIVE_MAX_PROTOCOL_ERRORS; sent += 1) {
-        client.send({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: "still-not-a-uuid" });
+        client.send({ type: "subscribe", projectId: PROJECT_ID, scope: { kind: "design_session", id: "still-not-a-uuid" } });
       }
       await waitFor(() => client.closed() !== null, "protocol close");
       expect(client.closed()?.code).toBe(LIVE_CLOSE_PROTOCOL);
@@ -724,10 +768,10 @@ describe("live socket: test subscriptions (issue #90)", () => {
   async function testClient(port: number, testId = TEST_ID): Promise<Client> {
     const client = connect(port, GOOD_COOKIE);
     await waitFor(() => client.frames.length > 0, "ready");
-    client.send({ type: "subscribe_test", projectId: PROJECT_ID, testId });
+    client.send({ type: "subscribe", projectId: PROJECT_ID, scope: { kind: "test", id: testId } });
     await waitFor(
-      () => client.frames.some((frame) => frame.type === "subscribed_test" || frame.type === "error"),
-      "subscribed_test or refusal",
+      () => client.frames.some((frame) => isSubscribedTo(testScope)(frame) || frame.type === "error"),
+      "subscribed or refusal",
     );
     return client;
   }
@@ -738,7 +782,7 @@ describe("live socket: test subscriptions (issue #90)", () => {
     await withRelay(async ({ port, hub }) => {
       const client = await testClient(port);
 
-      expect(client.frames).toContainEqual({ type: "subscribed_test", testId: TEST_ID });
+      expect(client.frames).toContainEqual({ type: "subscribed", scope: testScope });
       // `test:<testId>` is the string contract — a Web client has to build it.
       expect(hub.publish(`test:${TEST_ID}`, testRunFrame())).toBe(1);
 
@@ -750,17 +794,17 @@ describe("live socket: test subscriptions (issue #90)", () => {
   it("leaves the test subscription when asked, and then delivers nothing", async () => {
     await withRelay(async ({ port, hub }) => {
       const client = await testClient(port);
-      client.send({ type: "unsubscribe_test", testId: TEST_ID });
+      client.send({ type: "unsubscribe", scope: testScope });
       await waitFor(
-        () => client.frames.some((frame) => frame.type === "unsubscribed_test"),
-        "unsubscribed_test",
+        () => client.frames.some(isUnsubscribedFrom(testScope)),
+        "unsubscribed for the test scope",
       );
 
       // The half that makes unsubscribing mean something: the hub no longer counts
       // this connection, so a later run event goes nowhere.
       expect(hub.publish(`test:${TEST_ID}`, testRunFrame())).toBe(0);
       const frames = await settle(client);
-      expect(frames.some((frame) => frame.type === "test_run_event")).toBe(false);
+      expect(frames.some(isEventFor(testScope))).toBe(false);
     });
   });
 
@@ -768,7 +812,7 @@ describe("live socket: test subscriptions (issue #90)", () => {
     await withRelay(async ({ port, hub }) => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
-      client.send({ type: "subscribe_test", projectId: OTHER_PROJECT_ID, testId: TEST_ID });
+      client.send({ type: "subscribe", projectId: OTHER_PROJECT_ID, scope: testScope });
       await waitFor(() => client.frames.some((frame) => frame.type === "error"), "refusal");
 
       expect(client.frames).toContainEqual({ type: "error", message: "Test not found" });
@@ -782,7 +826,7 @@ describe("live socket: test subscriptions (issue #90)", () => {
       const client = await testClient(port, unknown);
 
       expect(client.frames).toContainEqual({ type: "error", message: "Test not found" });
-      expect(client.frames.some((frame) => frame.type === "subscribed_test")).toBe(false);
+      expect(client.frames.some(isSubscribedTo(testScope))).toBe(false);
       expect(hub.publish(`test:${unknown}`, testRunFrame())).toBe(0);
     });
   });
@@ -795,17 +839,17 @@ describe("live socket: test subscriptions (issue #90)", () => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
 
-      client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+      client.send(subscribeFrame(featureScope));
       await waitFor(() => client.frames.some((frame) => frame.type === "subscribed"), "subscribed");
-      client.send({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: SESSION_ID });
+      client.send(subscribeFrame(designScope));
       await waitFor(
-        () => client.frames.some((frame) => frame.type === "subscribed_design"),
-        "subscribed_design",
+        () => client.frames.some(isSubscribedTo(designScope)),
+        "subscribed for the design scope",
       );
-      client.send({ type: "subscribe_test", projectId: PROJECT_ID, testId: TEST_ID });
+      client.send({ type: "subscribe", projectId: PROJECT_ID, scope: testScope });
       await waitFor(
-        () => client.frames.some((frame) => frame.type === "subscribed_test"),
-        "subscribed_test",
+        () => client.frames.some(isSubscribedTo(testScope)),
+        "subscribed for the test scope",
       );
 
       expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(1);
@@ -828,7 +872,7 @@ describe("live socket: test subscriptions (issue #90)", () => {
       const client = connect(port, GOOD_COOKIE);
       await waitFor(() => client.frames.length > 0, "ready");
 
-      client.send({ type: "subscribe_test", projectId: PROJECT_ID, testId: "not-a-uuid" });
+      client.send({ type: "subscribe", projectId: PROJECT_ID, scope: { kind: "test", id: "not-a-uuid" } });
       await waitFor(
         () => client.frames.some((frame) => frame.type === "error"),
         "first protocol error",
@@ -836,7 +880,7 @@ describe("live socket: test subscriptions (issue #90)", () => {
 
       const frames = await settle(client);
       expect(frames).toContainEqual({ type: "error", message: "Unrecognised frame" });
-      expect(frames.some((frame) => frame.type === "subscribed_test")).toBe(false);
+      expect(frames.some(isSubscribedTo(testScope))).toBe(false);
       expect(
         frames.some(
           (frame) => frame.type === "error" && "message" in frame && frame.message === "Test not found",

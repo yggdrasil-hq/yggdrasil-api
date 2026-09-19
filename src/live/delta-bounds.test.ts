@@ -34,7 +34,12 @@ const JOB_ID = "22222222-2222-4222-8222-222222222222";
 function bothAccept(text: string): { route: boolean; publisher: boolean } {
   return {
     route: deltaTextFitsPayload(text),
-    publisher: encodeDeltaPayload({ featureId: FEATURE_ID, jobId: JOB_ID, text }) !== null,
+    publisher:
+      encodeDeltaPayload({
+        scope: { kind: "feature", id: FEATURE_ID },
+        jobId: JOB_ID,
+        text,
+      }) !== null,
   };
 }
 
@@ -99,7 +104,11 @@ describe("deltaPayloadBytes is the publisher's own measurement (#78)", () => {
     // becomes an approximation again — so it is asserted rather than assumed.
     for (const text of ["", "a", "字".repeat(100), "\n".repeat(100), '"'.repeat(100)]) {
       const real = Buffer.byteLength(
-        JSON.stringify({ featureId: FEATURE_ID, jobId: JOB_ID, text }),
+        JSON.stringify({
+          scope: { kind: "feature", id: FEATURE_ID },
+          jobId: JOB_ID,
+          text,
+        }),
       );
       expect(deltaPayloadBytes(text)).toBe(real);
     }

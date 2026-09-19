@@ -296,3 +296,171 @@ describe.skipIf(!reachability.ok)("JobRepository.listFeatureGrillRuns against a 
     expect(runs[0].supersedesJobId).toBeNull();
   });
 });
+
+/**
+ * `recordRelayedDeltaBytes` against a **real Postgres** (ADR 033 §5).
+ *
+ * **Why this is a second describe in the same file.** The statement changed under
+ * ADR 033: its `RETURNING` clause gained `test_id` and `kind`, because the delta path
+ * now resolves its scope with the same function the stored-event path uses
+ * (`liveScopeForJob`) instead of reading a bare `feature_id`. Two risks follow, and
+ * both are invisible to a fake pool:
+ *
+ *  - **Postgres has to accept the statement.** `$2` appears twice — as an addend and
+ *    as a subtrahend — which is exactly the shape of issue #43's `42P08
+ *    inconsistent types deduced for parameter`; the casts are what fix it, and only a
+ *    real parse proves they still do. This is the same class the file above was
+ *    written for.
+ *  - **The two new columns have to exist and carry the right values.** A `RETURNING`
+ *    naming a column the migration never added fails here and nowhere else, and the
+ *    *values* are load-bearing: `kind` is what makes a `design_grill`'s id
+ *    interpretable as a session, and `test_id` is the `test:` scope's whole routing
+ *    key. A null `test_id` for a scheduled run would leave the topic correct and
+ *    inert — the "declared, marshalled and silently discarded" shape this burn-down
+ *    has now found six times.
+ *
+ * The fixtures are deliberately minimal and use a job with **no feature**, because
+ * that is the case the old code dropped: a design session and a scheduled test run
+ * both have `feature_id IS NULL`, and both must now resolve to a scope.
+ */
+describe.skipIf(!reachability.ok)(
+  "JobRepository.recordRelayedDeltaBytes against a real Postgres (ADR 033 §5)",
+  () => {
+    let pool: pg.Pool;
+    let repository: JobRepository;
+    const ids = { user: "", org: "", project: "", test: "" };
+
+    beforeAll(async () => {
+      pool = new pg.Pool({ connectionString });
+      await runMigrations(pool);
+      repository = new JobRepository(pool);
+
+      const stamp = Date.now();
+      ids.user = (
+        await pool.query(
+          `INSERT INTO users (username, display_name, github_id, github_login)
+           VALUES ($1, 'I33', $2, $1) RETURNING id`,
+          [`i33_${stamp}`, stamp],
+        )
+      ).rows[0].id;
+      ids.org = (
+        await pool.query(
+          `INSERT INTO organizations (name, slug) VALUES ('o33', $1) RETURNING id`,
+          [`o33_${stamp}`],
+        )
+      ).rows[0].id;
+      ids.project = (
+        await pool.query(
+          `INSERT INTO projects (owner_user_id, organization_id, name, slug)
+           VALUES ($1, $2, 'p33', $3) RETURNING id`,
+          [ids.user, ids.org, `p33_${stamp}`],
+        )
+      ).rows[0].id;
+      // A real `tests` row, so `test_id` is a value the foreign key accepts rather
+      // than a bare uuid the column would reject.
+      ids.test = (
+        await pool.query(
+          // `tests` has no slug and no kind column — `name`, `spec_markdown` and
+          // `schedule_cron` are the NOT NULL trio (migration 002). Written from the
+          // migration rather than from memory: the first version of this fixture
+          // invented `slug` and `kind`, and Postgres refused it, which is the whole
+          // reason this file executes real SQL.
+          `INSERT INTO tests (project_id, name, spec_markdown, schedule_cron)
+           VALUES ($1, $2, '', '0 3 * * *') RETURNING id`,
+          [ids.project, `t33_${stamp}`],
+        )
+      ).rows[0].id;
+    }, 60_000);
+
+    afterAll(async () => {
+      if (pool) {
+        if (ids.project) {
+          await pool.query("DELETE FROM projects WHERE id = $1", [ids.project]).catch(() => undefined);
+        }
+        if (ids.org) {
+          await pool.query("DELETE FROM organizations WHERE id = $1", [ids.org]).catch(() => undefined);
+        }
+        if (ids.user) {
+          await pool.query("DELETE FROM users WHERE id = $1", [ids.user]).catch(() => undefined);
+        }
+        await pool.end();
+      }
+    }, 60_000);
+
+    async function insertJob(kind: string, featureId: string | null, testId: string | null) {
+      const row = await pool.query(
+        `INSERT INTO jobs (project_id, kind, feature_id, test_id, status)
+         VALUES ($1, $2, $3, $4, 'running') RETURNING id`,
+        [ids.project, kind, featureId, testId],
+      );
+      return row.rows[0].id as string;
+    }
+
+    it("is accepted by Postgres and returns the job's routing fields", async () => {
+      // The statement's own acceptance, plus the three fields `liveScopeForJob`
+      // needs. `featureId` null is the case that used to stop a delta dead.
+      const jobId = await insertJob("design_grill", null, null);
+
+      const recorded = await repository.recordRelayedDeltaBytes(jobId, 5);
+
+      expect(recorded).toEqual({
+        featureId: null,
+        testId: null,
+        jobKind: "design_grill",
+        totalBytes: 5,
+        previousBytes: 0,
+      });
+    });
+
+    it("accumulates the byte counter and reports the value before this call", async () => {
+      // `previousBytes` is what the ceiling uses to log *once* on the crossing
+      // rather than on every subsequent chunk, so both numbers matter and neither is
+      // derivable from the other after the fact.
+      const jobId = await insertJob("spec_grill", null, null);
+
+      const first = await repository.recordRelayedDeltaBytes(jobId, 10);
+      const second = await repository.recordRelayedDeltaBytes(jobId, 4);
+
+      expect(first).toMatchObject({ totalBytes: 10, previousBytes: 0 });
+      expect(second).toMatchObject({ totalBytes: 14, previousBytes: 10 });
+    });
+
+    it("returns the test id a scheduled test_run carries, which the test topic routes on", async () => {
+      // Issue #90's routing key, read back through the delta path. A null here would
+      // build a correct and inert `test:null` topic — the failure mode no fake pool
+      // can see.
+      const jobId = await insertJob("test_run", null, ids.test);
+
+      const recorded = await repository.recordRelayedDeltaBytes(jobId, 3);
+
+      expect(recorded).toMatchObject({
+        featureId: null,
+        testId: ids.test,
+        jobKind: "test_run",
+      });
+    });
+
+    it("returns the feature id for a feature-scoped job, alongside its kind", async () => {
+      const feature = (
+        await pool.query(
+          `INSERT INTO features (project_id, title, slug, feature_type, status)
+           VALUES ($1, 'delta', $2, 'normal', 'draft') RETURNING id`,
+          [ids.project, `f33_${Date.now()}`],
+        )
+      ).rows[0].id;
+      const jobId = await insertJob("spec_grill", feature, null);
+
+      const recorded = await repository.recordRelayedDeltaBytes(jobId, 1);
+
+      expect(recorded).toMatchObject({ featureId: feature, testId: null, jobKind: "spec_grill" });
+    });
+
+    it("returns null for a job that does not exist, rather than throwing", async () => {
+      // The caller distinguishes "nothing to relay" (return) from an error
+      // (log), and a `42P08`-class failure would land in the wrong branch.
+      await expect(
+        repository.recordRelayedDeltaBytes("00000000-0000-4000-8000-000000000000", 1),
+      ).resolves.toBeNull();
+    });
+  },
+);

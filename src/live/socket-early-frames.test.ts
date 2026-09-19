@@ -142,7 +142,9 @@ async function waitFor(predicate: () => boolean, label: string, ms = 3000): Prom
   }
 }
 
-const subscribeFrame = { type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID };
+const FEATURE_SCOPE = { kind: "feature" as const, id: FEATURE_ID };
+/** ADR 033 §1: one subscribe shape, with the scope as a value. */
+const subscribeFrame = { type: "subscribe", projectId: PROJECT_ID, scope: FEATURE_SCOPE };
 
 describe("live socket: a frame sent before `ready` (issue #77)", () => {
   it("still subscribes when the client sends subscribe on open, before the handshake completes", async () => {
@@ -156,7 +158,7 @@ describe("live socket: a frame sent before `ready` (issue #77)", () => {
       await waitFor(() => client.frames.some((f) => f.type === "subscribed"), "subscribed");
 
       const subscribed = client.frames.find((f) => f.type === "subscribed");
-      expect(subscribed).toMatchObject({ type: "subscribed", featureId: FEATURE_ID });
+      expect(subscribed).toMatchObject({ type: "subscribed", scope: FEATURE_SCOPE });
       expect(client.closed()).toBeNull();
     });
   });
@@ -171,9 +173,8 @@ describe("live socket: a frame sent before `ready` (issue #77)", () => {
       await waitFor(() => client.frames.some((f) => f.type === "subscribed"), "subscribed");
 
       const frame: ServerFrame = {
-        type: "job_event",
-        featureId: FEATURE_ID,
-        jobId: "job_1",
+        type: "event",
+        scope: FEATURE_SCOPE,
         event: {
           id: "event_1",
           jobId: "job_1",
@@ -192,7 +193,7 @@ describe("live socket: a frame sent before `ready` (issue #77)", () => {
       // A non-zero return is the hub's own statement that it had a subscriber
       // for this topic.
       expect(hub.publish(`feature:${FEATURE_ID}`, frame)).toBe(1);
-      await waitFor(() => client.frames.some((f) => f.type === "job_event"), "the event");
+      await waitFor(() => client.frames.some((f) => f.type === "event"), "the event");
     });
   });
 
@@ -210,7 +211,7 @@ describe("live socket: a frame sent before `ready` (issue #77)", () => {
       const client = connect(port);
       client.socket.on("open", () => {
         client.send(subscribeFrame);
-        client.send({ type: "unsubscribe", featureId: FEATURE_ID });
+        client.send({ type: "unsubscribe", scope: FEATURE_SCOPE });
       });
 
       await waitFor(
@@ -221,9 +222,8 @@ describe("live socket: a frame sent before `ready` (issue #77)", () => {
       await new Promise((resolve) => setTimeout(resolve, 120));
 
       const frame: ServerFrame = {
-        type: "job_event",
-        featureId: FEATURE_ID,
-        jobId: "job_1",
+        type: "event",
+        scope: FEATURE_SCOPE,
         event: {
           id: "event_1",
           jobId: "job_1",
@@ -249,7 +249,7 @@ describe("live socket: a frame sent before `ready` (issue #77)", () => {
     await withRelay(async ({ port }) => {
       const client = connect(port);
       client.socket.on("open", () =>
-        client.send({ type: "subscribe", projectId: "not-a-uuid", featureId: FEATURE_ID }),
+        client.send({ type: "subscribe", projectId: "not-a-uuid", scope: FEATURE_SCOPE }),
       );
 
       await waitFor(() => client.frames.some((f) => f.type === "error"), "an error frame");
