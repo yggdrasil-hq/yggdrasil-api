@@ -12,9 +12,15 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit -
 ```
 
 It brings up its own Postgres and MinIO, runs `tsc --noEmit`, then vitest.
-`--build` is **required**: `docker compose run test` reuses the cached image and
-only `test-results/` is mounted, so an edit is not in the container until it
-rebuilds. This has produced a false pass before.
+
+`--build` is needed when the **image** has to change: the first run, a
+`package.json`/lockfile edit, or a new top-level source directory. It is **not**
+needed for an edit under the mounted paths — issue #102 mounts the source
+read-only, so a run always sees the tree on disk. Before that it did not, and
+running without `--build` silently tested the previous build: that produced a false
+pass, and a false *negative* on a mutation, which is the more expensive direction.
+`scripts/run-tests.sh` prints a "source under test" digest so the tree a run
+actually saw is visible in its log.
 
 **2. Against a real database, converting the skipped cases into real checks.**
 
@@ -22,12 +28,28 @@ rebuilds. This has produced a false pass before.
 ./scripts/test-against-real-db.sh
 ```
 
-Five files verify against a real PostgreSQL and **skip** when they cannot reach
-one — they print what went unverified. In the compose run on this project's dev
-host, **29 tests skip**, so "the suite is green" means less than it appears to.
-This script drops that to **10**, and the 19 it recovers are precisely the ones
+Ten files verify against a real PostgreSQL and **skip** in full when they cannot
+reach one — they print what went unverified. In the compose run on this project's
+dev host, **77 tests skip**, so "the suite is green" means less than it appears to.
+This script drops that to **10**, and the **67** it recovers are precisely the ones
 guarding #43, #56, #61, #75, #76 and #31 — real-database bugs that a green suite
 did not catch.
+
+**Both numbers are measured and environment-dependent** (issue #105): they count the
+cases that cannot reach a database from wherever the suite is running, so a host
+that *can* reach one — CI can — skips fewer and has less for the script to recover.
+They are quoted with their recipe rather than as a constant:
+
+```bash
+docker compose -f docker-compose.test.yml up --build \
+  --abort-on-container-exit --exit-code-from test | tail -3   # reports "... | 77 skipped"
+./scripts/test-against-real-db.sh                            # reports "... | 10 skipped"
+```
+
+**A run's own summary line is the authority for a skip count, not this file.** The
+figure here read 29 for several waves after the truth had moved to 77, because a
+number in prose has nothing to fail when it drifts — and the script's closing
+message now reports what it observed rather than repeating one.
 
 ## Why skipping is deliberate, and why it is not a pass
 
