@@ -17,13 +17,15 @@
 #
 # **Both figures are measured, and both are environment-dependent**: they count the
 # cases that cannot reach a database from wherever the suite is running, so a host
-# that can reach one — CI can — skips fewer and leaves this script less to recover.
-# Issue #105 found this header claiming 29 and 19 for several waves after the truth
-# had moved to 77 and 67, and the lesson is not "write a better number": it is that
-# a run's **own summary line** is the only authority for a count like this, and a
-# second copy in prose has nothing to fail when it drifts. The closing message below
-# therefore reports what it observed and points back at that summary, and the docs
-# quote a figure only alongside the recipe for re-measuring it.
+# that can reach one skips fewer and leaves this script less to recover — CI's own
+# run of the compose half skips **none**, which is why the dev-host figure is the one
+# that makes this script worth running. Issue #105 found this header claiming 29 and
+# 19 for several waves after the truth had moved to 77 and 67, and the lesson is not
+# "write a better number": it is that a run's **own summary line** is the only
+# authority for a count like this, and a second copy in prose has nothing to fail when
+# it drifts. The closing message below therefore reports what it observed and points
+# back at that summary, and the docs quote a figure only alongside the recipe for
+# re-measuring it.
 #
 # To re-measure the pair, run both and read their summaries:
 #
