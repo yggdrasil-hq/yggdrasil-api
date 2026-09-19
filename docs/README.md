@@ -23,5 +23,6 @@ before reading the body.
 | Doc | Read this when |
 |-----|----------------|
 | [`conventions/conventions.md`](conventions/conventions.md) | Conventions specific to this repo (defer to meta repo for shared ones). |
+| [`conventions/testing.md`](conventions/testing.md) | You run this repo's tests, a case skipped, or a change needs verifying against a real database. |
 
 > Follow `../../docs/conventions/documentation-guide.md` when adding docs.
