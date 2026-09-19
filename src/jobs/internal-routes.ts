@@ -71,11 +71,23 @@ const jobEventSchema = z.object({
     // Issue #27: synthesized by the Orchestrator, which reads the marker the
     // build pod's entrypoint wrote when it resolved conflicts with the base.
     "merge_conflicts",
+    // ADR 032 item 3: the fork preamble stopped before the first turn.
+    "fork_failed",
   ]),
   question: z.string().optional(),
   markdown: z.string().optional(),
   message: z.string().optional(),
   status: z.string().optional(),
+  /**
+   * ADR 032 item 3: which of the fork's three steps stopped, on a `fork_failed`
+   * event. A closed enum mirroring the migration's CHECK, so an unrecognised stage
+   * is refused at the boundary rather than stored as a value nothing can act on.
+   *
+   * Optional because no other event carries one, and its absence on a
+   * `fork_failed` is answered by the handler rather than by a default — a default
+   * would attribute a failure to a stage the Orchestrator never claimed.
+   */
+  forkStage: z.enum(["write", "switch", "fork"]).optional(),
   prUrl: z.string().optional(),
   summary: z.string().optional(),
   comment: z.string().optional(),
@@ -772,7 +784,14 @@ async function syncFeatureState(
     event.type !== "report_test_step" &&
     event.type !== "submit_test_report" &&
     event.type !== "update_design_preview" &&
-    event.type !== "submit_design"
+    event.type !== "submit_design" &&
+    // ADR 032 item 3. This list is the difference between an event being stored
+    // and an event being *acted on*: `fork_failed` reaches the table either way,
+    // because the route persists before it syncs, so without this arm the failure
+    // is recorded and the feature stays whatever it was — the "declared,
+    // marshalled and discarded" shape this burn-down has found seven times, in its
+    // most literal form.
+    event.type !== "fork_failed"
   ) {
     return;
   }
@@ -983,6 +1002,23 @@ async function syncFeatureState(
           designSnapshots,
         },
       });
+      return;
+    }
+    if (event.type === "fork_failed") {
+      // ADR 032 item 3: a fork that could not start is a failed run, and the
+      // *reason* is the stage the Orchestrator named rather than a generic error —
+      // "the artifact never arrived", "it arrived and Pi loaded nothing" and "the
+      // resume point was rejected" ask three different things of the operator.
+      //
+      // Set here rather than produced by the frontend, because a surface that
+      // derived its own wording would be a second reading of the same fact — the
+      // shape this burn-down keeps finding (a value recorded in one place and
+      // restated in another, free to disagree).
+      // The stage itself rides on the stored event (`fork_stage`), which is what a
+      // surface reads to say *which* step stopped. Nothing is copied onto the
+      // feature row: a second copy of a fact recorded in one place is free to
+      // disagree with it, and the event is the record.
+      await deps.features.updateStatus(job.featureId, "failed");
       return;
     }
     if (event.type === "submit_review") {

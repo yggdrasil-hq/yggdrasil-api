@@ -359,6 +359,7 @@ describe("toLiveJobEvent", () => {
       reviewFindings: null,
       actionItems: null,
       snapshot: null,
+      forkStage: null,
       createdAt,
     };
 
@@ -391,6 +392,7 @@ describe("toLiveJobEvent", () => {
       reviewFindings: null,
       actionItems: null,
       snapshot: null,
+      forkStage: null,
       createdAt: new Date("2026-09-18T10:00:00.000Z"),
     });
     expect(live.question).toBeNull();

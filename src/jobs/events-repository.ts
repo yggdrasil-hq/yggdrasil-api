@@ -21,7 +21,13 @@ export type JobEventType =
    * build's entrypoint resolved conflicts between the feature branch and its
    * base. Context for a reviewer, not a result — see the API's job-event route.
    */
-  | "merge_conflicts";
+  | "merge_conflicts"
+  /**
+   * ADR 032 item 3: the fork preamble stopped before the first turn, at the stage
+   * `forkStage` names. Terminal — the run never reached an agent turn, so this is
+   * the job's whole outcome rather than context for one.
+   */
+  | "fork_failed";
 
 export interface JobEventActionItem {
   type: string;
@@ -128,6 +134,18 @@ export interface JobEvent {
   reviewFindings: JobEventReviewFinding[] | null;
   actionItems: JobEventActionItem[] | null;
   snapshot: Record<string, string> | null;
+  /**
+   * ADR 032 item 3: the stage a `fork_failed` event stopped at, or **null for
+   * every other event type**.
+   *
+   * The three stages are three different diagnoses — the artifact never reached
+   * the pod, it reached it and Pi loaded nothing from it, or the session was fine
+   * and the resume point was rejected — so a renderer must say which happened
+   * rather than "the fork failed". Null here means "this event is not a fork
+   * failure", not "a fork failed for an unknown reason"; the latter is not
+   * expressible, because the Orchestrator always names a stage.
+   */
+  forkStage: string | null;
   createdAt: Date;
 }
 
@@ -146,6 +164,7 @@ interface JobEventRow {
   review_findings: JobEventReviewFinding[] | null;
   action_items: JobEventActionItem[] | null;
   design_snapshot: Record<string, string> | null;
+  fork_stage: string | null;
   created_at: Date;
 }
 
@@ -209,7 +228,8 @@ export interface JobEventWithScope {
 
 /** The event columns, spelled once so every read returns the same shape. */
 const jobEventColumns = `id, job_id, type, question, markdown, message, status, pr_url,
-         summary, verdict, question_form, review_findings, action_items, design_snapshot, created_at`;
+         summary, verdict, question_form, review_findings, action_items, design_snapshot,
+         fork_stage, created_at`;
 
 function mapJobEvent(row: JobEventRow): JobEvent {
   return {
@@ -227,6 +247,7 @@ function mapJobEvent(row: JobEventRow): JobEvent {
     reviewFindings: row.review_findings,
     actionItems: row.action_items,
     snapshot: row.design_snapshot,
+    forkStage: row.fork_stage,
     createdAt: row.created_at,
   };
 }
@@ -286,6 +307,17 @@ export class JobEventRepository {
     reviewFindings?: JobEventReviewFinding[] | null;
     actionItems?: JobEventActionItem[];
     snapshot?: Record<string, string>;
+    /**
+     * ADR 032 item 3: which of a fork's three steps stopped, on a `fork_failed`
+     * event. Declared here for the reason `verdict` and `questionForm` give above —
+     * the caller spreads the validated payload into this parameter, so an undeclared
+     * field is discarded *silently* and the column would stay null while the
+     * Orchestrator believed it had said where the fork stopped.
+     *
+     * It is the one fact that makes a fork failure actionable, so losing it would
+     * leave three distinct diagnoses rendering as one prose string.
+     */
+    forkStage?: string | null;
   }): Promise<JobEvent> {
     /*
      * **JSONB parameters are serialised explicitly, and that is load-bearing.**
@@ -310,10 +342,11 @@ export class JobEventRepository {
      */
     const result = await this.db.query<JobEventRow>(
       `INSERT INTO job_events
-         (job_id, type, question, markdown, message, status, pr_url, summary, verdict, question_form, review_findings, action_items, design_snapshot)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+         (job_id, type, question, markdown, message, status, pr_url, summary, verdict, question_form, review_findings, action_items, design_snapshot, fork_stage)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
        RETURNING id, job_id, type, question, markdown, message, status, pr_url,
-         summary, verdict, question_form, review_findings, action_items, design_snapshot, created_at`,
+         summary, verdict, question_form, review_findings, action_items, design_snapshot,
+         fork_stage, created_at`,
       [
         input.jobId,
         input.type,
@@ -331,6 +364,10 @@ export class JobEventRepository {
         input.reviewFindings ? JSON.stringify(input.reviewFindings) : null,
         input.actionItems ? JSON.stringify(input.actionItems) : null,
         input.snapshot ?? null,
+        // The migration's CHECK keeps this NULL for every other event type and
+        // restricts it to the three stages on a `fork_failed`, so a typo is refused
+        // by the database rather than stored as a value nothing can act on.
+        input.forkStage ?? null,
       ],
     );
 
