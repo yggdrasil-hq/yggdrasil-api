@@ -6,11 +6,13 @@ import type { SessionService } from "../auth/sessions.js";
 import type { FeatureRepository } from "../features/repository.js";
 import type { JobRepository } from "../jobs/repository.js";
 import type { ProjectRepository } from "../projects/repository.js";
+import type { TestRepository } from "../tests/repository.js";
 import type { UserRepository } from "../users/repository.js";
 import { readCookie } from "./cookies.js";
 import {
   authorizeDesignSessionSubscription,
   authorizeSubscription,
+  authorizeTestSubscription,
 } from "./authorization.js";
 import { FrameBudget, type FrameBudgetOptions } from "./limits.js";
 import type { LiveConnection, LiveHub } from "./hub.js";
@@ -22,6 +24,7 @@ import {
   LIVE_SOCKET_PATH,
   liveTopicForDesignSession,
   liveTopicForFeature,
+  liveTopicForTest,
   parseClientFrame,
   type ServerFrame,
 } from "./types.js";
@@ -76,6 +79,15 @@ export interface LiveSocketDeps {
    * that read is what keeps this dependency honest about its purpose.
    */
   jobs: Pick<JobRepository, "findByIdForProject">;
+  /**
+   * Issue #90: a Test entity is resolved through this repository, so
+   * `authorizeTestSubscription` can mirror the run-history route
+   * (`tests.findById(project.id, testId)`) the way the socket's other two scopes
+   * mirror their routes. A narrow `Pick` for the same reason `jobs` is one: the
+   * socket needs exactly one read, and naming it keeps the dependency honest
+   * about its purpose.
+   */
+  tests: Pick<TestRepository, "findById">;
   hub: LiveHub;
   onError?: (message: string) => void;
   path?: string;
@@ -332,13 +344,24 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
         return;
       }
 
+      if (frame.type === "unsubscribe_test") {
+        deps.hub.unsubscribe(connection, liveTopicForTest(frame.testId));
+        safeSend(connection, { type: "unsubscribed_test", testId: frame.testId });
+        return;
+      }
+
       // Awaited rather than fired and forgotten: `subscribe` does an
       // authorisation query, and returning before it resolves is what let a
       // later frame overtake it (see the note on `queueFrame`). Same for the
-      // design-session variant, which is why it is awaited here too rather than
-      // dispatched independently.
+      // design-session and test variants, which is why they are awaited here too
+      // rather than dispatched independently.
       if (frame.type === "subscribe_design") {
         await subscribeDesignSession(connection, frame.projectId, frame.sessionId);
+        return;
+      }
+
+      if (frame.type === "subscribe_test") {
+        await subscribeTest(connection, frame.projectId, frame.testId);
         return;
       }
 
@@ -456,6 +479,54 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
 
     deps.hub.subscribe(connection, liveTopicForDesignSession(sessionId));
     safeSend(connection, { type: "subscribed_design", sessionId });
+  }
+
+  /**
+   * The Test-entity peer of `subscribe` (issue #90).
+   *
+   * Parallel rather than factored together, deliberately and for the reason its
+   * design-session sibling gives: each scope differs in exactly the three places
+   * that carry the meaning — the authoriser, the topic function and the reply
+   * frame — and each should read next to the REST route it mirrors. This one
+   * mirrors `GET /projects/:projectId/tests/:testId/runs`, which is why it
+   * resolves a `tests` row rather than a job.
+   *
+   * Like the other two it sends no state on success: it adds the socket to a topic
+   * and returns, leaving the page's REST read as the only state path (ADR 019
+   * item 7). That matters more here than elsewhere, because a run's progress is
+   * exactly the kind of derived thing a second implementation in the browser
+   * would get subtly wrong.
+   */
+  async function subscribeTest(
+    connection: AuthedConnection,
+    projectId: string,
+    testId: string,
+  ): Promise<void> {
+    let decision;
+    try {
+      // Re-authorised on every frame, never remembered from an earlier frame on
+      // the same socket — the rule both other paths follow, for the same reason.
+      decision = await authorizeTestSubscription(deps, {
+        userId: connection.userId,
+        projectId,
+        testId,
+      });
+    } catch (error) {
+      report(`live socket test subscribe failed: ${describe(error)}`);
+      safeSend(connection, { type: "error", message: "Subscription failed" });
+      return;
+    }
+
+    if (!decision.ok) {
+      // One message for both refusals, matching the REST route's single 404 for a
+      // project the caller cannot see and a test that is not there — the same
+      // non-disclosure rule as the feature and session paths (ADR 019 item 3).
+      safeSend(connection, { type: "error", message: "Test not found" });
+      return;
+    }
+
+    deps.hub.subscribe(connection, liveTopicForTest(testId));
+    safeSend(connection, { type: "subscribed_test", testId });
   }
 
   return {

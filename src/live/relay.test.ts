@@ -14,6 +14,7 @@ const FEATURE_ID = "33333333-3333-4333-8333-333333333333";
 const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
 const EVENT_ID = "44444444-4444-4444-8444-444444444444";
 const SESSION_ID = "88888888-8888-4888-8888-888888888888";
+const TEST_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 function scope(overrides: Partial<JobEventWithScope> = {}): JobEventWithScope {
   return {
@@ -22,6 +23,8 @@ function scope(overrides: Partial<JobEventWithScope> = {}): JobEventWithScope {
     // Most cases here are about the feature topic, so the default is the kind
     // that could own a feature. `design_grill` cases override it.
     jobKind: "feature_build",
+    // A feature-scoped job carries no `test_id`; issue #90's cases override it.
+    testId: null,
     event: {
       id: EVENT_ID,
       jobId: "job_1",
@@ -152,13 +155,47 @@ describe("relayEnvelopeFor", () => {
     expect((envelope?.frame as { event: { jobId: string } }).event.jobId).toBe(SESSION_ID);
   });
 
-  it("still returns null for a feature-less job that is not a design session", () => {
-    // A *scheduled* `test_run` is the real instance: it carries no feature_id and
-    // does produce events, so this null is a live case rather than a leftover.
-    // Dropping it is honest — there is no surface subscribed to it — and inventing
-    // a topic nobody reads would be noise pretending to be a feature. Filed
-    // separately rather than solved here.
-    expect(relayEnvelopeFor(scope({ featureId: null, jobKind: "test_run" }))).toBeNull();
+  it("routes a feature-less scheduled test_run to its test's topic (issue #90)", () => {
+    // The case this branch exists for. A scheduled `test_run` carries a `test_id`
+    // and no `feature_id`, so before this it fell into the null case and its
+    // events reached no socket at all. `test_id` is a routing key that names the
+    // surface — the standalone Testing product's run history — so the id alone
+    // decides the topic, exactly as `featureId` does.
+    const envelope = relayEnvelopeFor(
+      scope({ featureId: null, jobKind: "test_run", testId: TEST_ID }),
+    );
+
+    expect(envelope?.topic).toBe(`test:${TEST_ID}`);
+    // A distinct frame type for the same reason as the design frame: the scope id
+    // names a `tests` row, and `job_event.featureId` would be the wrong name for
+    // it. `testId` and the event's `jobId` are both carried because they are two
+    // genuinely different values.
+    expect(envelope?.frame).toEqual({
+      type: "test_run_event",
+      testId: TEST_ID,
+      jobId: "job_1",
+      event: expect.objectContaining({ id: EVENT_ID, type: "agent_text" }),
+    });
+  });
+
+  it("prefers the feature topic for a feature-driven test_run, which has both ids", () => {
+    // The consequence #90's decision records as out of scope, asserted so it is a
+    // known behaviour rather than a surprise: one job with two surfaces, and the
+    // Test-entity page gets no socket signal for the feature-driven case because
+    // feature is checked first. Reordering these branches should fail a test, not
+    // quietly change who receives what.
+    const envelope = relayEnvelopeFor(scope({ jobKind: "test_run", testId: TEST_ID }));
+
+    expect(envelope?.topic).toBe(`feature:${FEATURE_ID}`);
+    expect(envelope?.frame).toMatchObject({ type: "job_event" });
+  });
+
+  it("still returns null for a feature-less, test-less job", () => {
+    // What null covers now: nothing produces such a job, so this is a guard rather
+    // than a live case. Dropping it is honest — inventing a topic nobody reads
+    // would be noise pretending to be a signal — and it is asserted so the
+    // fallthrough stays deliberate.
+    expect(relayEnvelopeFor(scope({ featureId: null, jobKind: "deploy", testId: null }))).toBeNull();
   });
 
   it("prefers the feature topic when a job somehow has both", () => {

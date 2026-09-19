@@ -29,6 +29,12 @@ const OTHER_FEATURE_ID = "66666666-6666-4666-8666-666666666666";
 const SESSION_ID = "88888888-8888-4888-8888-888888888888";
 /** In the project, but a different kind — the case the REST route also rejects. */
 const NON_DESIGN_JOB_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+/*
+ * Issue #90: a Test entity's id, which is a `tests` row id rather than a job id.
+ * Named separately from `NON_DESIGN_JOB_ID` because the test scope resolves its
+ * resource through a different repository entirely.
+ */
+const TEST_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
 const GOOD_COOKIE = `${config.cookieName}=sess_ok`;
 
@@ -109,6 +115,14 @@ async function withRelay(
     projects: projects as never,
     features: features as never,
     jobs: jobs as never,
+    // Issue #90: the test scope's authoriser resolves a `tests` row the way the
+    // run-history route does. None of these cases subscribe to a test, so this
+    // only has to exist and be shaped like `TestRepository.findById`.
+    tests: {
+      findById: vi.fn(async (projectId: string, testId: string) =>
+        projectId === PROJECT_ID && testId === TEST_ID ? { id: TEST_ID } : null,
+      ),
+    } as never,
     onError: options.onError,
     frameBudget: options.frameBudget,
   });
@@ -220,6 +234,34 @@ function jobEventFrame(): ServerFrame {
       question: null,
       markdown: null,
       message: "hello",
+      status: null,
+      prUrl: null,
+      summary: null,
+      actionItems: null,
+      snapshot: null,
+      createdAt: "2026-09-18T10:00:00.000Z",
+    },
+  };
+}
+
+/**
+ * Issue #90: the frame a scheduled `test_run`'s event produces. `testId` and
+ * `jobId` are deliberately different values — they are two genuinely different
+ * things (the surface to refresh, and the run whose event it is), and using one
+ * value for both would hide a mistake that swapped them.
+ */
+function testRunFrame(): ServerFrame {
+  return {
+    type: "test_run_event",
+    testId: TEST_ID,
+    jobId: "job_run_1",
+    event: {
+      id: "test_event_1",
+      jobId: "job_run_1",
+      type: "test_progress",
+      question: null,
+      markdown: null,
+      message: "2 of 5 passing",
       status: null,
       prUrl: null,
       summary: null,
@@ -667,6 +709,139 @@ describe("live socket: design-session subscriptions (issue #25)", () => {
       }
       await waitFor(() => client.closed() !== null, "protocol close");
       expect(client.closed()?.code).toBe(LIVE_CLOSE_PROTOCOL);
+    });
+  });
+});
+
+/*
+ * Issue #90: the `test:` scope, driven over a real socket. The authoriser and the
+ * routing are covered as units elsewhere; this is the end-to-end shape, because
+ * the three things that could still be wrong here — the frame name the client
+ * must send, the topic string the API publishes to, and which frame it replies
+ * with — are all cross-process contracts rather than internal decisions.
+ */
+describe("live socket: test subscriptions (issue #90)", () => {
+  async function testClient(port: number, testId = TEST_ID): Promise<Client> {
+    const client = connect(port, GOOD_COOKIE);
+    await waitFor(() => client.frames.length > 0, "ready");
+    client.send({ type: "subscribe_test", projectId: PROJECT_ID, testId });
+    await waitFor(
+      () => client.frames.some((frame) => frame.type === "subscribed_test" || frame.type === "error"),
+      "subscribed_test or refusal",
+    );
+    return client;
+  }
+
+  it("subscribes a member to a test and receives its scheduled run's events", async () => {
+    // The whole point of the issue: a scheduled `test_run` has no feature, so its
+    // events had no topic and reached no socket. This is that path end to end.
+    await withRelay(async ({ port, hub }) => {
+      const client = await testClient(port);
+
+      expect(client.frames).toContainEqual({ type: "subscribed_test", testId: TEST_ID });
+      // `test:<testId>` is the string contract — a Web client has to build it.
+      expect(hub.publish(`test:${TEST_ID}`, testRunFrame())).toBe(1);
+
+      const frames = await settle(client);
+      expect(frames).toContainEqual(testRunFrame());
+    });
+  });
+
+  it("leaves the test subscription when asked, and then delivers nothing", async () => {
+    await withRelay(async ({ port, hub }) => {
+      const client = await testClient(port);
+      client.send({ type: "unsubscribe_test", testId: TEST_ID });
+      await waitFor(
+        () => client.frames.some((frame) => frame.type === "unsubscribed_test"),
+        "unsubscribed_test",
+      );
+
+      // The half that makes unsubscribing mean something: the hub no longer counts
+      // this connection, so a later run event goes nowhere.
+      expect(hub.publish(`test:${TEST_ID}`, testRunFrame())).toBe(0);
+      const frames = await settle(client);
+      expect(frames.some((frame) => frame.type === "test_run_event")).toBe(false);
+    });
+  });
+
+  it("refuses a test in a project the caller is not a member of", async () => {
+    await withRelay(async ({ port, hub }) => {
+      const client = connect(port, GOOD_COOKIE);
+      await waitFor(() => client.frames.length > 0, "ready");
+      client.send({ type: "subscribe_test", projectId: OTHER_PROJECT_ID, testId: TEST_ID });
+      await waitFor(() => client.frames.some((frame) => frame.type === "error"), "refusal");
+
+      expect(client.frames).toContainEqual({ type: "error", message: "Test not found" });
+      expect(hub.publish(`test:${TEST_ID}`, testRunFrame())).toBe(0);
+    });
+  });
+
+  it("refuses a test id that is not in the project", async () => {
+    await withRelay(async ({ port, hub }) => {
+      const unknown = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+      const client = await testClient(port, unknown);
+
+      expect(client.frames).toContainEqual({ type: "error", message: "Test not found" });
+      expect(client.frames.some((frame) => frame.type === "subscribed_test")).toBe(false);
+      expect(hub.publish(`test:${unknown}`, testRunFrame())).toBe(0);
+    });
+  });
+
+  it("keeps the test topic separate from the feature and design ones", async () => {
+    // Three scopes on one socket. All three id spaces are uuids, so only the topic
+    // prefix keeps them apart — the reason each scope has its own. A publish to one
+    // must reach exactly one subscriber and appear as exactly one frame type.
+    await withRelay(async ({ port, hub }) => {
+      const client = connect(port, GOOD_COOKIE);
+      await waitFor(() => client.frames.length > 0, "ready");
+
+      client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+      await waitFor(() => client.frames.some((frame) => frame.type === "subscribed"), "subscribed");
+      client.send({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: SESSION_ID });
+      await waitFor(
+        () => client.frames.some((frame) => frame.type === "subscribed_design"),
+        "subscribed_design",
+      );
+      client.send({ type: "subscribe_test", projectId: PROJECT_ID, testId: TEST_ID });
+      await waitFor(
+        () => client.frames.some((frame) => frame.type === "subscribed_test"),
+        "subscribed_test",
+      );
+
+      expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(1);
+      expect(hub.publish(`design:${SESSION_ID}`, designSessionFrame())).toBe(1);
+      expect(hub.publish(`test:${TEST_ID}`, testRunFrame())).toBe(1);
+
+      const frames = await settle(client);
+      expect(frames).toContainEqual(jobEventFrame());
+      expect(frames).toContainEqual(designSessionFrame());
+      expect(frames).toContainEqual(testRunFrame());
+    });
+  });
+
+  it("treats a malformed test id as a malformed frame, not a refused subscription", async () => {
+    // Same contract as the design path, and worth pinning for the same reason: a
+    // non-uuid never reaches the authoriser, so it is an *unrecognised frame*
+    // counted against the protocol-error budget, not a "Test not found" refusal.
+    // The two look alike to a client while only one is a client bug.
+    await withRelay(async ({ port }) => {
+      const client = connect(port, GOOD_COOKIE);
+      await waitFor(() => client.frames.length > 0, "ready");
+
+      client.send({ type: "subscribe_test", projectId: PROJECT_ID, testId: "not-a-uuid" });
+      await waitFor(
+        () => client.frames.some((frame) => frame.type === "error"),
+        "first protocol error",
+      );
+
+      const frames = await settle(client);
+      expect(frames).toContainEqual({ type: "error", message: "Unrecognised frame" });
+      expect(frames.some((frame) => frame.type === "subscribed_test")).toBe(false);
+      expect(
+        frames.some(
+          (frame) => frame.type === "error" && "message" in frame && frame.message === "Test not found",
+        ),
+      ).toBe(false);
     });
   });
 });

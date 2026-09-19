@@ -121,6 +121,32 @@ export function liveTopicForDesignSession(sessionId: string): string {
 }
 
 /**
+ * The relay's subscription topic for a Test entity (issue #90).
+ *
+ * The third topic shape, and the one that closes a hole rather than adding a
+ * feature. A *scheduled* `test_run` is project-scoped: it carries a `test_id`
+ * and no `feature_id`, so before this it fell into `relayEnvelopeFor`'s null
+ * case and its events reached no socket at all. The standalone Testing product's
+ * run-history page (`GET /projects/:projectId/tests/:testId/runs`) is the only
+ * surface that can show such a run, so `test:` is the scope that page reads.
+ *
+ * **The id is a `tests` row id, not a job id** — the same kind of value
+ * `liveTopicForFeature` takes, and unlike `liveTopicForDesignSession`, whose id
+ * is a job id. That is why `relayEnvelopeFor` can key this branch on the id's
+ * presence alone: `test_id` is a real routing key that names the resource,
+ * whereas a design session's id would not say what it was without the kind.
+ *
+ * `job:<jobId>` was the alternative and was rejected on authorisation grounds
+ * (#90's decision comment): it has no single REST equivalent to mirror, and its
+ * natural check binds a job to a *project* only — weaker than the two existing
+ * topics, each of which resolves its resource inside the project (ADR 019
+ * item 7).
+ */
+export function liveTopicForTest(testId: string): string {
+  return `test:${testId}`;
+}
+
+/**
  * `pg_notify`'s hard limit is 8000 bytes. A streaming chunk is a handful of
  * bytes, so this is not a real constraint on deltas — it is a guard so that a
  * pathological value (a bug upstream, or a non-streaming producer misusing the
@@ -248,6 +274,9 @@ export type ServerFrame =
   /** Issue #25: the design-session peer of `subscribed`, naming a session rather than a feature. */
   | { type: "subscribed_design"; sessionId: string }
   | { type: "unsubscribed_design"; sessionId: string }
+  /** Issue #90: the Test-entity peer of `subscribed`, naming the `tests` row. */
+  | { type: "subscribed_test"; testId: string }
+  | { type: "unsubscribed_test"; testId: string }
   | { type: "job_event"; featureId: string; jobId: string; event: LiveJobEvent }
   /**
    * Issue #25: a stored event for a design session.
@@ -258,6 +287,16 @@ export type ServerFrame =
    * the event's own `jobId` is the same value.
    */
   | { type: "design_session_event"; sessionId: string; event: LiveJobEvent }
+  /**
+   * Issue #90: a stored event for a scheduled `test_run`.
+   *
+   * Distinct for the same reason `design_session_event` is: `job_event`'s only
+   * scope field is called `featureId`, and putting a `tests` row id in a field
+   * with that name would be a lie an over-eager reader could act on. The name
+   * also says which surface the frame belongs to, which is the thing a reader
+   * of a frame log needs to know.
+   */
+  | { type: "test_run_event"; testId: string; jobId: string; event: LiveJobEvent }
   | { type: "job_event_delta"; featureId: string; jobId: string; text: string }
   | { type: "error"; message: string }
   | { type: "pong" };
@@ -309,6 +348,21 @@ export type ClientFrame =
    */
   | { type: "subscribe_design"; projectId: string; sessionId: string }
   | { type: "unsubscribe_design"; sessionId: string }
+  /**
+   * Issue #90: subscribe to a Test entity's runs instead of a feature or a design
+   * session.
+   *
+   * A third frame type rather than an optional field on an existing one, for the
+   * reason the design frame gives: each carries a *different* resource with a
+   * *different* authorisation rule, and folding them together would need a
+   * precedence rule in an authorisation path — exactly the thing that is read
+   * wrong. Three shapes, three answers, no ambiguity about which authoriser ran.
+   *
+   * `testId` matches the REST path parameter the client already holds
+   * (`/projects/:projectId/tests/:testId/runs`).
+   */
+  | { type: "subscribe_test"; projectId: string; testId: string }
+  | { type: "unsubscribe_test"; testId: string }
   | { type: "ping" };
 
 function isUuidValue(value: unknown): value is string {
@@ -352,6 +406,14 @@ export function parseClientFrame(raw: string): ClientFrame | null {
   if (frame.type === "unsubscribe_design") {
     if (!isUuidValue(frame.sessionId)) return null;
     return { type: "unsubscribe_design", sessionId: frame.sessionId };
+  }
+  if (frame.type === "subscribe_test") {
+    if (!isUuidValue(frame.projectId) || !isUuidValue(frame.testId)) return null;
+    return { type: "subscribe_test", projectId: frame.projectId, testId: frame.testId };
+  }
+  if (frame.type === "unsubscribe_test") {
+    if (!isUuidValue(frame.testId)) return null;
+    return { type: "unsubscribe_test", testId: frame.testId };
   }
   return null;
 }
