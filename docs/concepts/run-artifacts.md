@@ -112,6 +112,35 @@ runs, which is why both upload routes carry an error middleware that converts it
 that breaks it). ADR 029 item 5: an artifact must never fail the test run that
 produced it.
 
+### A zero in either cap, and why the two do not agree
+
+Both caps accept `0`, and **they mean opposite things** (issue #107). This is the
+one place in the configuration where two adjacent variables with the same prefix
+read in opposite directions, so it is worth stating rather than leaving to the
+config comment:
+
+| variable | `=0` means | which way it fails |
+|---|---|---|
+| `SCREENSHOT_MAX_BYTES` | refuse every non-empty screenshot | **closed** — nothing is stored |
+| `SCREENSHOT_MAX_PER_JOB` | no per-run ceiling at all | **open** — everything is stored |
+
+Each reading is what the code already said: the size check is `byteSize > maxBytes`,
+so zero refuses everything, and the count check is `maxPerJob > 0 && …`, so zero
+skips it. `SCREENSHOT_MAX_BYTES` therefore reads like `RECORDING_MAX_BYTES` and
+`SESSION_MAX_BYTES`, and `SCREENSHOT_MAX_PER_JOB` reads like
+`LIVE_DELTA_BYTES_PER_JOB`. **An operator who reads one and assumes the other gets
+the opposite of what they intended, and for the per-job cap that is the permissive
+direction** — which is the whole reason the direction is named on each variable in
+`config.ts` and in the env example rather than only here.
+
+**Turning the per-run ceiling off is not turning every bound off.** With
+`SCREENSHOT_MAX_PER_JOB=0` the byte cap still refuses an oversized file and
+retention still reclaims screenshots as they age, so storage stays bounded — by the
+byte cap times whatever arrives inside the window. What zero removes is the *count*
+bound: the one that exists because a spec's `##` heading count is not ours to
+control. A deployment that wants a hard ceiling on a run's screenshots should set
+both caps, not neither.
+
 ## Where the bytes are served from
 
 From **this API, behind the ordinary session cookie** — never from a public URL,

@@ -140,6 +140,35 @@ export const DEFAULT_RECORDING_MAX_BYTES = 25_000_000;
  */
 export const DEFAULT_LIVE_DELTA_BYTES_PER_JOB = 8_000_000;
 
+/**
+ * The default cap on one screenshot, and the value `SCREENSHOT_MAX_BYTES=0`
+ * switches off entirely — it refuses every non-empty screenshot, the same reading as
+ * `RECORDING_MAX_BYTES` and `SESSION_MAX_BYTES` and the **opposite** of the per-job
+ * cap beside it.
+ *
+ * **This constant and `DEFAULT_SCREENSHOT_MAX_PER_JOB` are the pair most likely to
+ * be confused**, which is why each names the direction the other does not take: they
+ * share a prefix, they sit adjacent in the env file, and both are "caps". This one
+ * fails **closed** (zero refuses everything); its sibling fails **open** (zero
+ * permits everything). Issue #107.
+ */
+export const DEFAULT_SCREENSHOT_MAX_BYTES = 2_000_000;
+
+/**
+ * The default ceiling on screenshots for one job, and the value
+ * `SCREENSHOT_MAX_PER_JOB=0` switches off entirely — zero means **no per-run ceiling
+ * at all**, which is the **opposite** of `DEFAULT_SCREENSHOT_MAX_BYTES`' zero.
+ *
+ * A separate cap from the byte one because **bounded per file is not bounded per
+ * run**: how many steps a run has is decided by the `##` headings in the project's
+ * own test markdown, so a spec with thousands of headings would be thousands of
+ * files. Zero therefore removes the only *count* bound an operator has. What still
+ * applies is the byte cap per file and the retention window, so storage stays
+ * bounded — just not by anything whose size the operator set directly. See the
+ * `screenshots` block for the full account.
+ */
+export const DEFAULT_SCREENSHOT_MAX_PER_JOB = 50;
+
 function required(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback;
   if (!value) {
@@ -385,6 +414,34 @@ export const config = {
    * thousands of headings would be thousands of files. Bounded per file is not
    * bounded per run.
    *
+   * **The two caps read zero in opposite directions, and that is deliberate rather
+   * than an accident to unify** (issue #107). Each matches the guard already written
+   * for it, so the code below is the specification and the config now agrees with
+   * it:
+   *
+   * - `maxBytes = 0` **fails closed** — `exceedsSizeCap` is `byteSize > maxBytes`,
+   *   so zero refuses every non-empty screenshot. Same reading as
+   *   `RECORDING_MAX_BYTES` and `SESSION_MAX_BYTES`.
+   * - `maxPerJob = 0` **fails open** — the guard is `maxPerJob > 0 && …`, so zero
+   *   switches the per-run ceiling off entirely. Same reading as
+   *   `LIVE_DELTA_BYTES_PER_JOB`.
+   *
+   * Both go through `limitFrom` rather than the `Number(env) || default` idiom, which
+   * cannot express zero at all (issue #104): `0 || 2_000_000` is the default, so a
+   * literal zero in either variable would silently configure the cap it was meant to
+   * change. **Stating the direction on each is the only thing that keeps the pair
+   * tellable apart** — an operator who reads one and assumes the other gets the
+   * opposite of what they intended, and for `maxPerJob` that is the permissive
+   * direction. Do not add a separate sentinel for "unlimited": zero already means it
+   * here, and a second spelling is how these caps became inconsistent in the first
+   * place.
+   *
+   * **Turning the per-run ceiling off is not turning every bound off.** The byte cap
+   * still refuses an oversized file and `retentionDays` still reclaims screenshots as
+   * they age, so storage stays bounded by the byte cap times whatever arrives inside
+   * the window. What zero removes is the *count* bound — the one that exists because a
+   * spec's heading count is not ours to control.
+   *
    * `contentTypes` is the accepted format whitelist and is deliberately not
    * env-configurable: it is a security boundary (an SVG is a document that can
    * carry script, and these bytes are served inline from our own origin), not a
@@ -394,8 +451,8 @@ export const config = {
   screenshots: {
     enabled: process.env.SCREENSHOTS_ENABLED !== "false",
     contentTypes: ["image/png", "image/jpeg", "image/webp"],
-    maxBytes: Math.max(0, Math.floor(Number(process.env.SCREENSHOT_MAX_BYTES)) || 2_000_000),
-    maxPerJob: Math.max(0, Math.floor(Number(process.env.SCREENSHOT_MAX_PER_JOB)) || 50),
+    maxBytes: limitFrom(process.env.SCREENSHOT_MAX_BYTES, DEFAULT_SCREENSHOT_MAX_BYTES),
+    maxPerJob: limitFrom(process.env.SCREENSHOT_MAX_PER_JOB, DEFAULT_SCREENSHOT_MAX_PER_JOB),
     retentionDays: Math.max(
       1,
       Math.floor(Number(process.env.SCREENSHOT_RETENTION_DAYS)) || 30,
