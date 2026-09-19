@@ -61,6 +61,18 @@ export const AUDIT_ACTIONS = {
    * an audit reader needs to tell them apart.
    */
   featureGrillRestartedFromMessage: "feature.grill_restarted_from_message",
+  /**
+   * ADR 032 item 3: the Spec interview was *resumed* from a stored session at a
+   * chosen resume point — a true fork, non-destructive in the sense that the earlier
+   * conversation and its session artifact are left intact.
+   *
+   * Written separately from the rewind above because an audit reader has to be able
+   * to tell which of the two gestures happened: they share a job kind and a state
+   * transition, but a rewind re-renders the earlier conversation into a prompt while
+   * a resume continues the agent's own session state — and only one of them leaves
+   * the original conversation readable afterwards.
+   */
+  featureGrillResumedFromMessage: "feature.grill_resumed_from_message",
   featureBuildRetried: "feature.build_retried",
   featureResumed: "feature.resumed",
 

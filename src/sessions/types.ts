@@ -68,13 +68,12 @@ export interface JobSessionContent extends JobSession {
 /**
  * What the Web app is told about a session.
  *
- * Carries no path and no bytes, and **carries no fork points**: ADR 032 item 2
- * sources those from `get_fork_messages`, which is an RPC to a live Pi process and
- * is therefore unavailable once the pod is gone (nothing captures it yet). A
- * `forkPoints: []` here would be the seventh instance of this suite's
- * declared-but-discarded shape — a field whose emptiness reads as "there are none"
- * when the truth is "nobody has asked". So the response says what is true: whether
- * a fork is possible at all, and why not when it is not.
+ * Carries no path and never any bytes. It **does** carry the fork points (item 2),
+ * as their own field with their own state — a doc comment here said otherwise until
+ * ADR 032 item 3's work landed, which made this response the thing a resume control
+ * is built from. The distinction that comment was protecting is still the rule: it is
+ * `forkPoints.state` that says whether the list is an answer, because a bare empty
+ * list would read as "there are none" when the truth may be "nobody asked".
  *
  * `state` is computed server-side from the same rule the sweeper's SQL mirrors, so
  * the client cannot drift from the server about whether an artifact is still there
@@ -123,6 +122,9 @@ export interface PublicJobSession {
    * can be stored while no capture was ever reported — and collapsing them would
    * lose the distinction between "nothing to resume from" and "we could not find
    * out".
+   *
+   * This is what the resume control offers a choice *from*, and its state is what
+   * decides whether there is a choice at all: only `captured` gives a list.
    */
   forkPoints: {
     state: ForkPointState;

@@ -468,20 +468,37 @@ export class FeatureRepository {
   }
 
   /**
-   * ADR 024: rewinds a feature to `draft` for a per-message grill restart,
-   * where the new run's seed is the earlier transcript truncated at the turn
-   * the user chose.
+   * Puts a feature back to `draft` because its Spec interview is being redone from
+   * an earlier point — ADR 024's "restart from here" (a rewind) or ADR 032 item 3's
+   * "resume from here" (a fork).
+   *
+   * **One transition for two gestures, deliberately.** What both gestures share is
+   * the *consequence*: an interview is about to be redone from a point, so whatever
+   * the feature holds as a settled spec is no longer settled. Then `adr_approved`
+   * must be cleared rather than left alone — a fork produces a **new** ADR (its
+   * terminal `submit_adr` calls `setSpecReady`, which does not touch the flag), and
+   * leaving an old approval set would let `queueBuild`'s `adr_approved = TRUE` guard
+   * launch a build against an ADR nobody approved. `awaiting_user_input` is cleared
+   * because the run that was waiting is gone, and the return reason/comment because
+   * they describe a build state that is being discarded.
+   *
+   * So the two gestures genuinely share a state transition, and are still not the
+   * same operation: a rewind renders the earlier conversation into the new run's
+   * *prompt*, whereas a fork restores the session itself and leaves the stored
+   * artifact intact. The difference lives in what the dispatched job carries, not
+   * here — which is why this is one method with a name that is true of both callers
+   * rather than a second copy of the same UPDATE under a new name.
    *
    * Distinct from `resetForRetry` and `restartFromCancelled` rather than a
    * widening of either: those each encode exactly one predecessor state (a
-   * failed grill, a cancelled run), while a rewind is legitimate from several.
+   * failed grill, a cancelled run), while a redo is legitimate from several.
    * The allowed set is passed in and enforced in SQL — the guarded-UPDATE
    * pattern ADR 011 established — so `WHERE status = ANY(...)` is what stops
-   * two concurrent restarts, or a restart racing a build, from both
+   * two concurrent redos, or a redo racing a build, from both
    * transitioning the same feature. A null return means the feature had
    * already moved on and the caller must not dispatch.
    */
-  async resetForMessageRestart(
+  async resetForGrillRedo(
     featureId: string,
     allowedStatuses: readonly string[],
   ): Promise<Feature | null> {

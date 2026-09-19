@@ -189,8 +189,23 @@ interface BuildAppOptions {
   /** ADR 024 state: the latest job (whose events form the transcript) and its events. */
   latestJob?: unknown;
   transcriptEvents?: unknown[];
-  /** Forces `resetForMessageRestart` to report the feature moved on before the rewind landed. */
-  resetForMessageRestartRefused?: boolean;
+  /** Forces `resetForGrillRedo` to report the feature moved on before the rewind landed. */
+  resetForGrillRedoRefused?: boolean;
+  /**
+   * ADR 032 item 3: the stored session row and fork-point row for the latest job, as
+   * `JobSessionRepository` would return them. Both default to null, which is "this
+   * API was never told anything about this run's session" — the state most tests are
+   * in, and the one the resume route has to refuse from.
+   */
+  storedSession?: {
+    outcome: "collected" | "not_collected" | "unavailable";
+    expiresAt: Date | null;
+    purgedAt: Date | null;
+  } | null;
+  storedForkPoints?: {
+    state: "captured" | "unavailable" | "unknown";
+    points: Array<{ entryId: string; text: string }> | null;
+  } | null;
   /*
    * Issue #35: the two knobs that let a create-gate test vary the org's model
    * coverage. Both default to "all five kinds configured and resolvable", which is
@@ -267,8 +282,8 @@ function buildApp(opts: BuildAppOptions) {
     // ADR 024: the guarded rewind. Mirrors the real guard by returning null
     // when the caller opts a feature out, so the "feature moved on" race is
     // exercisable without a database.
-    resetForMessageRestart: vi.fn(async () =>
-      opts.resetForMessageRestartRefused ? null : { ...(opts.feature ?? makeFeature()), status: "draft" },
+    resetForGrillRedo: vi.fn(async () =>
+      opts.resetForGrillRedoRefused ? null : { ...(opts.feature ?? makeFeature()), status: "draft" },
     ),
     queueBuild: vi.fn(async () => opts.feature ?? null),
     resumeImplementation: vi.fn(async () => opts.feature ?? null),
@@ -392,6 +407,18 @@ function buildApp(opts: BuildAppOptions) {
     })),
   };
 
+  /**
+   * ADR 032 item 3: the stored session and fork points the resume route reads.
+   *
+   * Only the two reads that route makes are faked — it resolves the session's
+   * availability from the row's own facts and validates the chosen point against the
+   * capture, so those two are the whole surface it touches.
+   */
+  const jobSessions = {
+    findByJob: vi.fn(async () => opts.storedSession ?? null),
+    findForkPoints: vi.fn(async () => opts.storedForkPoints ?? null),
+  };
+
   app.use(
     "/projects",
     createProjectsRouter({
@@ -402,6 +429,7 @@ function buildApp(opts: BuildAppOptions) {
       tests: tests as never,
       testRunReports: testRunReports as never,
       jobs: jobs as never,
+      jobSessions: jobSessions as never,
       jobEvents: jobEvents as never,
       jobMessages: {} as never,
       notifications: notifications as never,
@@ -1779,7 +1807,7 @@ describe("POST /projects/:projectId/features/:featureId/restart-from-message (AD
   });
 
   it("409s without dispatching when the guarded rewind refuses — the feature moved on", async () => {
-    const { app, feature, project, jobs } = setup({ resetForMessageRestartRefused: true });
+    const { app, feature, project, jobs } = setup({ resetForGrillRedoRefused: true });
 
     const res = await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
 
@@ -1794,7 +1822,7 @@ describe("POST /projects/:projectId/features/:featureId/restart-from-message (AD
 
     await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
 
-    expect(features.resetForMessageRestart).toHaveBeenCalledWith(feature.id, [
+    expect(features.resetForGrillRedo).toHaveBeenCalledWith(feature.id, [
       "draft",
       "spec_ready",
       "failed",
@@ -1827,7 +1855,283 @@ describe("POST /projects/:projectId/features/:featureId/restart-from-message (AD
     const res = await restartRequest(app, project.id, feature.id).send({ eventId: SECOND_TURN });
 
     expect(res.status).toBe(400);
-    expect(features.resetForMessageRestart).not.toHaveBeenCalled();
+    expect(features.resetForGrillRedo).not.toHaveBeenCalled();
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+});
+
+describe("POST /projects/:projectId/features/:featureId/resume-from-message (ADR 032 item 3)", () => {
+  const MODEL_ENV = { MODEL_BASE_URL: "u", MODEL_API_KEY: "k", MODEL_ID: "m" };
+
+  const POINT_ONE = "a1b2c3d4";
+  const POINT_TWO = "c3d4e5f6";
+
+  /** A collected session whose bytes are live, so `permitsFork` holds. */
+  const LIVE_SESSION = { outcome: "collected" as const, expiresAt: null, purgedAt: null };
+
+  /** A capture that answered, with the two points the page would offer. */
+  const CAPTURED = {
+    state: "captured" as const,
+    points: [
+      { entryId: POINT_ONE, text: "Add a saved-cards section." },
+      { entryId: POINT_TWO, text: "Many, with one default." },
+    ],
+  };
+
+  function setup(overrides: Partial<BuildAppOptions> = {}) {
+    const feature = makeFeature({ status: "spec_ready" });
+    const project = makeProject();
+    const built = buildApp({
+      project,
+      feature,
+      orgSecrets: MODEL_ENV,
+      // The source run is the feature's latest job — resolved server-side, never
+      // named by the caller.
+      latestJob: { id: "job_1", kind: "spec_grill", status: "completed" },
+      storedSession: LIVE_SESSION,
+      storedForkPoints: CAPTURED,
+      ...overrides,
+    });
+    return { feature, project, ...built };
+  }
+
+  function resumeRequest(app: express.Express, projectId: string, featureId: string) {
+    return authedRequest(app).post(
+      `/projects/${projectId}/features/${featureId}/resume-from-message`,
+    );
+  }
+
+  /** The argument the route dispatched for the most recent job insert. */
+  function dispatchedJob(jobs: { create: { mock: { calls: unknown[][] } } }) {
+    return jobs.create.mock.calls[0][0] as {
+      kind: string;
+      specContext: Record<string, unknown>;
+      restartedFromEventId?: string;
+      forkFromJobId?: string;
+    };
+  }
+
+  it("dispatches a spec_grill carrying both fork ids, and no rewind marker", async () => {
+    const { app, feature, project, jobs } = setup();
+
+    const res = await resumeRequest(app, project.id, feature.id).send({ entryId: POINT_TWO });
+
+    expect(res.status).toBe(201);
+    expect(jobs.create).toHaveBeenCalledTimes(1);
+
+    const dispatched = dispatchedJob(jobs);
+    expect(dispatched.kind).toBe("spec_grill");
+    // Both ids, because neither is derivable from the other (ADR 032 item 2): the job
+    // says where the bytes are, the entry id where in that session to branch.
+    expect(dispatched.specContext).toEqual({
+      forkFromJobId: "job_1",
+      forkEntryId: POINT_TWO,
+    });
+    // The job's first prompt is the fork point's own text, so a transcript summary
+    // here would be built and then discarded — the shape that reads as finished and
+    // does nothing.
+    expect(dispatched.specContext).not.toHaveProperty("grillTranscriptSummary");
+    // `restartedFromEventId` is a *rewind* marker. Setting it would make the page
+    // announce a rewind over a run that was forked.
+    expect(dispatched.restartedFromEventId).toBeUndefined();
+    // The queryable record of the same relationship, which is what the page reads.
+    expect(dispatched.forkFromJobId).toBe("job_1");
+  });
+
+  it("returns the feature at draft, and leaves the source run alone", async () => {
+    const { app, feature, project, jobs } = setup();
+
+    const res = await resumeRequest(app, project.id, feature.id).send({ entryId: POINT_ONE });
+
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe("draft");
+    // ADR 012's precedent: always a new job row. The source run is not mutated, and
+    // its session artifact is not touched — that is the "non-destructive" claim, and
+    // it is asserted rather than asserted-in-a-comment.
+    expect(jobs.create).toHaveBeenCalledTimes(1);
+    expect(Object.keys(jobs)).not.toContain("update");
+  });
+
+  it("clears the spec-settled state atomically, through the shared guarded update", async () => {
+    const { app, feature, project, features } = setup();
+
+    await resumeRequest(app, project.id, feature.id).send({ entryId: POINT_ONE });
+
+    // The same transition the rewind uses, and the same allowed set: `adr_approved`
+    // has to be cleared because the fork's terminal `submit_adr` overwrites the
+    // markdown and `setSpecReady` does not touch the flag, so a surviving approval
+    // would let `queueBuild` launch a build against an ADR nobody approved.
+    expect(features.resetForGrillRedo).toHaveBeenCalledWith(feature.id, [
+      "draft",
+      "spec_ready",
+      "failed",
+      "cancelled",
+    ]);
+  });
+
+  it("refuses when the feature moved on between the check and the write", async () => {
+    const { app, feature, project, jobs } = setup({ resetForGrillRedoRefused: true });
+
+    const res = await resumeRequest(app, project.id, feature.id).send({ entryId: POINT_ONE });
+
+    // The guarded UPDATE is the race guard: a feature that started a build in the
+    // window is refused rather than silently redone underneath it.
+    expect(res.status).toBe(409);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("records the resume in the audit trail, naming the run and the point", async () => {
+    const { app, feature, project, audit } = setup();
+
+    await resumeRequest(app, project.id, feature.id).send({ entryId: POINT_TWO });
+
+    expect(audit.record).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "feature.grill_resumed_from_message",
+        targetId: feature.id,
+        // A resume has no single "how far": it names the run the conversation came
+        // from *and* the point within it.
+        metadata: expect.objectContaining({
+          forkFromJobId: "job_1",
+          forkEntryId: POINT_TWO,
+        }),
+      }),
+    );
+  });
+
+  it("409s with the state's own explanation when the session cannot be forked", async () => {
+    const { app, feature, project, jobs } = setup({
+      storedSession: { outcome: "not_collected", expiresAt: null, purgedAt: null },
+    });
+
+    const res = await resumeRequest(app, project.id, feature.id).send({ entryId: POINT_ONE });
+
+    expect(res.status).toBe(409);
+    // The sentence the Spec page shows for this state, not a second wording: the
+    // refusal and the notice must describe one fact the same way.
+    expect(res.body.error).toBe("This run did not save a session.");
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("separates 'the capture failed' from 'we were never told' ", async () => {
+    const unavailable = setup({
+      storedForkPoints: { state: "unavailable", points: null },
+    });
+    const unknown = setup({ storedForkPoints: null });
+
+    const first = await resumeRequest(unavailable.app, unavailable.project.id, unavailable.feature.id).send({
+      entryId: POINT_ONE,
+    });
+    const second = await resumeRequest(unknown.app, unknown.project.id, unknown.feature.id).send({
+      entryId: POINT_ONE,
+    });
+
+    // ADR 032 item 5, applied to the resume-point side: two different claims, so two
+    // different sentences — and neither says "there are no points", which is what a
+    // captured empty list means and what neither of these is.
+    expect(first.status).toBe(409);
+    expect(second.status).toBe(409);
+    expect(first.body.error).toBe(
+      "Which points this session can resume from could not be determined.",
+    );
+    expect(second.body.error).toBe("No resumable points were reported for this run.");
+    expect(first.body.error).not.toBe(second.body.error);
+    expect(unavailable.jobs.create).not.toHaveBeenCalled();
+    expect(unknown.jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("404s for an entry id that is not a resume point of this run", async () => {
+    const { app, feature, project, jobs } = setup();
+
+    const res = await resumeRequest(app, project.id, feature.id).send({
+      entryId: "deadbeef",
+    });
+
+    // 404 rather than 409: the caller named something that is not in this run's
+    // conversation, mirroring how the rewind answers a turn that is not in the
+    // transcript. Refused here rather than passed to the Orchestrator, which would
+    // burn a pod to discover what this API already knew.
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe("That is not a resume point of this run's conversation.");
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("accepts a captured empty list as a refusal, not as 'no points to check'", async () => {
+    const { app, feature, project, jobs } = setup({
+      storedForkPoints: { state: "captured", points: [] },
+    });
+
+    const res = await resumeRequest(app, project.id, feature.id).send({ entryId: POINT_ONE });
+
+    // A captured empty list is a real answer — Pi said there are no resumable user
+    // messages — so every entry id is refused. The point of the case is that the
+    // validation ran at all: `points` is non-null here, and the previous test's
+    // separate `unknown` path must not be reachable through this one.
+    expect(res.status).toBe(404);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses when the latest run is not a grill, and when one is already running", async () => {
+    const notAGrill = setup({ latestJob: { id: "job_1", kind: "feature_build", status: "completed" } });
+    const live = setup({ activeSpecGrillJob: { id: "job_2", kind: "spec_grill" } });
+
+    const first = await resumeRequest(notAGrill.app, notAGrill.project.id, notAGrill.feature.id).send({
+      entryId: POINT_ONE,
+    });
+    const second = await resumeRequest(live.app, live.project.id, live.feature.id).send({
+      entryId: POINT_ONE,
+    });
+
+    expect(first.status).toBe(409);
+    expect(first.body.error).toBe("This feature's most recent run is not a grill session.");
+    expect(second.status).toBe(409);
+    // The same condition as the rewind's, and the same reason: a live session is
+    // steered with the reply composer (ADR 006), and branching underneath it would
+    // race the agent still writing to the transcript.
+    expect(second.body.error).toBe("A grill session is already running for this feature.");
+    expect(notAGrill.jobs.create).not.toHaveBeenCalled();
+    expect(live.jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses a feature that is past Spec, in the words of *this* gesture", async () => {
+    const { app, feature, project, jobs } = setup({
+      feature: makeFeature({ status: "running" }),
+    });
+
+    const res = await resumeRequest(app, project.id, feature.id).send({ entryId: POINT_ONE });
+
+    expect(res.status).toBe(409);
+    // Shared conditions, per-gesture wording: the resume must not tell the user its
+    // turns were discarded, because this gesture does not discard them.
+    expect(res.body.error).toContain("resumed");
+    expect(res.body.error).not.toContain("rewound");
+    expect(res.body.error).toContain("running");
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("400s for a missing or blank entry id, before any lookup", async () => {
+    const { app, feature, project, jobs } = setup();
+
+    const missing = await resumeRequest(app, project.id, feature.id).send({});
+    const blank = await resumeRequest(app, project.id, feature.id).send({ entryId: "  " });
+
+    expect(missing.status).toBe(400);
+    expect(blank.status).toBe(400);
+    expect(jobs.create).not.toHaveBeenCalled();
+  });
+
+  it("404s for a project the caller cannot read, before any session read", async () => {
+    const { app, feature, jobs } = setup();
+
+    // A project id that is a valid uuid and is *not* the fixture's — the harness's own
+    // id is `1111...`, so reusing it here would have asserted nothing (and did, until
+    // the first run of this test failed).
+    const res = await resumeRequest(app, "99999999-9999-4999-8999-999999999999", feature.id).send({
+      entryId: POINT_ONE,
+    });
+
+    expect(res.status).toBe(404);
     expect(jobs.create).not.toHaveBeenCalled();
   });
 });
@@ -2522,6 +2826,7 @@ describe("GET /:projectId/features/:featureId/events — the open question's age
         status: "running",
         lastError: null,
         restartedFromEventId: null,
+        forkFromJobId: null,
       },
       transcriptEvents: events,
       feature: { ...feature, awaitingUserInput },
@@ -2666,6 +2971,7 @@ describe("GET /:projectId/features/:featureId/jobs/:jobId/events (issue #28 part
     status: "completed",
     lastError: null,
     restartedFromEventId: null,
+    forkFromJobId: null,
     ...overrides,
   });
 
@@ -2767,6 +3073,7 @@ describe("GET /:projectId/features/:featureId/grill-runs (issue #28 part 2)", ()
     status: "completed" as const,
     createdAt: new Date("2026-09-01T10:00:00.000Z"),
     restartedFromEventId: null,
+    forkFromJobId: null,
     supersedesJobId: null,
     ...overrides,
   });

@@ -23,6 +23,16 @@ export async function dispatchJob(
     targetRevision?: number;
     /** ADR 024: set only by a per-message grill restart — the turn its seed was rewound to. */
     restartedFromEventId?: string;
+    /**
+     * ADR 032 item 3: set only by a per-message grill resume — the earlier run whose
+     * stored session the new run forks from.
+     *
+     * The fork's *entry id* deliberately does not appear here. It is not a property
+     * of the job row; it is a wire field the Orchestrator needs, and it travels in
+     * `specContext` with the job id. Recording it twice would be a second copy of one
+     * fact, free to disagree with the first.
+     */
+    forkFromJobId?: string;
   },
 ) {
   return jobs.create(input);

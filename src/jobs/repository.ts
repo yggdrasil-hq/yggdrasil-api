@@ -24,13 +24,14 @@ interface JobRow {
   completed_at: Date | null;
   target_revision: number | null;
   restarted_from_event_id: string | null;
+  fork_from_job_id: string | null;
 }
 
 const jobColumns = `
     id, project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
     design_name, design_slug, design_description, spec_context,
     design_id, status, last_error, created_at, started_at, completed_at,
-    target_revision, restarted_from_event_id
+    target_revision, restarted_from_event_id, fork_from_job_id
 `;
 
 function mapJob(row: JobRow): Job {
@@ -55,6 +56,7 @@ function mapJob(row: JobRow): Job {
     completedAt: row.completed_at,
     targetRevision: row.target_revision,
     restartedFromEventId: row.restarted_from_event_id,
+    forkFromJobId: row.fork_from_job_id,
   };
 }
 
@@ -76,13 +78,19 @@ export class JobRepository {
     targetRevision?: number;
     /** ADR 024: the transcript turn this run's seed was rewound to, when it is a per-message restart. */
     restartedFromEventId?: string;
+    /**
+     * ADR 032 item 3: the earlier run whose stored session this one forks, when it
+     * is a per-message resume. Also carried in `specContext` for the Orchestrator
+     * — see migration 057 for why the record is both a wire field and a column.
+     */
+    forkFromJobId?: string;
   }, client?: Queryable): Promise<Job> {
     const result = await (client ?? this.db).query<JobRow>(
       `INSERT INTO jobs
          (project_id, kind, feature_id, test_id, test_group, ref, trigger_source,
           design_name, design_slug, design_description, spec_context, status,
-          target_revision, restarted_from_event_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13)
+          target_revision, restarted_from_event_id, fork_from_job_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'pending', $12, $13, $14)
        RETURNING ${jobColumns}`,
       [
         input.projectId,
@@ -98,6 +106,7 @@ export class JobRepository {
         input.specContext ?? null,
         input.targetRevision ?? null,
         input.restartedFromEventId ?? null,
+        input.forkFromJobId ?? null,
       ],
     );
     return mapJob(result.rows[0]);

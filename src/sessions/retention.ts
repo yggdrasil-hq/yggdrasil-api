@@ -110,6 +110,45 @@ export function sessionState(facts: SessionFacts, now: Date): SessionState {
 export const UNKNOWN_SESSION_STATE: SessionState = "unknown";
 
 /**
+ * The availability of a session **as a stored row implies it**, or `unknown` when
+ * there is no row.
+ *
+ * Exported so the read route and the resume route cannot disagree about whether a
+ * run's session can be forked. That is not a hypothetical: the resume control is
+ * offered on the strength of `canFork` in the read response, so if the dispatch
+ * route computed availability its own way the two could disagree and the page would
+ * offer a control the API then refuses — the user-visible form of the "two copies of
+ * one rule" bug this file keeps warning about.
+ *
+ * **`hasData` follows the read route's notion, not the content route's.** A
+ * `collected` row whose object has gone missing from the bucket reads as
+ * `available` here and 404s at the content route; that split is deliberate (this
+ * route reports what was *recorded*, that one what can be *fetched*). For a fork it
+ * matters in the right direction: such a session is refused downstream as a
+ * `write`-stage failure — the stage that exists for exactly "the artifact never
+ * reached the pod" — rather than as an API refusal the page has no control for.
+ */
+export function storedSessionState(
+  session: {
+    outcome: SessionOutcome;
+    expiresAt: Date | null;
+    purgedAt: Date | null;
+  } | null,
+  now: Date,
+): SessionState {
+  if (!session) return UNKNOWN_SESSION_STATE;
+  return sessionState(
+    {
+      outcome: session.outcome,
+      hasData: session.outcome === "collected",
+      expiresAt: session.expiresAt,
+      purgedAt: session.purgedAt,
+    },
+    now,
+  );
+}
+
+/**
  * Whether this state means a true fork can be attempted against the stored
  * session.
  *

@@ -7,7 +7,7 @@ import { routeParam } from "../shared/route-param.js";
 import { isUuid } from "../shared/uuid.js";
 import { UserRepository } from "../users/repository.js";
 import type { JobSessionRepository } from "./repository.js";
-import { permitsFork, sessionState, UNKNOWN_FORK_POINT_STATE, UNKNOWN_SESSION_STATE } from "./retention.js";
+import { permitsFork, sessionState, storedSessionState, UNKNOWN_FORK_POINT_STATE } from "./retention.js";
 import {
   forkPointStateExplanation,
   sessionStateExplanation,
@@ -107,22 +107,13 @@ export function createSessionsRouter(deps: {
        * API was never told anything — an install with collection switched off
        * produces this and never the other. Naming it correctly is item 5's
        * requirement; the explanation is what the UI shows.
+       *
+       * The computation is `storedSessionState`'s rather than restated here, because
+       * ADR 032 item 3's resume route derives `canFork` from the same call: if the two
+       * routes each decided availability, the page could offer a resume the API then
+       * refuses.
        */
-      const state = session
-        ? sessionState(
-            {
-              outcome: session.outcome,
-              // A collected row's bytes are available unless a tombstone says
-              // otherwise. The live-object-missing case still reads as available
-              // here and 404s at the content route, which is the honest split: this
-              // route reports what was recorded, that one what can be fetched.
-              hasData: session.outcome === "collected",
-              expiresAt: session.expiresAt,
-              purgedAt: session.purgedAt,
-            },
-            new Date(),
-          )
-        : UNKNOWN_SESSION_STATE;
+      const state = storedSessionState(session, new Date());
 
       /*
        * The fork points are read in the same response, and the two states they carry
