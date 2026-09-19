@@ -2491,3 +2491,136 @@ describe("PUT /:projectId/timezone (issue #31 part 1)", () => {
     expect(projects.setTimeZone).not.toHaveBeenCalled();
   });
 });
+
+describe("GET /:projectId/features/:featureId/events — the open question's age (issue #92)", () => {
+  const project = makeProject();
+  const feature = makeFeature({ status: "draft" });
+  const url = `/projects/${project.id}/features/${feature.id}/events`;
+
+  /** The latest job is a spec_grill with the given events, or none at all. */
+  function grillJob(events: unknown[] | undefined, awaitingUserInput: boolean) {
+    return {
+      project,
+      // `findLatestJob` returns a job or null; the route only reads `kind`,
+      // `status`, `lastError` and `restartedFromEventId` from it.
+      latestJob: {
+        id: "44444444-4444-4444-8444-444444444444",
+        kind: "spec_grill",
+        status: "running",
+        lastError: null,
+        restartedFromEventId: null,
+      },
+      transcriptEvents: events,
+      feature: { ...feature, awaitingUserInput },
+    };
+  }
+
+  const askEvent = {
+    id: "evt_ask",
+    jobId: "44444444-4444-4444-8444-444444444444",
+    type: "ask_user",
+    question: "Which database?",
+    createdAt: new Date("2026-01-01T10:00:00.000Z"),
+  };
+
+  it("reports when the unanswered question was asked, and the bound", async () => {
+    const { app } = buildApp(grillJob([askEvent], true));
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(200);
+    expect(res.body.awaitingReply).toEqual({
+      since: "2026-01-01T10:00:00.000Z",
+      timeoutMs: 24 * 60 * 60 * 1000,
+      timeoutSource: "default",
+      // The suite sets no GRILL_REPLY_TIMEOUT, so the shipped default is what is
+      // reported — which is the value the mirror test pins to the Orchestrator's.
+    });
+  });
+
+  it("reports nothing once the question has been answered", async () => {
+    const { app } = buildApp(
+      grillJob(
+        [askEvent, { ...askEvent, id: "evt_reply", type: "user_message", createdAt: new Date("2026-01-01T10:01:00.000Z") }],
+        false,
+      ),
+    );
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(200);
+    expect(res.body.awaitingReply).toBeNull();
+  });
+
+  /*
+   * The two halves disagreeing, in both directions. Both are real races rather
+   * than hypotheticals: `awaiting_user_input` and the `ask_user` row are written
+   * by separate best-effort steps (`syncFeatureState` runs after the event has
+   * been committed), so a read can land between them. Neither direction may
+   * invent an age.
+   */
+  it("reports nothing when the flag is set but no question is open", async () => {
+    const { app } = buildApp(grillJob([], true));
+
+    expect((await authedRequest(app).get(url)).body.awaitingReply).toBeNull();
+  });
+
+  it("reports nothing when a question is open but the flag was not set", async () => {
+    const { app } = buildApp(grillJob([askEvent], false));
+
+    expect((await authedRequest(app).get(url)).body.awaitingReply).toBeNull();
+  });
+
+  it("reports nothing for a feature with no job", async () => {
+    // The early return. `awaitingReply: null` rather than absent, so a client
+    // can read the field unconditionally instead of treating `undefined` as a
+    // third state — the same reason the no-wait case is an explicit null.
+    const { app } = buildApp({ project, feature: { ...feature, awaitingUserInput: true } });
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.status).toBe(200);
+    expect(res.body.awaitingReply).toBeNull();
+    expect(res.body.events).toEqual([]);
+  });
+
+  it("leaves the rest of the read unchanged", async () => {
+    // The age is additive: the transcript read the grill page already depends on
+    // must keep its shape, or #92's fix breaks the surface it exists to serve.
+    const { app } = buildApp(grillJob([askEvent], true));
+
+    const res = await authedRequest(app).get(url);
+
+    expect(res.body.jobStatus).toBe("running");
+    expect(res.body.jobKind).toBe("spec_grill");
+    expect(res.body.lastError).toBeNull();
+    expect(res.body.restartedFromEventId).toBeNull();
+    expect(res.body.events).toHaveLength(1);
+    expect(res.body.events[0].type).toBe("ask_user");
+  });
+
+  it("404s for a project the caller cannot access", async () => {
+    // The access gate is the project, not the feature: this is the same
+    // `getOwnedProject` check every project-scoped route uses. (The feature fake
+    // answers for any id, so an unknown *feature* is not reachable here — a
+    // malformed one is, below, because the route rejects it before the
+    // repository.)
+    const { app } = buildApp(grillJob([askEvent], true));
+
+    const res = await authedRequest(app).get(
+      `/projects/99999999-9999-4999-8999-999999999999/features/${feature.id}/events`,
+    );
+
+    expect(res.status).toBe(404);
+  });
+
+  it("404s for a malformed feature id rather than querying with it", async () => {
+    const { app } = buildApp(grillJob([askEvent], true));
+
+    const res = await authedRequest(app).get(
+      `/projects/${project.id}/features/not-a-uuid/events`,
+    );
+
+    expect(res.status).toBe(404);
+  });
+});

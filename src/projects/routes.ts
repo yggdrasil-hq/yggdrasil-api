@@ -24,6 +24,7 @@ import type { TestRunReportRepository } from "../tests/reports-repository.js";
 import { toPublicTestRunExecution } from "../tests/report-types.js";
 import { toPublicTestRunHistoryEntry } from "../tests/run-history.js";
 import { toPublicAgenticReview } from "../features/review-types.js";
+import { deriveAwaitingReply } from "../jobs/grill-wait.js";
 import { isValidTimeZone } from "../scheduling/timezone.js";
 import {
   isValidCronExpression,
@@ -2360,6 +2361,9 @@ export function createProjectsRouter(deps: {
         lastError: null,
         jobKind: null,
         restartedFromEventId: null,
+        // Issue #92: present exactly when a human owes an answer, so this mirrors
+        // the no-job case honestly — a feature with no job is waiting on nothing.
+        awaitingReply: null,
         events: [],
       });
       return;
@@ -2375,6 +2379,24 @@ export function createProjectsRouter(deps: {
       lastError: job.lastError,
       jobKind: job.kind,
       restartedFromEventId: job.restartedFromEventId,
+      /**
+       * Issue #92: how long this grill has been waiting on an unanswered
+       * question, or null when it is not waiting.
+       *
+       * **On this read rather than the feature read, deliberately.** The age is
+       * derived from these events (`jobs/grill-wait.ts`), and this endpoint is the
+       * one the grill surface already polls, so putting it here means a client
+       * needs no second call and the number travels beside its own evidence. The
+       * feature read keeps owning `awaitingUserInput`, which is the boolean the
+       * rest of the app gates on — this is the *when*, not a second answer to
+       * *whether*.
+       */
+      awaitingReply: deriveAwaitingReply({
+        awaitingUserInput: feature.awaitingUserInput,
+        events,
+        timeoutMs: config.grills.replyTimeoutMs,
+        timeoutSource: config.grills.replyTimeoutSource,
+      }),
       events,
     });
   });
