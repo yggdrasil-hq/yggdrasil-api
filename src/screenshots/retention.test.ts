@@ -81,6 +81,19 @@ describe("rejectScreenshotUpload", () => {
     );
   });
 
+  it("treats a byte cap of zero as refusing everything, not as switched off", () => {
+    // Issue #107. The half of the pair that had no test: `exceedsSizeCap` is
+    // `byteSize > maxBytes`, so zero refuses every non-empty screenshot. This is
+    // the SAME reading as `RECORDING_MAX_BYTES` and `SESSION_MAX_BYTES`, and the
+    // OPPOSITE of the per-job cap tested two cases below.
+    //
+    // Empty is refused by its own rule regardless (see the case above), so the
+    // input here is deliberately a normal non-empty body: the claim is about the
+    // size cap's reading and not about emptiness leaking in.
+    expect(reject({ byteSize: 120_000, maxBytes: 0 })).toContain("exceeds the 0 B limit");
+    expect(reject({ byteSize: 1, maxBytes: 0 })).not.toBeNull();
+  });
+
   it("refuses a non-finite size rather than letting it through", () => {
     expect(reject({ byteSize: Number.NaN })).not.toBeNull();
     expect(reject({ byteSize: Number.POSITIVE_INFINITY })).not.toBeNull();
@@ -97,10 +110,42 @@ describe("rejectScreenshotUpload", () => {
   });
 
   it("treats a per-job cap of zero as switched off", () => {
-    // The convention `RECORDING_MAX_BYTES` sets: 0 is an instruction, not an
-    // unset value. Reading it as "zero permitted" would silently disable the
-    // whole feature for anyone who configured it that way.
+    // Issue #107. Zero here means **no per-run ceiling at all**, which is the
+    // OPPOSITE of the byte cap's zero above — the two share a prefix and sit
+    // adjacent in the env file, so the pair is exactly what an operator can
+    // misread. Naming the direction is what makes it memorable: this one fails
+    // *open*, that one fails *closed*.
+    //
+    // The reading is not a choice made here — the guard is `maxPerJob > 0 && …`, so
+    // zero skipping the check is what the expression already says. It matches
+    // `LIVE_DELTA_BYTES_PER_JOB`, whose zero the delta relay reads the same way.
+    //
+    // What zero does NOT switch off: the byte cap above still refuses an oversized
+    // file, and retention still reclaims as screenshots age. Only the count bound —
+    // the one that exists because a spec's heading count is not ours to control —
+    // is gone.
     expect(reject({ screenshotsForJob: 9_999, maxPerJob: 0 })).toBeNull();
+  });
+
+  it("reads zero in opposite directions for the two caps, so neither can be assumed from the other", () => {
+    // The assertion a future edit that "unifies" the pair has to break, and the
+    // reason it sits beside the two cases above rather than only under each cap:
+    // each cap's own case passes under a unification, because a unified rule still
+    // produces *a* value at zero. Only asserting that the two DIFFER catches it.
+    //
+    // Same input shape in both halves — a normal 120 kB screenshot, a job with
+    // screenshots already — with zero in one variable and a real value in the other,
+    // so the outcome differs only because the two zeros mean different things.
+
+    // The byte cap: zero refuses it.
+    expect(
+      reject({ byteSize: 120_000, maxBytes: 0, screenshotsForJob: 9_999, maxPerJob: 50 }),
+    ).toContain("exceeds the 0 B limit");
+
+    // The per-job cap: zero lets the ten-thousandth screenshot through.
+    expect(
+      reject({ byteSize: 120_000, maxBytes: 2_000_000, screenshotsForJob: 9_999, maxPerJob: 0 }),
+    ).toBeNull();
   });
 
   it("checks size before count, so an oversized file is reported as oversized", () => {

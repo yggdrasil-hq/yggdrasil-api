@@ -3,6 +3,8 @@ import {
   DEFAULT_GRILL_REPLY_TIMEOUT_MS,
   DEFAULT_LIVE_DELTA_BYTES_PER_JOB,
   DEFAULT_RECORDING_MAX_BYTES,
+  DEFAULT_SCREENSHOT_MAX_BYTES,
+  DEFAULT_SCREENSHOT_MAX_PER_JOB,
   DEFAULT_SESSION_MAX_BYTES,
   GRILL_REPLY_TIMEOUT_ENV,
   appPublicRedirect,
@@ -185,6 +187,22 @@ describe("every cap reaches zero, and keeps its own default (#104)", () => {
       fallback: DEFAULT_SESSION_MAX_BYTES,
       means: "reclaim every session",
     },
+    // Issue #107's pair, and the reason the `means` field is load-bearing rather
+    // than decorative: these two share a prefix, sit adjacent in the env file, and
+    // read zero in OPPOSITE directions. The strings below are the only place the
+    // difference is stated as a fact a test holds.
+    {
+      env: "SCREENSHOT_MAX_BYTES",
+      read: (c: typeof config) => c.screenshots.maxBytes,
+      fallback: DEFAULT_SCREENSHOT_MAX_BYTES,
+      means: "refuse every non-empty screenshot (fails closed)",
+    },
+    {
+      env: "SCREENSHOT_MAX_PER_JOB",
+      read: (c: typeof config) => c.screenshots.maxPerJob,
+      fallback: DEFAULT_SCREENSHOT_MAX_PER_JOB,
+      means: "permit every screenshot, i.e. no per-run ceiling (fails open)",
+    },
   ];
 
   /** `config` re-evaluated with `name` set to `value`, or removed when undefined. */
@@ -227,5 +245,20 @@ describe("every cap reaches zero, and keeps its own default (#104)", () => {
     // (`DefaultSessionMaxBytes`), and this asserts the equality so a change on
     // either side goes red here.
     expect(DEFAULT_SESSION_MAX_BYTES).toBe(5_000_000);
+  });
+
+  it("pins the screenshot cap to the Orchestrator's own default", () => {
+    // The same coupling as the session cap above, and the same reason to pin it —
+    // but with a wrinkle the session cap does not have: **both services read this
+    // one variable name**, `SCREENSHOT_MAX_BYTES`, and the Orchestrator resolves it
+    // independently (`orchestrator/cmd/server/main.go`'s `resolveScreenshotMaxBytes`,
+    // whose default is `worker.DefaultScreenshotMaxBytes`). Its own env example says
+    // the two "must agree" and tells an operator to set the variable on both sides,
+    // so a drift here is a divergence in a value an operator believes is singular.
+    //
+    // Pinning became possible to state precisely in #107, which extracted this from
+    // an inline literal into the named constant above — the price of the name is a
+    // number now worth asserting.
+    expect(DEFAULT_SCREENSHOT_MAX_BYTES).toBe(2_000_000);
   });
 });
