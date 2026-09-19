@@ -188,6 +188,25 @@ const requestedActionItemSchema = z.object({
  * `min(1)` stays: an empty delta carries no text and `encodeDeltaPayload` rejects
  * it, so accepting it here would just move the drop downstream.
  */
+/**
+ * Whether the body is *claiming* to be a streaming delta, regardless of whether
+ * it validated.
+ *
+ * Used to route a failed delta parse to a delta-shaped error (issue #78). Kept
+ * deliberately loose — `type` alone, no `message` check — because the point is to
+ * recognise the *intent* of a malformed payload: a body with
+ * `type: "agent_text_delta"` that fails validation is a bad delta, not a bad
+ * stored event, and reporting it as the latter is what made the size bound's
+ * message unreachable.
+ */
+function isDeltaBody(body: unknown): boolean {
+  return (
+    typeof body === "object" &&
+    body !== null &&
+    (body as { type?: unknown }).type === "agent_text_delta"
+  );
+}
+
 const jobEventDeltaSchema = z.object({
   type: z.literal("agent_text_delta"),
   message: z
@@ -335,11 +354,26 @@ export function createJobsInternalRouter(deps: {
       const delta = jobEventDeltaSchema.safeParse(req.body);
       if (delta.success) {
         await publishDelta(deps, live, jobId, delta.data.message, deltaBytesPerJob);
-        // 202, not 201: nothing was created. The caller cannot tell the
-        // difference between a relayed delta and a dropped one, and that is
+        // 202, not 201: nothing was created. For a delta that *fits*, the caller
+        // still cannot tell a relayed one from a dropped one, and that is
         // intended — deltas are best-effort and an error would report something
-        // the agent could not act on.
+        // the agent could not act on (the per-job ceiling can drop one
+        // asynchronously, after this response).
         res.status(202).json({});
+        return;
+      }
+
+      // Issue #78, caller-visible half: a delta that fails its *size* bound has to
+      // say so. Without this it fell through to `jobEventSchema`, which rejects
+      // the type — so an oversize payload was reported as an invalid event type,
+      // and the schema's carefully-worded size message was unreachable. That was
+      // also fragile in the other direction: adding `agent_text_delta` to the
+      // stored-event enum, or reordering the two parses, would have turned an
+      // oversize delta back into a silent 202-and-drop.
+      if (isDeltaBody(req.body)) {
+        res.status(400).json({
+          error: delta.error.issues[0]?.message ?? "Invalid delta",
+        });
         return;
       }
 
