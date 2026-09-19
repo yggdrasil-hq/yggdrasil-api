@@ -113,10 +113,10 @@ describe("relayEnvelopeFor", () => {
   it("routes an event to its feature's topic with the wire shape", () => {
     const envelope = relayEnvelopeFor(scope());
     expect(envelope?.topic).toBe(`feature:${FEATURE_ID}`);
+    // One frame shape for every scope, with the scope as a value (ADR 033 §1).
     expect(envelope?.frame).toEqual({
-      type: "job_event",
-      featureId: FEATURE_ID,
-      jobId: "job_1",
+      type: "event",
+      scope: { kind: "feature", id: FEATURE_ID },
       event: expect.objectContaining({
         id: EVENT_ID,
         type: "agent_text",
@@ -134,24 +134,28 @@ describe("relayEnvelopeFor", () => {
     );
 
     expect(envelope?.topic).toBe(`design:${SESSION_ID}`);
-    // A distinct frame type, not a `job_event` carrying a session id in a field
-    // named `featureId` — the frame should say which topic shape it arrived on.
+    // The scope carries the session id *and* its kind, so the frame says what the
+    // id means rather than leaving it to the frame's name — which is what replaced
+    // version 1's separate `design_session_event` type (ADR 033 §1).
     expect(envelope?.frame).toEqual({
-      type: "design_session_event",
-      sessionId: SESSION_ID,
+      type: "event",
+      scope: { kind: "design_session", id: SESSION_ID },
       event: expect.objectContaining({ id: EVENT_ID, type: "agent_text" }),
     });
   });
 
-  it("carries the session id once, since it is also the job id", () => {
+  it("carries the session id on the scope, since it is also the job id", () => {
     // The REST route resolves a session as `findByIdForProject(projectId, sessionId)`,
     // i.e. the session id *is* the job id. Carrying both on the frame would be two
-    // spellings of one value for a reader to wonder about.
+    // spellings of one value for a reader to wonder about — and under ADR 033 §1
+    // there is no separate `sessionId` field left for the second spelling to live in.
     const envelope = relayEnvelopeFor(
       scope({ featureId: null, jobKind: "design_grill", event: { ...scope().event, jobId: SESSION_ID } }),
     );
 
     expect(envelope?.frame).not.toHaveProperty("featureId");
+    expect(envelope?.frame).not.toHaveProperty("sessionId");
+    expect(envelope?.frame).toMatchObject({ scope: { kind: "design_session", id: SESSION_ID } });
     expect((envelope?.frame as { event: { jobId: string } }).event.jobId).toBe(SESSION_ID);
   });
 
@@ -166,14 +170,12 @@ describe("relayEnvelopeFor", () => {
     );
 
     expect(envelope?.topic).toBe(`test:${TEST_ID}`);
-    // A distinct frame type for the same reason as the design frame: the scope id
-    // names a `tests` row, and `job_event.featureId` would be the wrong name for
-    // it. `testId` and the event's `jobId` are both carried because they are two
-    // genuinely different values.
+    // The scope id names a `tests` row, and the `event` inside still carries its own
+    // `jobId` — two genuinely different values, now in fields that say which is
+    // which instead of one frame type per scope.
     expect(envelope?.frame).toEqual({
-      type: "test_run_event",
-      testId: TEST_ID,
-      jobId: "job_1",
+      type: "event",
+      scope: { kind: "test", id: TEST_ID },
       event: expect.objectContaining({ id: EVENT_ID, type: "agent_text" }),
     });
   });
@@ -187,7 +189,10 @@ describe("relayEnvelopeFor", () => {
     const envelope = relayEnvelopeFor(scope({ jobKind: "test_run", testId: TEST_ID }));
 
     expect(envelope?.topic).toBe(`feature:${FEATURE_ID}`);
-    expect(envelope?.frame).toMatchObject({ type: "job_event" });
+    expect(envelope?.frame).toMatchObject({
+      type: "event",
+      scope: { kind: "feature", id: FEATURE_ID },
+    });
   });
 
   it("still returns null for a feature-less, test-less job", () => {
@@ -207,7 +212,10 @@ describe("relayEnvelopeFor", () => {
     const envelope = relayEnvelopeFor(scope({ jobKind: "design_grill" }));
 
     expect(envelope?.topic).toBe(`feature:${FEATURE_ID}`);
-    expect(envelope?.frame).toMatchObject({ type: "job_event" });
+    expect(envelope?.frame).toMatchObject({
+      type: "event",
+      scope: { kind: "feature", id: FEATURE_ID },
+    });
   });
 });
 
@@ -220,12 +228,16 @@ describe("startLiveRelay: deltas", () => {
 
     fake.emit("notification", {
       channel: LIVE_JOB_EVENT_DELTAS_CHANNEL,
-      payload: JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1", text: "Hello " }),
+      payload: JSON.stringify({
+        scope: { kind: "feature", id: FEATURE_ID },
+        jobId: "job_1",
+        text: "Hello ",
+      }),
     });
     await flush();
 
     expect(received).toEqual([
-      { type: "job_event_delta", featureId: FEATURE_ID, jobId: "job_1", text: "Hello " },
+      { type: "delta", scope: { kind: "feature", id: FEATURE_ID }, text: "Hello " },
     ]);
     expect(findByIdWithScope).not.toHaveBeenCalled();
   });
@@ -238,7 +250,7 @@ describe("startLiveRelay: deltas", () => {
     for (const text of ["Drafting ", "the ", "ADR."]) {
       fake.emit("notification", {
         channel: LIVE_JOB_EVENT_DELTAS_CHANNEL,
-        payload: JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1", text }),
+        payload: JSON.stringify({ scope: { kind: "feature", id: FEATURE_ID }, jobId: "job_1", text }),
       });
     }
     await flush();
@@ -260,7 +272,11 @@ describe("startLiveRelay: deltas", () => {
     });
     await flush();
 
-    const deltaPayload = JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1", text: "x" });
+    const deltaPayload = JSON.stringify({
+      scope: { kind: "feature", id: FEATURE_ID },
+      jobId: "job_1",
+      text: "x",
+    });
 
     fake.emit("notification", { channel: LIVE_JOB_EVENT_DELTAS_CHANNEL, payload: EVENT_ID });
     fake.emit("notification", { channel: LIVE_JOB_EVENTS_CHANNEL, payload: deltaPayload });
@@ -282,7 +298,7 @@ describe("startLiveRelay: deltas", () => {
     fake.emit("notification", { channel: LIVE_JOB_EVENT_DELTAS_CHANNEL, payload: "{}" });
     fake.emit("notification", {
       channel: LIVE_JOB_EVENT_DELTAS_CHANNEL,
-      payload: JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1", text: "" }),
+      payload: JSON.stringify({ scope: { kind: "feature", id: FEATURE_ID }, jobId: "job_1", text: "" }),
     });
     await flush();
 
@@ -300,12 +316,16 @@ describe("startLiveRelay: deltas", () => {
 
     fake.emit("notification", {
       channel: LIVE_JOB_EVENT_DELTAS_CHANNEL,
-      payload: JSON.stringify({ featureId: FEATURE_ID, jobId: "job_2", text: "retry text" }),
+      payload: JSON.stringify({
+        scope: { kind: "feature", id: FEATURE_ID },
+        jobId: "job_2",
+        text: "retry text",
+      }),
     });
     await flush();
 
     expect(received).toEqual([
-      { type: "job_event_delta", featureId: FEATURE_ID, jobId: "job_2", text: "retry text" },
+      { type: "delta", scope: { kind: "feature", id: FEATURE_ID }, text: "retry text" },
     ]);
   });
 
@@ -316,7 +336,7 @@ describe("startLiveRelay: deltas", () => {
 
     fake.emit("notification", {
       channel: LIVE_JOB_EVENT_DELTAS_CHANNEL,
-      payload: JSON.stringify({ featureId: FEATURE_ID, jobId: "job_1", text: "late" }),
+      payload: JSON.stringify({ scope: { kind: "feature", id: FEATURE_ID }, jobId: "job_1", text: "late" }),
     });
     await flush();
 
@@ -348,7 +368,10 @@ describe("startLiveRelay", () => {
 
     expect(findByIdWithScope).toHaveBeenCalledWith(EVENT_ID);
     expect(received).toHaveLength(1);
-    expect(received[0]).toMatchObject({ type: "job_event", featureId: FEATURE_ID });
+    expect(received[0]).toMatchObject({
+      type: "event",
+      scope: { kind: "feature", id: FEATURE_ID },
+    });
   });
 
   it("ignores notifications on other channels and empty payloads", async () => {
@@ -371,7 +394,7 @@ describe("startLiveRelay", () => {
     expect(missing.received).toEqual([]);
 
     const noFeature = build({
-      findByIdWithScope: vi.fn(async () => scope({ featureId: null })),
+      findByIdWithScope: vi.fn(async () => scope({ featureId: null, jobKind: "deploy", testId: null })),
     });
     noFeature.fake.emit("notification", { channel: LIVE_JOB_EVENTS_CHANNEL, payload: EVENT_ID });
     await flush();

@@ -27,7 +27,11 @@ describe("PostgresDeltaPublisher", () => {
     const { db, queries } = fakeDb();
     const publisher = new PostgresDeltaPublisher(db as never);
 
-    await publisher.publishDelta({ featureId: FEATURE_ID, jobId: JOB_ID, text: "Hello " });
+    await publisher.publishDelta({
+      scope: { kind: "feature", id: FEATURE_ID },
+      jobId: JOB_ID,
+      text: "Hello ",
+    });
 
     expect(queries).toHaveLength(1);
     // Parameterised, not interpolated — the text is model output.
@@ -37,11 +41,13 @@ describe("PostgresDeltaPublisher", () => {
     // The payload is the whole message: a delta is never stored, so unlike a
     // stored event there is no row to read back.
     const payload = String(queries[0].values?.[1]);
-    expect(deltaFromPayload(payload)?.frame).toMatchObject({
-      type: "job_event_delta",
-      featureId: FEATURE_ID,
-      jobId: JOB_ID,
-      text: "Hello ",
+    expect(deltaFromPayload(payload)).toEqual({
+      topic: `feature:${FEATURE_ID}`,
+      frame: {
+        type: "delta",
+        scope: { kind: "feature", id: FEATURE_ID },
+        text: "Hello ",
+      },
     });
   });
 
@@ -50,7 +56,7 @@ describe("PostgresDeltaPublisher", () => {
     // row, and must not cost a lookup.
     const { db, queries } = fakeDb();
     await new PostgresDeltaPublisher(db as never).publishDelta({
-      featureId: FEATURE_ID,
+      scope: { kind: "feature", id: FEATURE_ID },
       jobId: JOB_ID,
       text: "a",
     });
@@ -68,7 +74,7 @@ describe("PostgresDeltaPublisher", () => {
     const publisher = new PostgresDeltaPublisher(db as never, { onError });
 
     await publisher.publishDelta({
-      featureId: FEATURE_ID,
+      scope: { kind: "feature", id: FEATURE_ID },
       jobId: JOB_ID,
       text: "x".repeat(20_000),
     });
@@ -82,7 +88,11 @@ describe("PostgresDeltaPublisher", () => {
     const onError = vi.fn();
     const publisher = new PostgresDeltaPublisher(db as never, { onError });
 
-    await publisher.publishDelta({ featureId: FEATURE_ID, jobId: JOB_ID, text: "" });
+    await publisher.publishDelta({
+      scope: { kind: "feature", id: FEATURE_ID },
+      jobId: JOB_ID,
+      text: "",
+    });
 
     expect(queries).toHaveLength(0);
     expect(onError).toHaveBeenCalledWith(expect.stringContaining("empty field"));
@@ -95,7 +105,7 @@ describe("PostgresDeltaPublisher", () => {
     const db = { query: vi.fn(async () => { throw new Error("notify failed"); }) };
     await expect(
       new PostgresDeltaPublisher(db as never).publishDelta({
-        featureId: FEATURE_ID,
+        scope: { kind: "feature", id: FEATURE_ID },
         jobId: JOB_ID,
         text: "a",
       }),
@@ -109,7 +119,11 @@ describe("NOOP_LIVE_PUBLISHER", () => {
     // rather than an error, so that turning the relay off cannot break a job.
     const publisher: LivePublisher = NOOP_LIVE_PUBLISHER;
     await expect(
-      publisher.publishDelta({ featureId: FEATURE_ID, jobId: JOB_ID, text: "ignored" }),
+      publisher.publishDelta({
+        scope: { kind: "feature", id: FEATURE_ID },
+        jobId: JOB_ID,
+        text: "ignored",
+      }),
     ).resolves.toBeUndefined();
   });
 });

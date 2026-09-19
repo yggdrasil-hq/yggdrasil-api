@@ -156,6 +156,13 @@ function buildApp(deps: {
       const previousBytes = deps.deltaBytes ?? 0;
       return {
         featureId: job.featureId,
+        // ADR 033 §5: the real repository returns these two from the same
+        // `RETURNING` clause, because the delta path now resolves its scope the
+        // same way the stored-event path does. The fake mirrors that rather than
+        // returning only the feature, or a test could not tell a design session's
+        // delta from a dropped one.
+        testId: job.testId,
+        jobKind: job.kind,
         previousBytes,
         totalBytes: previousBytes + (deps.deltaBytesPerCall ?? bytes),
       };
@@ -263,6 +270,8 @@ function buildApp(deps: {
 }
 
 const JOB_ID = "2d88c75e-7ad0-458c-8da5-ce8684ce6fa6";
+/** Issue #90: a `tests` row id, for the test-scoped delta case. */
+const TEST_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 const ORG_ID = "11111111-1111-4111-8111-111111111111";
 
 describe("POST /internal/jobs/:jobId/events", () => {
@@ -1564,7 +1573,7 @@ describe("POST /internal/jobs/:jobId/events (streaming deltas, ADR 019 item 13)"
     expect(res.body).toEqual({});
     expect(create).not.toHaveBeenCalled();
     expect(publishDelta).toHaveBeenCalledWith({
-      featureId: "feature_42",
+      scope: { kind: "feature", id: "feature_42" },
       jobId: JOB_ID,
       text: "Drafting ",
     });
@@ -1604,17 +1613,72 @@ describe("POST /internal/jobs/:jobId/events (streaming deltas, ADR 019 item 13)"
       .send({ type: "agent_text_delta", message: "chunk", featureId: "feature_attacker" });
 
     expect(publishDelta).toHaveBeenCalledWith({
-      featureId: "feature_from_db",
+      scope: { kind: "feature", id: "feature_from_db" },
       jobId: JOB_ID,
       text: "chunk",
     });
   });
 
-  it("drops a delta for a job with no feature", async () => {
-    // ADR 014's project-scoped design_grill has no feature topic to route to.
+  it("relays a delta for a design session, which has no feature at all", async () => {
+    // **This is issue #95's fix, at the route.** `publishDelta` used to return
+    // early on `!recorded.featureId`, so a `design_grill` — project-scoped, with no
+    // `feature_id` (ADR 014) — could never relay a delta and its prose arrived per
+    // message instead of per token. The scope now resolves from the job the same way
+    // the stored-event path resolves it, and a design session is a scope like any
+    // other.
     const publishDelta = vi.fn(async () => undefined);
     const app = buildApp({
-      findById: async () => makeJob({ id: JOB_ID, featureId: null }),
+      findById: async () =>
+        makeJob({ id: JOB_ID, featureId: null, kind: "design_grill" }),
+      publishDelta,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text_delta", message: "a mockup" });
+
+    expect(res.status).toBe(202);
+    expect(publishDelta).toHaveBeenCalledWith({
+      // The scope id is the *job* id: a design session is a `design_grill` job, and
+      // that is how the REST route resolves its `:sessionId`.
+      scope: { kind: "design_session", id: JOB_ID },
+      jobId: JOB_ID,
+      text: "a mockup",
+    });
+  });
+
+  it("relays a delta for a scheduled test_run, on the test scope", async () => {
+    // Issue #90's scope, now reachable from the delta path too — before ADR 033 the
+    // same `!featureId` guard dropped these.
+    const publishDelta = vi.fn(async () => undefined);
+    const app = buildApp({
+      findById: async () =>
+        makeJob({ id: JOB_ID, featureId: null, kind: "test_run", testId: TEST_ID }),
+      publishDelta,
+    });
+
+    const res = await request(app)
+      .post(`/internal/jobs/${JOB_ID}/events`)
+      .set("Authorization", "Bearer test-internal-api-token")
+      .send({ type: "agent_text_delta", message: "2 of 5 passing" });
+
+    expect(res.status).toBe(202);
+    expect(publishDelta).toHaveBeenCalledWith({
+      scope: { kind: "test", id: TEST_ID },
+      jobId: JOB_ID,
+      text: "2 of 5 passing",
+    });
+  });
+
+  it("drops a delta for a job with no scope at all", async () => {
+    // What survives of the old "no feature" case: a job that is neither
+    // feature-scoped, a design session, nor test-scoped has nowhere to go — nothing
+    // produces one, so this is a guard rather than a live case.
+    const publishDelta = vi.fn(async () => undefined);
+    const app = buildApp({
+      findById: async () =>
+        makeJob({ id: JOB_ID, featureId: null, kind: "feature_build" }),
       publishDelta,
     });
 

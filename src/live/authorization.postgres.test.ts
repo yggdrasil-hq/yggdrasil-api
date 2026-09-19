@@ -1,8 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import pg from "pg";
-import { authorizeDesignSessionSubscription } from "./authorization.js";
+import { authorizeScopeSubscription, type LiveAuthorizationDeps } from "./authorization.js";
+import { FeatureRepository } from "../features/repository.js";
 import { JobRepository } from "../jobs/repository.js";
 import { ProjectRepository } from "../projects/repository.js";
+import { TestRepository } from "../tests/repository.js";
 import { runMigrations } from "../db/migrate.js";
 import { livePostgresSkipWarning, probeLivePostgres } from "../testing/live-postgres.js";
 
@@ -53,10 +55,20 @@ if (!reachability.ok) {
   );
 }
 
-describe.skipIf(!reachability.ok)("authorizeDesignSessionSubscription (real Postgres)", () => {
+describe.skipIf(!reachability.ok)("authorizeScopeSubscription, design_session scope (real Postgres)", () => {
   let pool: pg.Pool;
   let projects: ProjectRepository;
   let jobs: JobRepository;
+  /**
+   * ADR 033 §2 keys the authorisers by kind in one registry, so the entry point's
+   * dependency object names all four repositories — the two this scope uses and the
+   * two it does not. Built for real rather than stubbed, because a stand-in here
+   * would be a fake in the one file whose whole point is that fakes agree with the
+   * code by construction.
+   */
+  let features: FeatureRepository;
+  let tests: TestRepository;
+  let authorizationDeps: LiveAuthorizationDeps;
 
   /** The member: owns the org and the project. */
   let memberId: string;
@@ -81,6 +93,9 @@ describe.skipIf(!reachability.ok)("authorizeDesignSessionSubscription (real Post
     await runMigrations(pool);
     projects = new ProjectRepository(pool);
     jobs = new JobRepository(pool);
+    features = new FeatureRepository(pool);
+    tests = new TestRepository(pool);
+    authorizationDeps = { projects, features, jobs, tests };
 
     const stamp = Date.now();
     // Offset well clear of `Date.now()`, which the other real-Postgres files use
@@ -160,9 +175,13 @@ describe.skipIf(!reachability.ok)("authorizeDesignSessionSubscription (real Post
   });
 
   it("allows an org member to watch their project's design session", async () => {
-    const decision = await authorizeDesignSessionSubscription(
-      { projects, jobs },
-      { userId: memberId, projectId, sessionId: designSessionId },
+    const decision = await authorizeScopeSubscription(
+      authorizationDeps,
+      {
+        userId: memberId,
+        projectId,
+        scope: { kind: "design_session", id: designSessionId },
+      },
     );
 
     expect(decision).toEqual({ ok: true });
@@ -173,9 +192,13 @@ describe.skipIf(!reachability.ok)("authorizeDesignSessionSubscription (real Post
     // exists, but no membership row connects them. The refusal is `project`, the
     // same value a non-existent project produces, so the socket cannot be used to
     // probe which projects exist (ADR 019 item 3).
-    const decision = await authorizeDesignSessionSubscription(
-      { projects, jobs },
-      { userId: outsiderId, projectId, sessionId: designSessionId },
+    const decision = await authorizeScopeSubscription(
+      authorizationDeps,
+      {
+        userId: outsiderId,
+        projectId,
+        scope: { kind: "design_session", id: designSessionId },
+      },
     );
 
     expect(decision).toEqual({ ok: false, reason: "project" });
@@ -185,9 +208,13 @@ describe.skipIf(!reachability.ok)("authorizeDesignSessionSubscription (real Post
     // Both ids are real and both belong to the member; they simply are not the
     // same pair. This is the case a single `jobs.findById(sessionId)` with no
     // project scope would have authorised.
-    const decision = await authorizeDesignSessionSubscription(
-      { projects, jobs },
-      { userId: memberId, projectId, sessionId: otherProjectSessionId },
+    const decision = await authorizeScopeSubscription(
+      authorizationDeps,
+      {
+        userId: memberId,
+        projectId,
+        scope: { kind: "design_session", id: otherProjectSessionId },
+      },
     );
 
     expect(decision).toEqual({ ok: false, reason: "session" });
@@ -197,21 +224,25 @@ describe.skipIf(!reachability.ok)("authorizeDesignSessionSubscription (real Post
     // The row exists and is in the right project, so only the kind refuses it.
     // Without that condition the design-session frame would be a way to watch any
     // job's events in a project the caller can see.
-    const decision = await authorizeDesignSessionSubscription(
-      { projects, jobs },
-      { userId: memberId, projectId, sessionId: featureBuildJobId },
+    const decision = await authorizeScopeSubscription(
+      authorizationDeps,
+      {
+        userId: memberId,
+        projectId,
+        scope: { kind: "design_session", id: featureBuildJobId },
+      },
     );
 
     expect(decision).toEqual({ ok: false, reason: "session" });
   });
 
   it("refuses a session id that does not exist", async () => {
-    const decision = await authorizeDesignSessionSubscription(
-      { projects, jobs },
+    const decision = await authorizeScopeSubscription(
+      authorizationDeps,
       {
         userId: memberId,
         projectId,
-        sessionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        scope: { kind: "design_session", id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" },
       },
     );
 
@@ -255,9 +286,13 @@ describe.skipIf(!reachability.ok)("authorizeDesignSessionSubscription (real Post
       // Quoting the stranger's own project: a member of nothing, so refused on the
       // project before the session is ever read.
       expect(
-        await authorizeDesignSessionSubscription(
-          { projects, jobs },
-          { userId: memberId, projectId: strangerProjectId, sessionId: strangerSessionId },
+        await authorizeScopeSubscription(
+          authorizationDeps,
+          {
+          userId: memberId,
+          projectId: strangerProjectId,
+          scope: { kind: "design_session", id: strangerSessionId },
+        },
         ),
       ).toEqual({ ok: false, reason: "project" });
 
@@ -265,9 +300,13 @@ describe.skipIf(!reachability.ok)("authorizeDesignSessionSubscription (real Post
       // the project, refused on the session — which is the pair of conditions
       // together doing the work rather than either alone.
       expect(
-        await authorizeDesignSessionSubscription(
-          { projects, jobs },
-          { userId: memberId, projectId, sessionId: strangerSessionId },
+        await authorizeScopeSubscription(
+          authorizationDeps,
+          {
+          userId: memberId,
+          projectId,
+          scope: { kind: "design_session", id: strangerSessionId },
+        },
         ),
       ).toEqual({ ok: false, reason: "session" });
     } finally {

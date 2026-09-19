@@ -203,7 +203,13 @@ describe.skipIf(!reachability.ok)(
       // The topic string a Web client has to build, asserted from the real row.
       const envelope = relayEnvelopeFor(scoped!);
       expect(envelope?.topic).toBe(`test:${testId}`);
-      expect(envelope?.frame).toMatchObject({ type: "test_run_event", testId });
+      // ADR 033 §1: one `event` frame for every scope, with the scope as a value.
+      // Asserted through the *scope* rather than a frame name, because the name no
+      // longer says which topic an event arrived on.
+      expect(envelope?.frame).toMatchObject({
+        type: "event",
+        scope: { kind: "test", id: testId },
+      });
     });
   },
 );
