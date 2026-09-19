@@ -21,6 +21,14 @@ const PROJECT_ID = "22222222-2222-4222-8222-222222222222";
 const OTHER_PROJECT_ID = "99999999-9999-4999-8999-999999999999";
 const FEATURE_ID = "33333333-3333-4333-8333-333333333333";
 const OTHER_FEATURE_ID = "66666666-6666-4666-8666-666666666666";
+/*
+ * Issue #25: a design session is a `design_grill` *job*, and its session id is the
+ * job id. Two of them, because the authorisation has two conditions to satisfy —
+ * the id has to resolve inside the project, *and* the job has to be the right kind.
+ */
+const SESSION_ID = "88888888-8888-4888-8888-888888888888";
+/** In the project, but a different kind — the case the REST route also rejects. */
+const NON_DESIGN_JOB_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 const GOOD_COOKIE = `${config.cookieName}=sess_ok`;
 
@@ -78,6 +86,20 @@ async function withRelay(
       projectId === PROJECT_ID && featureId === FEATURE_ID ? { id: FEATURE_ID } : null,
     ),
   };
+  /*
+   * Mirrors `JobRepository.findByIdForProject` as the design-session route uses it:
+   * scoped to the project, then checked for kind. The non-design id resolves *inside*
+   * the project on purpose — returning null for it would pass the kind test for the
+   * wrong reason, since a not-found is refused before the kind is ever read.
+   */
+  const jobs = {
+    findByIdForProject: vi.fn(async (projectId: string, jobId: string) => {
+      if (projectId !== PROJECT_ID) return null;
+      if (jobId === SESSION_ID) return { id: SESSION_ID, kind: "design_grill" };
+      if (jobId === NON_DESIGN_JOB_ID) return { id: NON_DESIGN_JOB_ID, kind: "feature_build" };
+      return null;
+    }),
+  };
 
   const sockets = createLiveSocketServer({
     server,
@@ -86,6 +108,7 @@ async function withRelay(
     users: users as never,
     projects: projects as never,
     features: features as never,
+    jobs: jobs as never,
     onError: options.onError,
     frameBudget: options.frameBudget,
   });
@@ -161,6 +184,28 @@ async function waitFor(predicate: () => boolean, label: string): Promise<void> {
 async function settle(client: Client): Promise<ServerFrame[]> {
   await new Promise((resolve) => setTimeout(resolve, 30));
   return client.frames;
+}
+
+/** Issue #25: the design-session peer of `jobEventFrame`. */
+function designSessionFrame(): ServerFrame {
+  return {
+    type: "design_session_event",
+    sessionId: SESSION_ID,
+    event: {
+      id: "design_event_1",
+      jobId: SESSION_ID,
+      type: "update_design_preview",
+      question: null,
+      markdown: null,
+      message: null,
+      status: null,
+      prUrl: null,
+      summary: null,
+      actionItems: null,
+      snapshot: null,
+      createdAt: "2026-09-18T10:00:00.000Z",
+    },
+  };
 }
 
 function jobEventFrame(): ServerFrame {
@@ -464,6 +509,168 @@ describe("live socket: connection identity", () => {
  * These are the three boundary cases the issue asks for (under, at, over),
  * plus the chosen failure behaviour.
  */
+describe("live socket: design-session subscriptions (issue #25)", () => {
+  /**
+   * Subscribes to the fixture design session over a real socket. Two frames pass
+   * through the budget before this resolves (`ready` and `subscribed_design`),
+   * which the frame-budget block below accounts for separately.
+   */
+  async function designClient(port: number, sessionId = SESSION_ID): Promise<Client> {
+    const client = connect(port, GOOD_COOKIE);
+    await waitFor(() => client.frames.length > 0, "ready");
+    client.send({ type: "subscribe_design", projectId: PROJECT_ID, sessionId });
+    await waitFor(
+      () => client.frames.some((frame) => frame.type === "subscribed_design" || frame.type === "error"),
+      "subscribed_design or refusal",
+    );
+    return client;
+  }
+
+  it("subscribes a member to a design session and receives its events", async () => {
+    // The end-to-end shape, which is the one that matters: a real socket, a real
+    // frame, and an event published to the design topic reaching it. The topic is
+    // `design:<sessionId>` — that string is the contract a Web client has to use.
+    await withRelay(async ({ port, hub }) => {
+      const client = await designClient(port);
+
+      expect(client.frames).toContainEqual({ type: "subscribed_design", sessionId: SESSION_ID });
+      expect(hub.publish(`design:${SESSION_ID}`, designSessionFrame())).toBe(1);
+
+      const frames = await settle(client);
+      expect(frames).toContainEqual(designSessionFrame());
+    });
+  });
+
+  it("leaves the design subscription when asked, and then delivers nothing", async () => {
+    await withRelay(async ({ port, hub }) => {
+      const client = await designClient(port);
+      client.send({ type: "unsubscribe_design", sessionId: SESSION_ID });
+      await waitFor(
+        () => client.frames.some((frame) => frame.type === "unsubscribed_design"),
+        "unsubscribed_design",
+      );
+
+      // The half that makes unsubscribing mean something: the hub no longer counts
+      // this connection, so the event goes nowhere.
+      expect(hub.publish(`design:${SESSION_ID}`, designSessionFrame())).toBe(0);
+      const frames = await settle(client);
+      expect(frames.some((frame) => frame.type === "design_session_event")).toBe(false);
+    });
+  });
+
+  it("refuses a design session in a project the caller is not a member of", async () => {
+    await withRelay(async ({ port, hub }) => {
+      const client = connect(port, GOOD_COOKIE);
+      await waitFor(() => client.frames.length > 0, "ready");
+      client.send({ type: "subscribe_design", projectId: OTHER_PROJECT_ID, sessionId: SESSION_ID });
+      await waitFor(() => client.frames.some((frame) => frame.type === "error"), "refusal");
+
+      expect(client.frames).toContainEqual({
+        type: "error",
+        message: "Design session not found",
+      });
+      expect(hub.publish(`design:${SESSION_ID}`, designSessionFrame())).toBe(0);
+    });
+  });
+
+  it("refuses a job in the project that is not a design session", async () => {
+    // The kind check, over a real socket. `findByIdForProject` resolves this id in
+    // the project, so only the kind condition refuses it — without that condition
+    // a design-session frame would be a way to watch a feature_build's events.
+    await withRelay(async ({ port, hub }) => {
+      const client = await designClient(port, NON_DESIGN_JOB_ID);
+
+      expect(client.frames).toContainEqual({
+        type: "error",
+        message: "Design session not found",
+      });
+      expect(client.frames.some((frame) => frame.type === "subscribed_design")).toBe(false);
+      expect(hub.publish(`design:${NON_DESIGN_JOB_ID}`, designSessionFrame())).toBe(0);
+    });
+  });
+
+  it("refuses a session id that does not exist", async () => {
+    await withRelay(async ({ port }) => {
+      const unknown = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+      const client = await designClient(port, unknown);
+
+      expect(client.frames).toContainEqual({
+        type: "error",
+        message: "Design session not found",
+      });
+    });
+  });
+
+  it("keeps the two topic families separate on one socket", async () => {
+    // A feature subscription and a design subscription on the same connection,
+    // then a publish to each. The two topics must not bleed into each other — the
+    // reason the `design:` prefix exists, since the hub treats a topic as an
+    // opaque string and the two id spaces are both uuids.
+    await withRelay(async ({ port, hub }) => {
+      const client = connect(port, GOOD_COOKIE);
+      await waitFor(() => client.frames.length > 0, "ready");
+
+      client.send({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID });
+      await waitFor(() => client.frames.some((frame) => frame.type === "subscribed"), "subscribed");
+      client.send({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: SESSION_ID });
+      await waitFor(
+        () => client.frames.some((frame) => frame.type === "subscribed_design"),
+        "subscribed_design",
+      );
+
+      expect(hub.publish(`feature:${FEATURE_ID}`, jobEventFrame())).toBe(1);
+      // One, not two: the design topic has exactly one subscriber (this socket),
+      // and the feature publish did not reach it.
+      expect(hub.publish(`design:${SESSION_ID}`, designSessionFrame())).toBe(1);
+
+      const frames = await settle(client);
+      expect(frames).toContainEqual(jobEventFrame());
+      expect(frames).toContainEqual(designSessionFrame());
+    });
+  });
+
+  it("treats a malformed design id as a malformed frame, not a refused subscription", async () => {
+    // `parseClientFrame` validates ids at the boundary, so a non-uuid never reaches
+    // the authoriser: it is an *unrecognised frame*, counted against the
+    // protocol-error budget like any other malformed frame. That is the contract,
+    // and it is worth pinning because the two failure modes look alike from a
+    // client — "my id was rejected" and "your frame was malformed" — while only
+    // the second is a client bug, and only the second can close the socket.
+    //
+    // (`authorizeDesignSessionSubscription` has its own `isUuid` guard. From the
+    // socket that guard is unreachable — parsing already refused — so it is
+    // defence in depth for a direct caller, not the first line here.)
+    await withRelay(async ({ port }) => {
+      const client = connect(port, GOOD_COOKIE);
+      await waitFor(() => client.frames.length > 0, "ready");
+
+      client.send({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: "not-a-uuid" });
+      await waitFor(
+        () => client.frames.some((frame) => frame.type === "error"),
+        "first protocol error",
+      );
+
+      const frames = await settle(client);
+      expect(frames).toContainEqual({ type: "error", message: "Unrecognised frame" });
+      // Not a `subscribed_design`, and no refusal message of its own — the frame
+      // never became a subscription request at all.
+      expect(frames.some((frame) => frame.type === "subscribed_design")).toBe(false);
+      expect(frames.some((frame) => frame.type === "error" && "message" in frame && frame.message === "Design session not found")).toBe(false);
+
+      // And it is a real protocol error: reaching the connection's budget closes
+      // the socket with the protocol code, which a refused subscription never does.
+      // The count comes from the constant so this cannot drift from the rule it is
+      // asserting — my first version hard-coded three and timed out, because the
+      // budget is five.
+      for (let sent = 1; sent < LIVE_MAX_PROTOCOL_ERRORS; sent += 1) {
+        client.send({ type: "subscribe_design", projectId: PROJECT_ID, sessionId: "still-not-a-uuid" });
+      }
+      await waitFor(() => client.closed() !== null, "protocol close");
+      expect(client.closed()?.code).toBe(LIVE_CLOSE_PROTOCOL);
+    });
+  });
+});
+
 describe("live socket frame budget (issue #24)", () => {
   it("delivers up to the budget and then closes with the rate-limit code", async () => {
     await withRelay(

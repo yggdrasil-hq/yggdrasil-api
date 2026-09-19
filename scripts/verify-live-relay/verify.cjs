@@ -15,6 +15,9 @@ const WS_NGINX = "ws://rv-nginx/api/ws";
 const PROJECT_ID = "33333333-3333-4333-8333-333333333333";
 const FEATURE_ID = "44444444-4444-4444-8444-444444444444";
 const JOB_ID = "55555555-5555-4555-8555-555555555555";
+// Issue #25: a `design_grill` job with no feature — so its events reach nobody
+// through the feature topic and must arrive on `design:<id>` instead.
+const DESIGN_JOB_ID = "77777777-7777-4777-8777-777777777777";
 const IDLE_SECONDS = Number(process.env.IDLE_SECONDS || 90);
 
 const results = [];
@@ -37,7 +40,14 @@ async function waitFor(frames, predicate, timeoutMs) {
   }
 }
 
-async function subscribe(wsUrl) {
+/**
+ * Subscribes, returning the socket and its frames.
+ *
+ * `target` selects which frame to send, because the two carry different resources
+ * with different authorisation rules (issue #25). Defaulted to the feature so the
+ * existing calls read unchanged.
+ */
+async function subscribe(wsUrl, target = { type: "feature", id: FEATURE_ID }) {
   const frames = [];
   let closed = null;
   const ws = new WebSocket(wsUrl, { headers: { Cookie: COOKIE } });
@@ -65,9 +75,17 @@ async function subscribe(wsUrl) {
   // app happens to wait for `ready`, which is why this has never surfaced.
   const ready = await waitFor(frames, (f) => f.type === "ready", 15000);
   if (!ready) throw new Error("no `ready` frame on " + wsUrl + "; frames=" + JSON.stringify(frames));
-  ws.send(JSON.stringify({ type: "subscribe", projectId: PROJECT_ID, featureId: FEATURE_ID }));
-  const first = await waitFor(frames, (f) => f.type === "subscribed" || f.type === "error", 15000);
-  if (!first || first.type !== "subscribed") {
+  const subscribeFrame =
+    target.type === "design"
+      ? { type: "subscribe_design", projectId: PROJECT_ID, sessionId: target.id }
+      : { type: "subscribe", projectId: PROJECT_ID, featureId: target.id };
+  ws.send(JSON.stringify(subscribeFrame));
+  const first = await waitFor(
+    frames,
+    (f) => f.type === "subscribed" || f.type === "subscribed_design" || f.type === "error",
+    15000,
+  );
+  if (!first || (first.type !== "subscribed" && first.type !== "subscribed_design")) {
     throw new Error(
       "subscribe refused on " + wsUrl +
       ": firstFrame=" + JSON.stringify(first) +
@@ -78,8 +96,8 @@ async function subscribe(wsUrl) {
   return { ws, frames };
 }
 
-async function postEvent(baseUrl, body) {
-  const res = await fetch(baseUrl + "/internal/jobs/" + JOB_ID + "/events", {
+async function postEvent(baseUrl, body, jobId = JOB_ID) {
+  const res = await fetch(baseUrl + "/internal/jobs/" + jobId + "/events", {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: "Bearer " + INTERNAL_TOKEN },
     body: JSON.stringify(body),
@@ -99,6 +117,90 @@ async function storedEventCrossProcess({ name, wsUrl, writeUrl }) {
     record(name, Boolean(frame),
       frame ? "delivered (socket=" + host(wsUrl) + ", write=" + host(writeUrl) + ")"
             : "NOT delivered within 15s (socket=" + host(wsUrl) + ", write=" + host(writeUrl) + ")");
+  } finally { ws.close(); }
+}
+
+/*
+ * Issue #25: the design topic, cross-process.
+ *
+ * Written by one replica and observed on a socket held by another, which is the
+ * same load-bearing claim #32 measured for the feature topic — and the one that
+ * matters for a *new* topic, because a routing mistake here is invisible to a
+ * single-process test by construction. The frame type asserted is
+ * `design_session_event`, not `job_event`, so this also pins that the two topic
+ * families produce different frames rather than the design one borrowing the
+ * feature frame and putting a session id in `featureId`.
+ */
+async function designSessionCrossProcess({ name, wsUrl, writeUrl }) {
+  const { ws, frames } = await subscribe(wsUrl, { type: "design", id: DESIGN_JOB_ID });
+  try {
+    const marker = nextMarker();
+    const { status } = await postEvent(
+      writeUrl,
+      {
+        type: "update_design_preview",
+        // Relative, not absolute: `designSnapshotSchema` rejects a leading "/"
+        // ("paths must be safe relative paths"). My first version used
+        // "/index.html" and every design write 400'd — the schema doing its job.
+        snapshot: { "index.html": "<html>" + marker + "</html>" },
+      },
+      DESIGN_JOB_ID,
+    );
+    if (status !== 201) { record(name, false, "design event write returned " + status); return; }
+
+    const frame = await waitFor(
+      frames,
+      (f) =>
+        f.type === "design_session_event" &&
+        f.sessionId === DESIGN_JOB_ID &&
+        f.event &&
+        f.event.snapshot &&
+        String(f.event.snapshot["index.html"] || "").includes(marker),
+      15000,
+    );
+    record(name, Boolean(frame),
+      frame ? "delivered on design topic (socket=" + host(wsUrl) + ", write=" + host(writeUrl) + ")"
+            : "NOT delivered within 15s (socket=" + host(wsUrl) + ", write=" + host(writeUrl) + ")");
+  } finally { ws.close(); }
+}
+
+/**
+ * The negative half, and it has to be aimed at something that *could* happen.
+ *
+ * **My first version of this was not.** It subscribed to the feature topic and
+ * wrote a design event, asserting nothing arrived — which could never have failed:
+ * the fixture design job has no `feature_id`, so its events cannot reach any
+ * feature topic even if the routing were wrong, because the topic it would be
+ * mis-routed to is `feature:<designJobId>`, not the one under test. A negative case
+ * that cannot fail is worse than none, because it reads as coverage.
+ *
+ * This instead watches the **design** topic and writes a **feature** event. That is
+ * a real risk: a router that confused the two id spaces — both are uuids from the
+ * same source — or that fanned one event onto every topic, would show up here and
+ * nowhere else. Cross-process, like the positive case, so the LISTEN/NOTIFY path is
+ * exercised rather than a same-process publish.
+ */
+async function featureEventStaysOffTheDesignTopic({ name, wsUrl, writeUrl }) {
+  const { ws, frames } = await subscribe(wsUrl, { type: "design", id: DESIGN_JOB_ID });
+  try {
+    const marker = nextMarker();
+    const { status } = await postEvent(writeUrl, { type: "agent_text", message: marker });
+    if (status !== 201) { record(name, false, "feature event write returned " + status); return; }
+
+    // The positive case's own window, so "nothing arrived" is a real absence rather
+    // than a race the assertion happened to win.
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    const leaked = frames.some(
+      (f) =>
+        (f.type === "job_event" || f.type === "design_session_event") &&
+        f.event &&
+        f.event.message === marker,
+    );
+    record(
+      name,
+      !leaked,
+      leaked ? "LEAKED onto the design topic" : "stayed off the design topic",
+    );
   } finally { ws.close(); }
 }
 
@@ -201,6 +303,22 @@ async function main() {
   await storedEventCrossProcess({
     name: "through nginx: socket + write both via the proxy",
     wsUrl: WS_NGINX, writeUrl: NGINX_API,
+  });
+
+  // Issue #25: the design-session topic, which is the second topic *shape* the
+  // relay gained. Cross-process like the feature cases above, because a routing
+  // mistake is unobservable in a single process.
+  await designSessionCrossProcess({
+    name: "design session: event across replicas on its own topic",
+    wsUrl: WS_A, writeUrl: API_B,
+  });
+
+  // And the negative half, aimed at a mistake that could actually be made: the
+  // two id spaces are both uuids, so a router that confused them would put a
+  // feature's events on the design topic.
+  await featureEventStaysOffTheDesignTopic({
+    name: "feature event stays off the design topic",
+    wsUrl: WS_A, writeUrl: API_B,
   });
 
   // An idle socket through nginx. nginx's *default* proxy_read_timeout is 60s and

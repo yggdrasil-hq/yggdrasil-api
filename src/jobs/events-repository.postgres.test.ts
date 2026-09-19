@@ -45,6 +45,8 @@ describe.skipIf(!reachability.ok)("JobEventRepository against a real Postgres", 
   let pool: pg.Pool;
   let repository: JobEventRepository;
   let jobId: string;
+  /** Issue #25: a `design_grill` job, for the design-topic scope assertions. */
+  let designJobId: string;
 
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString });
@@ -86,13 +88,25 @@ describe.skipIf(!reachability.ok)("JobEventRepository against a real Postgres", 
         [projectId],
       )
     ).rows[0].id;
+
+    // Issue #25: a `design_grill` job, which is the shape the relay's design topic
+    // routes on. It has no feature and *is* a design session, so the two fields the
+    // routing decision reads are both non-default here.
+    designJobId = (
+      await pool.query(
+        `INSERT INTO jobs (project_id, kind) VALUES ($1, 'design_grill') RETURNING id`,
+        [projectId],
+      )
+    ).rows[0].id;
   });
 
   afterAll(async () => {
     // Scoped to this file's own rows: the scratch database is the caller's to
     // drop, but leaving a job behind would leak into any other real-Postgres file
     // that happens to count rows. ON DELETE CASCADE does the rest.
-    await pool.query("DELETE FROM jobs WHERE id = $1", [jobId]).catch(() => undefined);
+    await pool
+      .query("DELETE FROM jobs WHERE id = ANY($1::uuid[])", [[jobId, designJobId]])
+      .catch(() => undefined);
     await pool.end().catch(() => undefined);
   });
 
@@ -203,6 +217,33 @@ describe.skipIf(!reachability.ok)("JobEventRepository against a real Postgres", 
       multiSelect: true,
       options: [{ label: "Next.js", description: null }],
     });
+    // Issue #25: the scope also carries the job's kind, which is what lets the
+    // relay route a feature-less event. Asserted here because this statement's
+    // column list is spelled separately from the others', so a `j.kind` added to
+    // the interface but not to the SELECT would typecheck and return `undefined`
+    // at runtime — the exact class of drift this file exists to catch.
+    expect(scoped?.jobKind).toBe("spec_grill");
+  });
+
+  it("returns a design session's scope with its kind, for the design topic (#25)", async () => {
+    // The pair the relay decides on: no feature (so the feature topic is not an
+    // option) *and* the `design_grill` kind (so the design topic is). A `null`
+    // featureId alone would have been indistinguishable from a scheduled
+    // `test_run`, which is why the kind had to be added to this read.
+    const created = await repository.create({
+      jobId: designJobId,
+      type: "update_design_preview",
+      snapshot: { "index.html": "<html></html>" },
+    });
+
+    const scoped = await repository.findByIdWithScope(created.id);
+
+    expect(scoped?.featureId).toBeNull();
+    expect(scoped?.jobKind).toBe("design_grill");
+    expect(scoped?.projectId).toBeTruthy();
+    // And the session id the relay routes on is this job's own id — the same value
+    // the REST route resolves `:sessionId` as.
+    expect(scoped?.event.jobId).toBe(designJobId);
   });
 
   it("accepts a large structured question without truncating an option label", async () => {

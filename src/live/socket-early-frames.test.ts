@@ -70,6 +70,11 @@ async function withRelay(
       touch: vi.fn(async () => undefined),
     } as never,
     users: { findById: vi.fn(async () => ({ id: "user_1" })) } as never,
+    // Issue #25 put a third read on this dependency (design sessions resolve
+    // through the job repository). This file is about early frames, not design
+    // sessions, so the fake refuses everything — a subscribe_design here would be
+    // a refusal, which no case in this file sends.
+    jobs: { findByIdForProject: vi.fn(async () => null) } as never,
     projects: {
       findByIdForUser: vi.fn(async () => {
         authorizeCalls.count += 1;

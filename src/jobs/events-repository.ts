@@ -1,4 +1,5 @@
 import type pg from "pg";
+import type { JobKind } from "./types.js";
 
 export type JobEventType =
   | "agent_text"
@@ -152,6 +153,7 @@ interface JobEventRow {
 interface JobEventScopeRow extends JobEventRow {
   project_id: string;
   feature_id: string | null;
+  kind: JobKind;
 }
 
 export interface JobEventWithScope {
@@ -159,6 +161,25 @@ export interface JobEventWithScope {
   projectId: string;
   /** Null for a job that belongs to no feature (ADR 014's project-scoped `design_grill`). */
   featureId: string | null;
+  /**
+   * The owning job's kind, so the relay can route an event for a job with no
+   * feature (issue #25).
+   *
+   * **Why the kind rather than a ready-made topic.** A `featureId` is enough for
+   * the feature case because the id *is* the routing key. A design session is the
+   * opposite: its session id **is** the job id (see
+   * `GET /projects/:projectId/designs/:sessionId/events`, which resolves the
+   * session as `findByIdForProject(projectId, sessionId)` and requires
+   * `kind === "design_grill"`), so the id alone does not say what it is — the kind
+   * does. Passing the kind keeps `relayEnvelopeFor` the one place that decides
+   * which topic an event belongs to, which is what its doc comment claims, instead
+   * of pushing that decision into SQL as a computed topic column.
+   *
+   * It is also the field a later generalisation needs: a feature-less job of
+   * another kind (a scheduled `test_run` produces events and has no feature
+   * either) currently routes nowhere, and that is a decision about kinds.
+   */
+  jobKind: JobKind;
 }
 
 /** The event columns, spelled once so every read returns the same shape. */
@@ -329,7 +350,7 @@ export class JobEventRepository {
       `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
          e.status, e.pr_url, e.summary, e.verdict, e.question_form, e.review_findings,
          e.action_items, e.design_snapshot,
-         e.created_at, j.project_id, j.feature_id
+         e.created_at, j.project_id, j.feature_id, j.kind
        FROM job_events e
        INNER JOIN jobs j ON j.id = e.job_id
        WHERE e.id = $1`,
@@ -341,6 +362,7 @@ export class JobEventRepository {
       event: mapJobEvent(row),
       projectId: row.project_id,
       featureId: row.feature_id,
+      jobKind: row.kind,
     };
   }
 

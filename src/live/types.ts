@@ -105,6 +105,22 @@ export function liveTopicForFeature(featureId: string): string {
 }
 
 /**
+ * The relay's subscription topic for a design session (issue #25).
+ *
+ * The sibling of `liveTopicForFeature` the comment above anticipated, and it is a
+ * second *shape* rather than a second mechanism: the hub takes an opaque string,
+ * so `design:` joining `feature:` is the whole change to the topic vocabulary.
+ *
+ * **The id is a job id.** A design session is a `design_grill` job (ADR 014), and
+ * `GET /projects/:projectId/designs/:sessionId/events` resolves its `:sessionId` as
+ * a job id — so this takes the same value a client already has from that REST read,
+ * and no new identifier has to be threaded anywhere.
+ */
+export function liveTopicForDesignSession(sessionId: string): string {
+  return `design:${sessionId}`;
+}
+
+/**
  * `pg_notify`'s hard limit is 8000 bytes. A streaming chunk is a handful of
  * bytes, so this is not a real constraint on deltas — it is a guard so that a
  * pathological value (a bug upstream, or a non-streaming producer misusing the
@@ -229,7 +245,19 @@ export type ServerFrame =
   | { type: "ready"; protocolVersion: number }
   | { type: "subscribed"; featureId: string }
   | { type: "unsubscribed"; featureId: string }
+  /** Issue #25: the design-session peer of `subscribed`, naming a session rather than a feature. */
+  | { type: "subscribed_design"; sessionId: string }
+  | { type: "unsubscribed_design"; sessionId: string }
   | { type: "job_event"; featureId: string; jobId: string; event: LiveJobEvent }
+  /**
+   * Issue #25: a stored event for a design session.
+   *
+   * Its own type rather than a `job_event` carrying a session id in `featureId`,
+   * so the frame says which topic shape it arrived on. `sessionId` is also the job
+   * id — that is how the REST route resolves a session — so it is carried once and
+   * the event's own `jobId` is the same value.
+   */
+  | { type: "design_session_event"; sessionId: string; event: LiveJobEvent }
   | { type: "job_event_delta"; featureId: string; jobId: string; text: string }
   | { type: "error"; message: string }
   | { type: "pong" };
@@ -264,6 +292,23 @@ export const LIVE_JOB_EVENT_DELTAS_CHANNEL = "job_event_deltas";
 export type ClientFrame =
   | { type: "subscribe"; projectId: string; featureId: string }
   | { type: "unsubscribe"; featureId: string }
+  /**
+   * Issue #25: subscribe to a design session instead of a feature.
+   *
+   * A distinct frame type rather than an optional field on `subscribe`, and the
+   * reason is that the two carry a *different* resource with a *different*
+   * authorisation rule — a feature is resolved inside its project, a design
+   * session is a job resolved inside its project and then checked for kind. One
+   * frame with both fields would need a precedence rule ("featureId wins if
+   * present"), and a silent precedence rule in an authorisation path is exactly
+   * the kind of thing that is read wrong. Naming the two frames separately makes
+   * the parse unambiguous and each frame's authoriser the obvious one.
+   *
+   * `sessionId` matches the REST path parameter the client already holds
+   * (`/projects/:projectId/designs/:sessionId/events`).
+   */
+  | { type: "subscribe_design"; projectId: string; sessionId: string }
+  | { type: "unsubscribe_design"; sessionId: string }
   | { type: "ping" };
 
 function isUuidValue(value: unknown): value is string {
@@ -299,6 +344,14 @@ export function parseClientFrame(raw: string): ClientFrame | null {
   if (frame.type === "unsubscribe") {
     if (!isUuidValue(frame.featureId)) return null;
     return { type: "unsubscribe", featureId: frame.featureId };
+  }
+  if (frame.type === "subscribe_design") {
+    if (!isUuidValue(frame.projectId) || !isUuidValue(frame.sessionId)) return null;
+    return { type: "subscribe_design", projectId: frame.projectId, sessionId: frame.sessionId };
+  }
+  if (frame.type === "unsubscribe_design") {
+    if (!isUuidValue(frame.sessionId)) return null;
+    return { type: "unsubscribe_design", sessionId: frame.sessionId };
   }
   return null;
 }
