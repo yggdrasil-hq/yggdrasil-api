@@ -183,7 +183,19 @@ export function createApp(deps?: AppDependencies): Express {
   app.use("/settings", createSettingsRouter({ users, sessions }));
   app.use(
     "/organizations",
-    createOrganizationsRouter({ users, sessions, organizations, clusters: orgClusters, orgSecrets, audit }),
+    createOrganizationsRouter({
+      users,
+      sessions,
+      organizations,
+      clusters: orgClusters,
+      orgSecrets,
+      audit,
+      // Issue #35: the shared readiness predicate reads these, so the onboarding
+      // entry check and the create gate cannot disagree about what "ready" means.
+      providers: modelProviders,
+      models: orgModels,
+      jobDefaults: jobModelDefaults,
+    }),
   );
   app.use(
     "/organizations",

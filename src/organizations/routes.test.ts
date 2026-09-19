@@ -4,6 +4,7 @@ import request from "supertest";
 import { describe, expect, it, vi } from "vitest";
 import { createOrganizationsRouter } from "./routes.js";
 import type { Organization } from "./types.js";
+import { AGENT_JOB_KINDS } from "../model-config/types.js";
 import type { SessionRecord } from "../auth/sessions.js";
 import type { User } from "../users/types.js";
 
@@ -29,6 +30,23 @@ function buildApp(overrides: {
   /** The role findById-for-membership returns; undefined => "admin", null => not a member. */
   role?: string | null;
   members?: Array<Record<string, unknown>>;
+  /* --- Issue #35: the readiness knobs a test varies --- */
+  /** The orgs `listForUser` returns; defaults to one org using the `role` above. */
+  orgs?: Organization[];
+  /** Defaults to all five kinds pointing at one resolvable model. */
+  jobDefaults?: Array<{
+    organizationId: string;
+    jobKind: string;
+    modelId: string;
+    createdAt: Date;
+    updatedAt: Date;
+  }>;
+  /** false => the default's catalog model no longer exists. */
+  catalogModelExists?: boolean;
+  /** false => the default's provider key is unreadable. */
+  providerKeyReadable?: boolean;
+  /** false => the provider row is gone. */
+  providerExists?: boolean;
 } = {}) {
   const app = express();
   app.use(cookieParser());
@@ -45,7 +63,7 @@ function buildApp(overrides: {
   const organizations = {
     roleForUser: vi.fn(async () => roleForUserRole),
     findById: vi.fn(async () => makeOrg()),
-    listForUser: vi.fn(async () => [makeOrg()]),
+    listForUser: vi.fn(async () => overrides.orgs ?? [makeOrg()]),
     create: vi.fn(async () => makeOrg()),
     update: vi.fn(async () => makeOrg()),
     membership: vi.fn(async () => null),
@@ -95,6 +113,59 @@ function buildApp(overrides: {
     record: vi.fn(async (_res: unknown, _input: Record<string, unknown>) => undefined),
   };
 
+  /*
+   * Issue #35: the model-config repositories the shared readiness predicate reads.
+   *
+   * The defaults are deliberately **complete and resolvable** (all five kinds
+   * pointing at one catalog model whose provider key decrypts), so an org's
+   * `ready` depends on the two things a test means to vary — its `status` and
+   * these — rather than on an incidental missing row. A test that wants an unready
+   * org overrides exactly the piece it is about.
+   */
+  const provider = {
+    id: "provider_1",
+    organizationId: ORG_ID,
+    providerType: "openrouter",
+    baseUrl: "https://openrouter.ai/api/v1",
+  };
+  const catalogModel = {
+    id: "model_1",
+    organizationId: ORG_ID,
+    providerId: provider.id,
+    modelId: "gpt-4.1",
+  };
+  const providers = {
+    findById: vi.fn(async () => (overrides.providerExists === false ? null : provider)),
+    decryptApiKey: vi.fn(async () =>
+      overrides.providerKeyReadable === false ? null : "sk-live",
+    ),
+  };
+  const models = {
+    findById: vi.fn(async () =>
+      overrides.catalogModelExists === false ? null : catalogModel,
+    ),
+  };
+  const jobDefaults = {
+    listForOrganization: vi.fn(
+      async () =>
+        overrides.jobDefaults ??
+        AGENT_JOB_KINDS.map((jobKind) => ({
+          organizationId: ORG_ID,
+          jobKind,
+          modelId: catalogModel.id,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })),
+    ),
+    findForJobKind: vi.fn(async (_orgId: string, jobKind: string) => ({
+      organizationId: ORG_ID,
+      jobKind,
+      modelId: catalogModel.id,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })),
+  };
+
   app.use(
     "/organizations",
     createOrganizationsRouter({
@@ -104,10 +175,13 @@ function buildApp(overrides: {
       clusters: clusters as never,
       orgSecrets: orgSecrets as never,
       audit: audit as never,
+      providers: providers as never,
+      models: models as never,
+      jobDefaults: jobDefaults as never,
     }),
   );
 
-  return { app, organizations, clusters, orgSecrets, audit };
+  return { app, organizations, clusters, orgSecrets, audit, providers, models, jobDefaults };
 }
 
 const SESSION_COOKIE = "yggdrasil_session=sess_1";
@@ -371,4 +445,83 @@ describe("organizations router (ADR 016 track A1)", () => {
       expect(audit.record).not.toHaveBeenCalled();
     });
   });
+
+/*
+ * Issue #35: `GET /organizations/readiness` — the onboarding entry signal.
+ *
+ * Note what these assert beyond the shape: the route is **literal** (`/readiness`,
+ * registered before `/:organizationId`), so the first case doubles as a guard
+ * against the path being swallowed by the id route and 404ing on the UUID check —
+ * a mistake that would silently break the Web gate while unit tests of the
+ * predicate stayed green.
+ */
+describe("GET /organizations/readiness (issue #35)", () => {
+  it("is reachable as a literal path, not parsed as an organization id", async () => {
+    const { app } = buildApp({ role: "admin" });
+
+    const res = await authedRequest(app).get("/organizations/readiness");
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty("entryAllowed");
+  });
+
+  it("allows entry and points at the org that satisfies it", async () => {
+    const { app } = buildApp({ role: "admin", orgs: [makeOrg({ status: "ready" })] });
+
+    const res = await authedRequest(app).get("/organizations/readiness");
+
+    expect(res.body.entryAllowed).toBe(true);
+    expect(res.body.readyOrganizationId).toBe(ORG_ID);
+    expect(res.body.organizations[0].ready).toBe(true);
+  });
+
+  it("blocks entry and lists both outstanding steps on a fresh org", async () => {
+    const { app } = buildApp({
+      role: "admin",
+      orgs: [makeOrg({ status: "pending_cluster", isPersonal: true })],
+      jobDefaults: [],
+    });
+
+    const res = await authedRequest(app).get("/organizations/readiness");
+
+    expect(res.body.entryAllowed).toBe(false);
+    expect(res.body.readyOrganizationId).toBeNull();
+    const steps = res.body.organizations[0].steps.filter(
+      (step: { satisfied: boolean }) => !step.satisfied,
+    );
+    expect(steps.map((step: { id: string }) => step.id).sort()).toEqual([
+      "cluster",
+      "model_defaults",
+    ]);
+  });
+
+  /*
+   * The non-admin case, which is the issue's explicit requirement: the payload has
+   * to carry enough for a client to say "an admin has to do this" instead of
+   * rendering a form that member cannot submit.
+   */
+  it("carries the caller's role and that each step needs admin rights", async () => {
+    const { app } = buildApp({
+      role: "developer",
+      orgs: [makeOrg({ status: "pending_cluster" })],
+    });
+
+    const res = await authedRequest(app).get("/organizations/readiness");
+
+    expect(res.body.organizations[0].role).toBe("developer");
+    expect(
+      res.body.organizations[0].steps.every(
+        (step: { requiresAdmin: boolean }) => step.requiresAdmin,
+      ),
+    ).toBe(true);
+  });
+
+  it("requires authentication", async () => {
+    const { app } = buildApp({ role: "admin" });
+
+    const res = await request(app).get("/organizations/readiness");
+
+    expect(res.status).toBe(401);
+  });
+});
 });

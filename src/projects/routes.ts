@@ -55,6 +55,7 @@ import type { ProjectModelOverrideRepository } from "../model-config/project-ove
 import type { FeatureJobModelOverrideRepository } from "../model-config/feature-override-repository.js";
 import type { FeatureModelSecretRepository } from "../secrets/feature-model-repository.js";
 import type { AgentJobKind } from "../model-config/types.js";
+import { describeMissingModelKinds, evaluateModelCoverage } from "../organizations/readiness.js";
 import { AUDIT_ACTIONS } from "../audit/actions.js";
 import type { AuditRecorder } from "../audit/record.js";
 import type { DesignRepository } from "../designs/repository.js";
@@ -430,26 +431,47 @@ export function createProjectsRouter(deps: {
       return;
     }
 
-    // Resolve model config before creating anything (ADR 018): a request
-    // bundle wins, else the project inherits its org's "spec_grill" default
-    // (project_init dispatches as spec_grill below). There is no per-user
+    // Resolve model config before creating anything (ADR 018): a request bundle
+    // wins, else the project inherits its org's defaults. There is no per-user
     // default anymore (ADR 007 retired).
+    //
+    // Issue #35 tightened the second half of this. It used to require a default for
+    // `spec_grill` alone, which is weaker than ADR 018 item 6a's "all five
+    // agent-driven job kinds" — so an org could create a project that then had its
+    // `feature_build`/`test_run`/`agentic_review`/`design_grill` jobs fail at *run*
+    // time on a missing model, which is the failure item 6a's gate exists to catch
+    // at creation instead. Both the gate and the onboarding readiness signal now
+    // call one predicate (`organizations/readiness.ts`), because a readiness check
+    // that disagrees with the gate promises a form will work and then 400s.
+    //
+    // **The escape hatch is preserved** (ADR 018 item 5): a complete request bundle
+    // resolves for every job kind at the project tier, so it satisfies this
+    // dimension outright. Requiring org coverage on top of a supplied bundle would
+    // retire a documented, tested capability rather than implement the ADR.
     const requestedModelConfig = parsed.data.modelConfig
       ? toModelConfigBundle(parsed.data.modelConfig)
       : null;
     let effectiveModelConfig = requestedModelConfig;
     if (!effectiveModelConfig) {
-      const orgDefault = await deps.jobDefaults.findForJobKind(org.id, "spec_grill");
-      effectiveModelConfig = orgDefault
-        ? await resolveOrgModelConfig(deps, org.id, orgDefault.modelId)
-        : null;
-    }
-    if (!effectiveModelConfig) {
-      res.status(400).json({
-        error:
-          "Set a default model configuration in Organization settings, or provide one for this project.",
-      });
-      return;
+      const coverage = await evaluateModelCoverage(deps, org.id);
+      if (coverage.missing.length === 0) {
+        const orgDefault = await deps.jobDefaults.findForJobKind(org.id, "spec_grill");
+        effectiveModelConfig = orgDefault
+          ? await resolveOrgModelConfig(deps, org.id, orgDefault.modelId)
+          : null;
+      }
+      if (!effectiveModelConfig) {
+        // The message names what is missing rather than the old blanket instruction:
+        // "set a default model configuration" is unhelpful to an admin who has set
+        // four of five, or whose default stopped resolving because its provider was
+        // deleted. Both are distinct remedies and the sentence now distinguishes them.
+        res.status(400).json({
+          error:
+            "Set a default model configuration in Organization settings, or provide one for this project. " +
+            describeMissingModelKinds(coverage),
+        });
+        return;
+      }
     }
 
     const project = await deps.projects.create({
