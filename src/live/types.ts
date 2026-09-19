@@ -113,6 +113,59 @@ export function liveTopicForFeature(featureId: string): string {
  */
 export const LIVE_DELTA_MAX_PAYLOAD_BYTES = 7_000;
 
+/**
+ * Placeholder ids used only to *measure* a payload, never to send one.
+ *
+ * Real uuids, so their length and JSON shape are exactly what a real payload
+ * carries — and therefore the measured size is exact rather than approximate.
+ * Deliberately not a fixed "envelope overhead" constant: the first version of
+ * this fix used one (109 bytes, measured with real uuids) and it was **wrong**,
+ * because `JSON.stringify` escapes some characters. Text of 6891 newlines
+ * serialises to a 13891-byte payload, not 7000 — so a constant envelope left a
+ * gap twice as wide as the one being fixed, and in the same direction (route
+ * accepts, publisher drops).
+ */
+const DELTA_PAYLOAD_PLACEHOLDER_FEATURE_ID = "00000000-0000-4000-8000-000000000000";
+const DELTA_PAYLOAD_PLACEHOLDER_JOB_ID = "00000000-0000-4000-8000-000000000000";
+
+/**
+ * The exact serialised payload size a given text would produce (issue #78).
+ *
+ * Exported so the ingest route can bound the *real* thing rather than a proxy for
+ * it. The route cannot use the real ids — it does not know the feature id until
+ * after it has looked the job up, and it must decide before doing any work — but
+ * it does not need them: uuids are fixed-width, so substituting same-shaped
+ * placeholders gives a byte-identical envelope for any text.
+ *
+ * This is deliberately the same `JSON.stringify` the publisher performs, with the
+ * same field order, so the two cannot disagree. Anything that changed the payload
+ * shape (a new field, a reordering) would change both callers at once because
+ * both go through this function.
+ */
+export function deltaPayloadBytes(text: string): number {
+  return Buffer.byteLength(
+    JSON.stringify({
+      featureId: DELTA_PAYLOAD_PLACEHOLDER_FEATURE_ID,
+      jobId: DELTA_PAYLOAD_PLACEHOLDER_JOB_ID,
+      text,
+    }),
+  );
+}
+
+/**
+ * Whether a delta text can actually be relayed (issue #78).
+ *
+ * The predicate the ingest route applies, so that "the route accepted it" and
+ * "the publisher will send it" are the same statement. Before this they were
+ * different statements expressed in different units, and non-ASCII text fell in
+ * between.
+ */
+export function deltaTextFitsPayload(text: string): boolean {
+  return deltaPayloadBytes(text) <= LIVE_DELTA_MAX_PAYLOAD_BYTES;
+}
+
+
+
 /** The JSON shape `LIVE_JOB_EVENT_DELTAS_CHANNEL`'s payload carries. */
 export interface LiveDeltaPayload {
   featureId: string;
