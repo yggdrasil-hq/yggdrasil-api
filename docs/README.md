@@ -17,6 +17,7 @@ before reading the body.
 |-----|----------------|
 | [`concepts/authentication.md`](concepts/authentication.md) | Auth routes, sessions, OAuth, migrations. |
 | [`concepts/onboarding-readiness.md`](concepts/onboarding-readiness.md) | You touch the onboarding entry gate, `POST /projects`'s org gates, or a fresh signup reports a dead end. |
+| [`concepts/agentic-review-findings.md`](concepts/agentic-review-findings.md) | You touch the Agentic Review read, `submit_review`, `job_events.review_findings`, or a panel reports "no blocking issues" over a review that requested changes. |
 | [`concepts/live-relay-limits.md`](concepts/live-relay-limits.md) | You touch `src/live/`, the delta ingest, or an install reports live updates stopped. |
 | [`concepts/run-artifacts.md`](concepts/run-artifacts.md) | You touch recordings/screenshots, a job's `recordingPath`/`screenshotPath`, or an artifact looks missing or broken. |
 

@@ -63,6 +63,26 @@ export interface JobEventQuestionForm {
   options: JobEventQuestionOption[];
 }
 
+/**
+ * Issue #73: one place an agentic review pointed at.
+ *
+ * `path` and `line` are nullable because a finding may name a file without a line,
+ * or neither — and "no location" is a legitimate remark about the change as a whole,
+ * which is a different thing from a missing finding and must stay expressible. The
+ * read contract (`features/review-types.ts`) types them the same way for the same
+ * reason.
+ *
+ * `blocking` is the field the whole column exists for: it is what makes "N blocking
+ * issues" a countable statement instead of a guess, and a `changes_requested`
+ * verdict with zero blocking findings is a real (if odd) thing a reviewer can say.
+ */
+export interface JobEventReviewFinding {
+  path: string | null;
+  line: number | null;
+  body: string;
+  blocking: boolean;
+}
+
 export interface JobEvent {
   id: string;
   jobId: string;
@@ -88,6 +108,23 @@ export interface JobEvent {
    * was asked as prose. See `JobEventQuestionForm`.
    */
   questionForm: JobEventQuestionForm | null;
+  /**
+   * Issue #73: the review's per-location findings, or **null when they were
+   * written as prose** in `summary`.
+   *
+   * Null and `[]` are deliberately different states, and the difference is the
+   * whole reason this column exists:
+   *
+   * - `null` — no structured findings were recorded. Either the review predates
+   *   the column, or the reviewer wrote them as a paragraph. A renderer cannot
+   *   count blocking issues from this and must not claim zero.
+   * - `[]` — structured findings were recorded, and there were none. This is the
+   *   only state in which "0 blocking issues" is a true statement.
+   *
+   * A client that read absence-of-structure as absence-of-problems is what #73
+   * describes, so the two must stay distinguishable rather than collapsing to `[]`.
+   */
+  reviewFindings: JobEventReviewFinding[] | null;
   actionItems: JobEventActionItem[] | null;
   snapshot: Record<string, string> | null;
   createdAt: Date;
@@ -105,6 +142,7 @@ interface JobEventRow {
   summary: string | null;
   verdict: string | null;
   question_form: JobEventQuestionForm | null;
+  review_findings: JobEventReviewFinding[] | null;
   action_items: JobEventActionItem[] | null;
   design_snapshot: Record<string, string> | null;
   created_at: Date;
@@ -125,7 +163,7 @@ export interface JobEventWithScope {
 
 /** The event columns, spelled once so every read returns the same shape. */
 const jobEventColumns = `id, job_id, type, question, markdown, message, status, pr_url,
-         summary, verdict, question_form, action_items, design_snapshot, created_at`;
+         summary, verdict, question_form, review_findings, action_items, design_snapshot, created_at`;
 
 function mapJobEvent(row: JobEventRow): JobEvent {
   return {
@@ -140,6 +178,7 @@ function mapJobEvent(row: JobEventRow): JobEvent {
     summary: row.summary,
     verdict: row.verdict,
     questionForm: row.question_form,
+    reviewFindings: row.review_findings,
     actionItems: row.action_items,
     snapshot: row.design_snapshot,
     createdAt: row.created_at,
@@ -187,15 +226,48 @@ export class JobEventRepository {
      * question form without a type error.
      */
     questionForm?: JobEventQuestionForm | null;
+    /**
+     * Issue #73: a review's per-location findings. Declared here for the reason the
+     * `verdict` and `questionForm` comments give — the caller spreads a wider object
+     * into this parameter, so an undeclared field is discarded **silently**. The
+     * verdict was already lost that way once (#59), and a findings list lost the
+     * same way would leave the column null while the producer believed it had sent
+     * structure.
+     *
+     * `null`/absent means "written as prose"; `[]` means "structured, none found".
+     * See the read side's doc comment for why those must stay distinct.
+     */
+    reviewFindings?: JobEventReviewFinding[] | null;
     actionItems?: JobEventActionItem[];
     snapshot?: Record<string, string>;
   }): Promise<JobEvent> {
+    /*
+     * **JSONB parameters are serialised explicitly, and that is load-bearing.**
+     *
+     * `node-postgres` does not send a JS value as JSON: it sends a JS *array* as a
+     * Postgres **array literal** (`{...}`) and a plain object as `[...]`-ish text.
+     * Postgres then casts the parameter to jsonb, and an array literal is not valid
+     * JSON — so a JS array destined for a jsonb column fails at the server with
+     * `invalid input syntax for type json`.
+     *
+     * That is not hypothetical: it was true of `actionItems` from the day the
+     * column was added. Every `submit_adr` batch went through this call and could
+     * never be stored, and no test noticed because every real-database case here
+     * wrote an *object* (`questionForm`) — objects happen to serialise acceptably,
+     * so the array path was never executed against a database. Found while adding
+     * #73's findings array, whose failing real-database test is what exposed it.
+     *
+     * `JSON.stringify` for the two array-valued columns; the object-valued ones are
+     * left as they are, because changing what already works is a separate risk from
+     * fixing what does not. `?? null` is preserved through the stringify so an
+     * absent value stays SQL NULL rather than becoming the string "null".
+     */
     const result = await this.db.query<JobEventRow>(
       `INSERT INTO job_events
-         (job_id, type, question, markdown, message, status, pr_url, summary, verdict, question_form, action_items, design_snapshot)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         (job_id, type, question, markdown, message, status, pr_url, summary, verdict, question_form, review_findings, action_items, design_snapshot)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
        RETURNING id, job_id, type, question, markdown, message, status, pr_url,
-         summary, verdict, question_form, action_items, design_snapshot, created_at`,
+         summary, verdict, question_form, review_findings, action_items, design_snapshot, created_at`,
       [
         input.jobId,
         input.type,
@@ -207,7 +279,11 @@ export class JobEventRepository {
         input.summary ?? null,
         input.verdict ?? null,
         input.questionForm ?? null,
-        input.actionItems ?? null,
+        // Explicitly `?? null` rather than defaulting to `[]`: null is "findings were
+        // prose" and `[]` is "structured, none found", so collapsing them here would
+        // lose the distinction the column exists to carry (issue #73).
+        input.reviewFindings ? JSON.stringify(input.reviewFindings) : null,
+        input.actionItems ? JSON.stringify(input.actionItems) : null,
         input.snapshot ?? null,
       ],
     );
@@ -251,7 +327,7 @@ export class JobEventRepository {
   async findByIdWithScope(eventId: string): Promise<JobEventWithScope | null> {
     const result = await this.db.query<JobEventScopeRow>(
       `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
-         e.status, e.pr_url, e.summary, e.verdict, e.question_form,
+         e.status, e.pr_url, e.summary, e.verdict, e.question_form, e.review_findings,
          e.action_items, e.design_snapshot,
          e.created_at, j.project_id, j.feature_id
        FROM job_events e
@@ -272,7 +348,7 @@ export class JobEventRepository {
   async listSpecGrillByFeature(featureId: string): Promise<JobEvent[]> {
     const result = await this.db.query<JobEventRow>(
       `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
-         e.status, e.pr_url, e.summary, e.verdict, e.question_form,
+         e.status, e.pr_url, e.summary, e.verdict, e.question_form, e.review_findings,
          e.action_items, e.design_snapshot,
          e.created_at
        FROM job_events e
@@ -318,7 +394,7 @@ export class JobEventRepository {
       // audit query became ambiguous against the joined `projects` table — the
       // constant is only safe in a single-table read.
       `SELECT e.id, e.job_id, e.type, e.question, e.markdown, e.message,
-         e.status, e.pr_url, e.summary, e.verdict, e.question_form,
+         e.status, e.pr_url, e.summary, e.verdict, e.question_form, e.review_findings,
          e.action_items, e.design_snapshot, e.created_at
        FROM job_events e
        INNER JOIN jobs j ON j.id = e.job_id

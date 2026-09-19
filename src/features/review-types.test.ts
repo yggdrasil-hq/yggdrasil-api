@@ -24,6 +24,7 @@ function makeEvent(overrides: Partial<JobEvent> = {}): JobEvent {
     summary: "Auth flow is missing the token refresh path.",
     verdict: "changes_requested",
     questionForm: null,
+    reviewFindings: null,
     actionItems: null,
     snapshot: null,
     createdAt: new Date("2026-09-18T10:00:00.000Z"),
@@ -37,6 +38,8 @@ describe("toPublicAgenticReview", () => {
       verdict: "changes_requested",
       summary: "Auth flow is missing the token refresh path.",
       comments: [],
+      // A prose review: the findings are in `summary`, so nothing is countable.
+      findingsRecorded: false,
       jobId: "job_1",
       completedAt: "2026-09-18T10:00:00.000Z",
     });
@@ -56,6 +59,7 @@ describe("toPublicAgenticReview", () => {
       verdict: null,
       summary: null,
       comments: [],
+      findingsRecorded: false,
       jobId: null,
       completedAt: null,
     });
@@ -94,5 +98,48 @@ describe("toPublicAgenticReview", () => {
 
   it("carries the producing job's id so the UI can link to it", () => {
     expect(toPublicAgenticReview(makeEvent({ jobId: "job_9" })).jobId).toBe("job_9");
+  });
+
+  /*
+   * Issue #73: `findingsRecorded` is the field that makes a blocking count safe to
+   * render, so these three cases are the ones that keep "no findings" and "findings
+   * written as prose" distinguishable. Collapsing them is what let a panel show "no
+   * blocking issues" over a `changes_requested` review.
+   */
+  it("marks a prose review as not recorded, so a client cannot count it", () => {
+    expect(toPublicAgenticReview(makeEvent({ reviewFindings: null })).findingsRecorded).toBe(false);
+  });
+
+  it("projects structured findings onto comments and marks them recorded", () => {
+    const review = toPublicAgenticReview(
+      makeEvent({
+        reviewFindings: [
+          { path: "src/auth.ts", line: 42, body: "Token refresh is missing.", blocking: true },
+          { path: null, line: null, body: "Overall shape is fine.", blocking: false },
+        ],
+      }),
+    );
+
+    expect(review.findingsRecorded).toBe(true);
+    expect(review.comments).toEqual([
+      { path: "src/auth.ts", line: 42, body: "Token refresh is missing.", blocking: true },
+      { path: null, line: null, body: "Overall shape is fine.", blocking: false },
+    ]);
+  });
+
+  /*
+   * The distinction that matters: an empty *structured* list is a real answer — the
+   * reviewer recorded findings and there were none — whereas a prose review says
+   * nothing about how many there are. Both render an empty list, and only
+   * `findingsRecorded` tells them apart.
+   */
+  it("distinguishes an empty structured list from prose", () => {
+    const structuredNone = toPublicAgenticReview(makeEvent({ reviewFindings: [] }));
+    const prose = toPublicAgenticReview(makeEvent({ reviewFindings: null }));
+
+    expect(structuredNone.comments).toEqual([]);
+    expect(prose.comments).toEqual([]);
+    expect(structuredNone.findingsRecorded).toBe(true);
+    expect(prose.findingsRecorded).toBe(false);
   });
 });

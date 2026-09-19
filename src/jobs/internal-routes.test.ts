@@ -19,6 +19,7 @@ function makeEvent(overrides: Partial<JobEvent> = {}): JobEvent {
     summary: null,
     verdict: null,
     questionForm: null,
+    reviewFindings: null,
     actionItems: null,
     snapshot: null,
     createdAt: new Date(),
@@ -295,6 +296,7 @@ describe("POST /internal/jobs/:jobId/events", () => {
       type: "ask_user",
       question: "Which auth model?",
       questionForm: null,
+      reviewFindings: null,
     });
   });
 
@@ -410,6 +412,7 @@ describe("POST /internal/jobs/:jobId/events", () => {
       snapshot: { "designs/checkout/page.html": "<h1>Hello</h1>" },
       // Present-and-null, not undefined: see the note in the ask_user case above.
       questionForm: null,
+      reviewFindings: null,
     });
   });
 
@@ -618,6 +621,93 @@ describe("POST /internal/jobs/:jobId/events", () => {
       .send({ type: "not_a_real_type" });
 
     expect(res.status).toBe(400);
+  });
+
+  /*
+   * Issue #73's ingest half. The storage decision is null-vs-`[]`, and the route is
+   * the only place that distinction is produced — so these assert it here rather
+   * than trusting the column's doc comment. #59 is the precedent: the verdict was
+   * validated, acted on, and then dropped because `create` never declared it, and a
+   * findings list lost the same way would leave the column null while the producer
+   * believed it had sent structure.
+   */
+  describe("structured review findings (issue #73)", () => {
+    const postReview = (app: express.Express, body: Record<string, unknown>) =>
+      request(app)
+        .post(`/internal/jobs/${JOB_ID}/events`)
+        .set("Authorization", "Bearer test-internal-api-token")
+        .send({ type: "submit_review", verdict: "changes_requested", ...body });
+
+    it("stores findings, defaulting an omitted blocking flag to true", async () => {
+      const create = vi.fn(async (input: Record<string, unknown>) => makeEvent(input));
+      const app = buildApp({
+        create,
+        findById: async () => makeJob({ featureId: "feature_42", kind: "agentic_review" }),
+      });
+
+      const res = await postReview(app, {
+        summary: "Two things.",
+        findings: [
+          { path: "src/auth.ts", line: 42, body: "Token refresh missing.", blocking: true },
+          { body: "Shape is fine." },
+        ],
+      });
+
+      expect(res.status).toBe(201);
+      const [input] = create.mock.calls.at(-1) as [Record<string, unknown>];
+      expect(input.reviewFindings).toEqual([
+        { path: "src/auth.ts", line: 42, body: "Token refresh missing.", blocking: true },
+        // The omitted flag becomes `true`, matching the read contract's own default:
+        // an absent flag means "these are the blockers", and defaulting to false
+        // would let a review pass its gate while displaying what should stop it.
+        { path: null, line: null, body: "Shape is fine.", blocking: true },
+      ]);
+    });
+
+    it("stores null, not an empty array, when findings are omitted", async () => {
+      const create = vi.fn(async (input: Record<string, unknown>) => makeEvent(input));
+      const app = buildApp({
+        create,
+        findById: async () => makeJob({ featureId: "feature_42", kind: "agentic_review" }),
+      });
+
+      await postReview(app, { summary: "Prose only." });
+
+      const [input] = create.mock.calls.at(-1) as [Record<string, unknown>];
+      // null means "written as prose" and `[]` means "structured, none found". If
+      // this defaulted to `[]`, a client would read every prose review as a review
+      // with zero findings — which is the defect #73 exists to fix.
+      expect(input.reviewFindings).toBeNull();
+    });
+
+    it("stores an empty array when the producer explicitly sent none", async () => {
+      const create = vi.fn(async (input: Record<string, unknown>) => makeEvent(input));
+      const app = buildApp({
+        create,
+        findById: async () => makeJob({ featureId: "feature_42", kind: "agentic_review" }),
+      });
+
+      await postReview(app, { summary: "Nothing to flag.", findings: [] });
+
+      const [input] = create.mock.calls.at(-1) as [Record<string, unknown>];
+      // The one state in which "0 blocking issues" is a true statement.
+      expect(input.reviewFindings).toEqual([]);
+    });
+
+    it("rejects a malformed finding rather than storing a half-shaped list", async () => {
+      const create = vi.fn(async (input: Record<string, unknown>) => makeEvent(input));
+      const app = buildApp({
+        create,
+        findById: async () => makeJob({ featureId: "feature_42", kind: "agentic_review" }),
+      });
+
+      // No `body`: a finding with nothing to say is not a finding, and storing it
+      // would put an empty row in front of a reviewer.
+      const res = await postReview(app, { summary: "x", findings: [{ path: "a.ts" }] });
+
+      expect(res.status).toBe(400);
+      expect(create).not.toHaveBeenCalled();
+    });
   });
 
   it("returns 404 for a malformed job id", async () => {

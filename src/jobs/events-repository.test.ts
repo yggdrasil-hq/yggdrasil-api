@@ -20,6 +20,7 @@ function eventRow(overrides: Record<string, unknown> = {}) {
     summary: null,
     verdict: null,
     questionForm: null,
+    review_findings: null,
     action_items: null,
     design_snapshot: null,
     created_at: new Date("2026-09-18T10:00:00.000Z"),
@@ -176,5 +177,86 @@ describe("verdict persistence and the feature's latest review (issue #59)", () =
     const repository = new JobEventRepository(db as never);
 
     expect(await repository.findLatestReviewByFeature(FEATURE_ID)).toBeNull();
+  });
+});
+
+/*
+ * Issue #73: the findings column has to survive a round trip through the
+ * repository, and only the *values* matter — the failure this guards is #59's, where
+ * the field was declared and then discarded, and where a fake pool that only
+ * asserted the SQL string would have passed.
+ *
+ * These assert the parameter position too: `review_findings` sits between
+ * `question_form` and `action_items`, so a missed `$n` renumbering would put the
+ * findings in the action-items column and still produce no type error.
+ */
+describe("JobEventRepository review findings (issue #73)", () => {
+  const findings = [
+    { path: "src/auth.ts", line: 42, body: "Token refresh missing.", blocking: true },
+  ];
+
+  it("writes the findings parameter in the column's own position", async () => {
+    const { db, queries } = fakePool({
+      insert: [eventRow({ type: "submit_review", review_findings: findings })],
+    });
+    const repository = new JobEventRepository(db as never);
+
+    const event = await repository.create({
+      jobId: JOB_ID,
+      type: "submit_review",
+      reviewFindings: findings,
+    });
+
+    const insert = queries.find((q) => q.sql.includes("INSERT INTO job_events"));
+    expect(insert?.sql).toContain("review_findings");
+    // 11th of 13: after question_form, before action_items. Asserting the value at
+    // its index is what catches a renumbering that the compiler cannot.
+    // Stringified, because node-postgres sends a JS array as a PG *array literal*
+    // rather than as JSON, and Postgres then refuses the jsonb cast. Asserting the
+    // serialised form is what makes this test catch a regression to a raw array —
+    // the bug that made `actionItems` unwritable from the day the column existed.
+    expect(insert?.values?.[10]).toEqual(JSON.stringify(findings));
+    expect(event.reviewFindings).toEqual(findings);
+  });
+
+  it("reads the findings back out of the row", async () => {
+    const { db } = fakePool({
+      insert: [eventRow({ type: "submit_review", review_findings: findings })],
+    });
+    const repository = new JobEventRepository(db as never);
+
+    const event = await repository.create({ jobId: JOB_ID, type: "submit_review" });
+
+    expect(event.reviewFindings).toEqual(findings);
+  });
+
+  /*
+   * The distinction the whole column exists for, asserted at the storage layer:
+   * absent means prose (a count is not knowable) and `[]` means structured-with-none
+   * (a count of zero is true). Defaulting here would collapse them.
+   */
+  it("stores null when findings are omitted and an empty array when they are empty", async () => {
+    const { db, queries } = fakePool({ insert: [eventRow()] });
+    const repository = new JobEventRepository(db as never);
+
+    await repository.create({ jobId: JOB_ID, type: "submit_review" });
+    const omitted = queries.filter((q) => q.sql.includes("INSERT INTO job_events")).at(-1);
+    expect(omitted?.values?.[10]).toBeNull();
+
+    await repository.create({ jobId: JOB_ID, type: "submit_review", reviewFindings: [] });
+    const empty = queries.filter((q) => q.sql.includes("INSERT INTO job_events")).at(-1);
+    // `[]` is a real value and must still be sent as JSON, not collapsed to NULL —
+    // that is the difference between "structured, none found" and "written as prose".
+    expect(empty?.values?.[10]).toEqual("[]");
+  });
+
+  it("maps a null column to null rather than to an empty list", async () => {
+    const { db } = fakePool({ insert: [eventRow({ type: "submit_review" })] });
+    const repository = new JobEventRepository(db as never);
+
+    const event = await repository.create({ jobId: JOB_ID, type: "submit_review" });
+
+    // `[]` here would make every pre-#73 review read as "structured, none found".
+    expect(event.reviewFindings).toBeNull();
   });
 });
