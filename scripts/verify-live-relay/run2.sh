@@ -98,18 +98,69 @@ docker run -d --name "$NGINX" --network "$NET" \
 echo "started $NGINX"
 
 echo "== waiting for migrations (first replica to boot applies them) =="
+# Issue #97. This used to wait on `to_regclass('public.sessions') is not null`, and
+# `sessions` is created by migration 001 of 51. Because the replicas are started
+# simultaneously on purpose (to exercise #76's advisory lock), the loser is still
+# applying the rest when that probe goes true, so the wait ended long before the
+# database was ready.
+#
+# The gap was wider than "001 of 51" suggests, which is worth recording: the
+# fixtures need `features` (migration 002) *and* `organizations` /
+# `organization_memberships` (013) *and* `projects.organization_id` (015). So the
+# window in which fixtures.sql could run against an incomplete schema spanned
+# fourteen migrations, not one — and a fixture that lands half-applied is exactly
+# the intermittent failure that reads as flakiness in the relay.
+#
+# Counting the ledger against the number of migration *files* is the check that
+# means "migrations complete" rather than "migrations started", and it needs no
+# edit when a migration is added — unlike naming a table from the newest migration,
+# which silently rots the next time one lands after it.
+EXPECTED_MIGRATIONS="$(find "$API_DIR/src/db/migrations" -name '*.sql' | wc -l | tr -d '[:space:]')"
+migrations_applied=""
 for _ in $(seq 1 120); do
-  if docker exec "$PG" psql -U yggdrasil -d "$DB" -tAc \
-      "select to_regclass('public.sessions') is not null" 2>/dev/null | grep -q t; then
+  migrations_applied="$(docker exec "$PG" psql -U yggdrasil -d "$DB" -tAc \
+      "select count(*) from schema_migrations" 2>/dev/null | tr -d '[:space:]')"
+  if [ "${migrations_applied:-}" = "$EXPECTED_MIGRATIONS" ]; then
     break
   fi
   sleep 1
 done
-docker exec "$PG" psql -U yggdrasil -d "$DB" -tAc "select count(*) from schema_migrations" 2>/dev/null \
-  | sed 's/^/  migrations applied: /'
+
+# Fatal, not merely reported. The old code fell through to the fixtures whatever
+# the state, and because `set -uo pipefail` is set with no `-e`, nothing downstream
+# noticed. Stopping here names the real cause instead of letting it surface later
+# as a socket refusal — the failure mode #97 is about.
+if [ "${migrations_applied:-}" != "$EXPECTED_MIGRATIONS" ]; then
+  echo "" >&2
+  echo "FATAL: migrations did not finish: ${migrations_applied:-0} of $EXPECTED_MIGRATIONS" >&2
+  echo "       applied after 120s. Stopping, because inserting fixtures into a" >&2
+  echo "       half-migrated schema fails later as a socket refusal naming the" >&2
+  echo "       wrong cause (#97). Check the replica logs printed below." >&2
+  exit 1
+fi
+echo "  migrations applied: $migrations_applied of $EXPECTED_MIGRATIONS"
 
 echo "== fixtures (fixed UUIDs; see fixtures.sql) =="
-docker exec -i "$PG" psql -U yggdrasil -d "$DB" -q < "$HERE/fixtures.sql" && echo "inserted"
+# Issue #97, second half. `ON_ERROR_STOP=1` is load-bearing and its absence was
+# worse than the issue records. A fixture failure here does **not** surface as a
+# non-zero exit on its own: psql reading a script from stdin returns 0 even after
+# a failed statement (marked by `-c`, where it returns 1 — which is why this is
+# easy to get wrong), so the original `psql ... < fixtures.sql && echo "inserted"`
+# printed **inserted** over a fixture that never landed. The harness then reported
+# success at the fixture step and failed later, as `subscribe refused … "Feature
+# not found"` — a correct socket refusal naming a cause that was not the cause.
+#
+# So both halves are needed: `ON_ERROR_STOP=1` makes psql exit 3 on the first
+# error, and the explicit check makes that exit fatal rather than decorative.
+if ! docker exec -i "$PG" psql -U yggdrasil -d "$DB" -q -v ON_ERROR_STOP=1 \
+    < "$HERE/fixtures.sql"; then
+  echo "" >&2
+  echo "FATAL: fixtures.sql failed. Stopping rather than continuing, because the" >&2
+  echo "       run would otherwise fail later as a socket refusal naming a different" >&2
+  echo "       cause (#97) — which has already cost one false-regression hunt." >&2
+  exit 1
+fi
+echo "inserted"
 
 echo ""
 echo "== pg_notify payload cap (the reason the payload is an id, not the event) =="
