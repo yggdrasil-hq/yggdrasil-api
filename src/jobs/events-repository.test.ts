@@ -19,6 +19,7 @@ function eventRow(overrides: Record<string, unknown> = {}) {
     pr_url: null,
     summary: null,
     verdict: null,
+    questionForm: null,
     action_items: null,
     design_snapshot: null,
     created_at: new Date("2026-09-18T10:00:00.000Z"),

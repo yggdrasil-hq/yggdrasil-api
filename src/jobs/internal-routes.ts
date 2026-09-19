@@ -8,7 +8,7 @@ import type { FeatureRepository } from "../features/repository.js";
 import type { DesignRepository } from "../designs/repository.js";
 import type { JobEventRepository } from "./events-repository.js";
 import type { JobRepository } from "./repository.js";
-import type { JobKind } from "./types.js";
+import { GRILL_JOB_KINDS, type JobKind } from "./types.js";
 import type { ProjectRepository } from "../projects/repository.js";
 import type { TestRepository } from "../tests/repository.js";
 import type { TestRunReportRepository } from "../tests/reports-repository.js";
@@ -88,6 +88,31 @@ const jobEventSchema = z.object({
   testStatus: z.enum(["pass", "fail"]).optional(),
   testDetails: z.string().optional(),
   screenshotPath: z.string().optional(),
+  /**
+   * Issue #38: the structured half of an `ask_user` question — a heading for the
+   * control, whether more than one choice may be picked, and the choices.
+   *
+   * All three are optional on the object and their *relationship* is enforced in
+   * the `superRefine` below, because "header is required when options are present"
+   * is not expressible in a flat object schema without a discriminated union — and
+   * a union here would make the error message a model receives harder to act on
+   * than a sentence naming the missing field.
+   *
+   * The names match the tool's arguments exactly (`header`, `question`,
+   * `multiSelect`, `options`), so a reader comparing
+   * `extensions/yggdrasil-contract` with this schema is comparing the same words.
+   */
+  header: z.string().trim().min(1).max(128).optional(),
+  multiSelect: z.boolean().optional(),
+  options: z
+    .array(
+      z.object({
+        label: z.string().trim().min(1).max(256),
+        description: z.string().trim().max(512).optional(),
+      }),
+    )
+    .max(20)
+    .optional(),
   passed: z.number().int().nonnegative().optional(),
   failed: z.number().int().nonnegative().optional(),
   skipped: z.number().int().nonnegative().optional(),
@@ -114,6 +139,45 @@ const jobEventSchema = z.object({
       code: "custom",
       message: "Test step reports require testName and testStatus",
     });
+  }
+  /*
+   * Issue #38: a structured question's halves only make sense together.
+   *
+   * `options` without `header` is the case worth a message: the contract the Web
+   * app renders against expects a heading, and a model that supplied choices but
+   * forgot the label is one correction away from a valid call. A bare `header`
+   * with no `options` is harmless and therefore accepted rather than rejected —
+   * it renders as a question with no control, which is the prose case.
+   *
+   * An empty `options` array is rejected rather than treated as prose: a tool
+   * caller that *meant* to offer choices and produced none is a bug in the call,
+   * and silently downgrading it to a text box would hide that from the model that
+   * could fix it.
+   */
+  if (event.type === "ask_user") {
+    if (event.options !== undefined) {
+      if (!event.header) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["header"],
+          message: "A question with options requires a header naming what is being chosen",
+        });
+      }
+      if (event.options.length === 0) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["options"],
+          message: "A question with options must offer at least one",
+        });
+      }
+    }
+    if (!event.question) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["question"],
+        message: "An ask_user question requires the question text",
+      });
+    }
   }
   if (
     event.type === "submit_test_report" &&
@@ -401,6 +465,32 @@ export function createJobsInternalRouter(deps: {
           return;
         }
       }
+      /*
+       * Issue #38's "where the tool lives" question, enforced rather than assumed.
+       *
+       * The *prevention* is the skills' `allowed-tools` frontmatter: `ask_user` is
+       * listed by the three grill skills only, so a `feature_build` agent never has
+       * the tool in its list. This is the backstop for the day that changes.
+       *
+       * Why a hard rejection rather than accepting the event: `ask_user` ends the
+       * agent's *turn* without ending the run (it is deliberately absent from
+       * `CuratedEvent.Terminal`), after which the Orchestrator blocks on
+       * `WaitForReply`. On a job kind with no chat surface there is no reply to
+       * wait for and no timeout — so accepting one here produces a run that hangs
+       * indefinitely with nothing on screen to explain it. Failing the event post
+       * instead turns a silent infinite stall into a logged error naming the job
+       * and kind, which is the better of the two failures the issue asks us to
+       * choose between.
+       */
+      if (parsed.data.type === "ask_user") {
+        const job = await deps.jobs.findById(jobId);
+        if (job && !GRILL_JOB_KINDS.has(job.kind)) {
+          res.status(400).json({
+            error: `ask_user requires a job kind with a chat surface; job ${jobId} is ${job.kind}`,
+          });
+          return;
+        }
+      }
 
       let event;
       try {
@@ -424,6 +514,30 @@ export function createJobsInternalRouter(deps: {
           // is discarded silently. Spelling it means removing it is a compile
           // error rather than a quiet loss.
           verdict: parsed.data.verdict,
+          /*
+           * Issue #38: spelled out for the reason the `verdict` comment above
+           * gives. The tool's structured half arrives as three separate fields on
+           * the request body, and the repository takes one object — so building
+           * it here is not just tidiness, it is the only way `question_form` is
+           * written at all. A spread of `parsed.data` into a narrower parameter
+           * discards what the parameter does not declare, which is how the verdict
+           * was validated, acted on, and then silently dropped (`#59`).
+           *
+           * `header ?? null` rather than `?? ""`: the schema requires a header
+           * whenever options are present, so null here means "prose question",
+           * and an empty string would render as a blank heading instead.
+           */
+          questionForm:
+            parsed.data.type === "ask_user" && parsed.data.options
+              ? {
+                  header: parsed.data.header ?? null,
+                  multiSelect: parsed.data.multiSelect ?? false,
+                  options: parsed.data.options.map((option) => ({
+                    label: option.label,
+                    description: option.description ?? null,
+                  })),
+                }
+              : null,
           actionItems: parsed.data.actionItems,
           snapshot: parsed.data.snapshot,
         });

@@ -1,0 +1,198 @@
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import pg from "pg";
+import { JobEventRepository } from "./events-repository.js";
+import { runMigrations } from "../db/migrate.js";
+import { livePostgresSkipWarning, probeLivePostgres } from "../testing/live-postgres.js";
+
+/**
+ * Issue #38's persistence against a **real Postgres**.
+ *
+ * **Why this file exists.** Every other test of this repository uses a fake pool
+ * that records SQL and returns canned rows — which is why a repository method
+ * could throw on every call (#43) and an audit query could 500 on every request
+ * (#61) behind a green suite. A fake pool has no opinion on whether Postgres
+ * *accepts* a statement, and it has even less of one about whether a **new
+ * column** exists: the fake returns whatever row shape the test invented, so an
+ * INSERT naming a column the migration never added would pass here and fail on
+ * the first real deployment.
+ *
+ * `question_form` is exactly that risk (`db/migrations/052_...`). These cases
+ * apply the migrations and then read the column back, so the migration and the
+ * repository have to agree.
+ *
+ * Skipping is loud, not silent — see `testing/live-postgres.ts` for why a
+ * timeout to a Docker-allocated address usually means a host VPN is shadowing the
+ * compose subnet rather than anything being misconfigured.
+ */
+
+const connectionString = process.env.DATABASE_URL ?? "";
+
+const reachability = await probeLivePostgres(connectionString);
+
+if (!reachability.ok) {
+  console.warn(
+    livePostgresSkipWarning({
+      label: "job-events",
+      probe: reachability,
+      unverified:
+        "the question_form column, its round trip through JSONB, and the claim that " +
+        "migration 052 and JobEventRepository.create agree on its name",
+    }),
+  );
+}
+
+describe.skipIf(!reachability.ok)("JobEventRepository against a real Postgres", () => {
+  let pool: pg.Pool;
+  let repository: JobEventRepository;
+  let jobId: string;
+
+  beforeAll(async () => {
+    pool = new pg.Pool({ connectionString });
+    await runMigrations(pool);
+    repository = new JobEventRepository(pool);
+
+    const stamp = Date.now();
+    const userId = (
+      await pool.query(
+        `INSERT INTO users (username, display_name, github_id, github_login)
+         VALUES ($1, 'I38', $2, $1) RETURNING id`,
+        [`i38_${stamp}`, stamp],
+      )
+    ).rows[0].id;
+
+    // An organization is required: `projects.organization_id` is NOT NULL since
+    // ADR 016, so a project cannot exist without one.
+    const orgId = (
+      await pool.query(
+        `INSERT INTO organizations (name, slug) VALUES ($1, $1) RETURNING id`,
+        [`i38-org-${stamp}`],
+      )
+    ).rows[0].id;
+
+    const projectId = (
+      await pool.query(
+        `INSERT INTO projects (owner_user_id, organization_id, name, slug)
+         VALUES ($1, $2, 'I38', $3) RETURNING id`,
+        [userId, orgId, `i38-${stamp}`],
+      )
+    ).rows[0].id;
+
+    // A grill kind, because the route rejects `ask_user` on a kind with no chat
+    // surface — and this file is about the column, not that rule, so it uses a
+    // row that could legitimately carry one.
+    jobId = (
+      await pool.query(
+        `INSERT INTO jobs (project_id, kind) VALUES ($1, 'spec_grill') RETURNING id`,
+        [projectId],
+      )
+    ).rows[0].id;
+  });
+
+  afterAll(async () => {
+    // Scoped to this file's own rows: the scratch database is the caller's to
+    // drop, but leaving a job behind would leak into any other real-Postgres file
+    // that happens to count rows. ON DELETE CASCADE does the rest.
+    await pool.query("DELETE FROM jobs WHERE id = $1", [jobId]).catch(() => undefined);
+    await pool.end().catch(() => undefined);
+  });
+
+  it("round-trips a structured question through JSONB unchanged", async () => {
+    const created = await repository.create({
+      jobId,
+      type: "ask_user",
+      question: "Which database should the API use?",
+      questionForm: {
+        header: "Database",
+        multiSelect: false,
+        options: [
+          { label: "PostgreSQL", description: "Matches the existing API stack" },
+          { label: "SQLite", description: null },
+        ],
+      },
+    });
+
+    // Read back through the *repository*, not the RETURNING row, so the SELECT's
+    // column list is exercised too — a `create` that writes a column the reader
+    // does not select is the same class of mismatch as one that writes a column
+    // the migration does not have.
+    const events = await repository.listByJob(jobId);
+    const stored = events.find((event) => event.id === created.id);
+
+    expect(stored?.questionForm).toEqual({
+      header: "Database",
+      multiSelect: false,
+      options: [
+        { label: "PostgreSQL", description: "Matches the existing API stack" },
+        // JSONB preserves the null rather than dropping the key, which is what
+        // lets a client read `option.description` without an existence check.
+        { label: "SQLite", description: null },
+      ],
+    });
+  });
+
+  it("stores NULL for a prose question, and reads it back as null", async () => {
+    // The other half of "the two modes coexist", and the state of every row
+    // written before migration 052.
+    const created = await repository.create({
+      jobId,
+      type: "ask_user",
+      question: "What problem does this solve?",
+    });
+
+    const events = await repository.listByJob(jobId);
+    const stored = events.find((event) => event.id === created.id);
+
+    expect(stored?.questionForm).toBeNull();
+  });
+
+  it("finds a structured question with its scope, used by the live relay", async () => {
+    // `findByIdWithScope` has its own column list against a join, so it is a
+    // separate statement that a new column can be missing from. It is also the
+    // read the live relay performs on every notification, so a missing column
+    // there would surface as a delta arriving without its question.
+    const created = await repository.create({
+      jobId,
+      type: "ask_user",
+      question: "Which framework?",
+      questionForm: {
+        header: "Framework",
+        multiSelect: true,
+        options: [{ label: "Next.js", description: null }],
+      },
+    });
+
+    const scoped = await repository.findByIdWithScope(created.id);
+
+    expect(scoped?.event.questionForm).toEqual({
+      header: "Framework",
+      multiSelect: true,
+      options: [{ label: "Next.js", description: null }],
+    });
+  });
+
+  it("accepts a large structured question without truncating an option label", async () => {
+    // Near the schema's per-field limits rather than over them: the point is that
+    // JSONB does not silently shorten a long label, which a `VARCHAR` column
+    // would have. The migration chose jsonb partly for this reason.
+    const label = "x".repeat(256);
+    const created = await repository.create({
+      jobId,
+      type: "ask_user",
+      question: "Which?",
+      questionForm: {
+        header: "y".repeat(128),
+        multiSelect: false,
+        options: [
+          { label, description: "z".repeat(512) },
+          { label: "short", description: null },
+        ],
+      },
+    });
+
+    const scoped = await repository.findByIdWithScope(created.id);
+
+    expect(scoped?.event.questionForm?.header).toHaveLength(128);
+    expect(scoped?.event.questionForm?.options[0]?.label).toHaveLength(256);
+    expect(scoped?.event.questionForm?.options[0]?.description).toHaveLength(512);
+  });
+});

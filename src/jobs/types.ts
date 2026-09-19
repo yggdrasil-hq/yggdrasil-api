@@ -10,6 +10,25 @@ export type JobKind =
 export type JobStatus = "pending" | "running" | "completed" | "failed" | "cancelled";
 
 /**
+ * The job kinds that run a grill conversation — i.e. the ones with a chat surface a
+ * human can answer on.
+ *
+ * Issue #38 needs this to answer "where does the `ask_user` tool live" with
+ * something enforceable. The *prevention* is each skill's `allowed-tools`
+ * frontmatter, which lists `ask_user` only for the three grill skills; this
+ * constant is the API-side backstop, used to reject a question on a kind that has
+ * nowhere to render it (see `jobs/internal-routes.ts`).
+ *
+ * `project_init` is deliberately absent from this list and still covered: it is a
+ * `spec_grill` job distinguished by the feature's `feature_type`, not its kind.
+ * Adding it here would name a kind that does not exist.
+ */
+export const GRILL_JOB_KINDS: ReadonlySet<JobKind> = new Set<JobKind>([
+  "spec_grill",
+  "design_grill",
+]);
+
+/**
  * How a job came to exist, as `jobs.trigger_source`'s CHECK allows it
  * (migration 049).
  *

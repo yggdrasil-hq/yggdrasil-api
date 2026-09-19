@@ -47,6 +47,33 @@ describe("summarizeGrillTranscript", () => {
     );
   });
 
+  /*
+   * Issue #38's resume/replay question, asserted rather than reasoned about.
+   *
+   * The issue asks that "a question whose answer is already recorded must not be
+   * re-asked, and a restarted run must see the prior answers". Nothing needed to
+   * change for that: `summarizeGrillTranscript` renders a structured question
+   * through the same `ask_user` branch it always has, and the answer arrives as
+   * an ordinary `user_message`. So the mechanism is the pre-existing one — which
+   * is exactly why it is worth a test, because a future change that moved the
+   * structured case onto its own event type would break replay silently, with the
+   * restarted agent re-asking what it had already been told.
+   */
+  it("carries a structured question and its answer into a restarted run's seed", () => {
+    const withStructured = [
+      turn("e1", "agent_text", { message: "Let's spec the saved-cards feature." }),
+      turn("e2", "ask_user", { question: "Which database should the API use?" }),
+      turn("e3", "user_message", { message: "PostgreSQL" }),
+    ];
+
+    const seed = summarizeGrillTranscript(withStructured);
+
+    // Both halves are present, so a restarted run sees the question it asked and
+    // the answer it was given rather than reopening a settled decision.
+    expect(seed).toContain("Agent question: Which database should the API use?");
+    expect(seed).toContain("User: PostgreSQL");
+  });
+
   it("skips events that carry no prose, so a terminal marker never appears as a turn", () => {
     const summary = summarizeGrillTranscript(transcript());
     expect(summary).not.toContain("Submitted");
