@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import {
   DEFAULT_GRILL_REPLY_TIMEOUT_MS,
+  DEFAULT_SESSION_MAX_BYTES,
   GRILL_REPLY_TIMEOUT_ENV,
   appPublicRedirect,
   config,
   resolveGrillReplyTimeout,
+  sessionMaxBytesFrom,
 } from "./config.js";
 
 describe("appPublicRedirect", () => {
@@ -107,5 +109,50 @@ describe("the grill reply bound mirrors the Orchestrator's (#92)", () => {
         source: "default",
       });
     }
+  });
+});
+
+/**
+ * ADR 032 item 4's session cap, and the trap it exists to avoid.
+ *
+ * The sibling config blocks parse with `Number(env) || default`, which **cannot
+ * express zero**: `0 || 5_000_000` is the default, so `SESSION_MAX_BYTES=0` would
+ * silently configure the cap it was meant to switch off. Item 4 requires zero to
+ * mean "reclaim everything", so the value is parsed explicitly and this is the test
+ * that proves the difference — it fails against the idiom, which is the point.
+ */
+describe("sessionMaxBytesFrom", () => {
+  it("treats zero as the instruction it is, not as an absence", () => {
+    expect(sessionMaxBytesFrom("0")).toBe(0);
+    expect(sessionMaxBytesFrom(" 0 ")).toBe(0);
+  });
+
+  it("clamps a negative value to zero so the upload path and the sweep agree", () => {
+    // `-1` and `0` must not mean different things to two readers of one setting.
+    expect(sessionMaxBytesFrom("-1")).toBe(0);
+    expect(sessionMaxBytesFrom("-99999")).toBe(0);
+  });
+
+  it("uses the default when the value is unset, empty or unparseable", () => {
+    // The one case that *should* fall back: a typo must not switch collection off.
+    for (const raw of [undefined, "", "   ", "abc", "5MB", "NaN", "Infinity"]) {
+      expect(sessionMaxBytesFrom(raw), String(raw)).toBe(DEFAULT_SESSION_MAX_BYTES);
+    }
+  });
+
+  it("keeps a real value, and floors a fractional one", () => {
+    expect(sessionMaxBytesFrom("1000")).toBe(1000);
+    expect(sessionMaxBytesFrom("1000.9")).toBe(1000);
+  });
+
+  it("matches the Orchestrator's own default cap", () => {
+    // A cross-repo constant neither suite can see across: if the two disagree, the
+    // API silently declines artifacts the Orchestrator considered within policy and
+    // the only symptom is a 202 in the other service's log. The Orchestrator's
+    // value lives at `orchestrator/internal/worker/sessions.go`
+    // (`DefaultSessionMaxBytes`), and this asserts the equality so a change on
+    // either side goes red here.
+    expect(DEFAULT_SESSION_MAX_BYTES).toBe(5_000_000);
+    expect(config.sessions.maxBytes).toBe(DEFAULT_SESSION_MAX_BYTES);
   });
 });

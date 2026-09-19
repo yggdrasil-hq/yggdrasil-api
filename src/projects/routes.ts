@@ -2379,6 +2379,21 @@ export function createProjectsRouter(deps: {
       jobStatus: job.status,
       lastError: job.lastError,
       jobKind: job.kind,
+      /*
+       * ADR 032 item 1: the latest job's own id, so a client can address its
+       * artifacts.
+       *
+       * This response already describes that job -- its kind, its status, and
+       * whether it came from a rewind -- so its id is the same generation of
+       * information rather than a new kind of thing, and it is the one field a
+       * client cannot derive: every artifact route is job-scoped (`jobs/:jobId/…`),
+       * and a page that holds only a feature id cannot build one. Without it the
+       * Spec page cannot ask whether this run's session was saved, which is what ADR
+       * 032 item 5 requires a user to be told.
+       *
+       * Null when the feature has no job at all, matching `jobStatus`.
+       */
+      jobId: job.id,
       restartedFromEventId: job.restartedFromEventId,
       /**
        * Issue #92: how long this grill has been waiting on an unanswered

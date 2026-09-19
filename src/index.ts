@@ -17,6 +17,8 @@ import { JobRecordingRepository } from "./recordings/repository.js";
 import { startRecordingSweep } from "./recordings/sweep.js";
 import { JobScreenshotRepository } from "./screenshots/repository.js";
 import { startScreenshotSweep } from "./screenshots/sweep.js";
+import { JobSessionRepository } from "./sessions/repository.js";
+import { startSessionSweep } from "./sessions/sweep.js";
 import { startScheduler } from "./scheduling/scheduler.js";
 import { createObjectStorage } from "./storage/client.js";
 import { startTestingGateReconcile } from "./features/testing-gate-reconcile.js";
@@ -141,6 +143,25 @@ async function main(): Promise<void> {
       new JobScreenshotRepository(pool, sweepStorage),
       config.screenshots.sweepIntervalMs,
       (message) => console.error(message),
+    );
+  }
+
+  // ADR 032 item 4: the same discipline for stored Pi sessions. Its own sweep for
+  // the same reason the screenshots have one — the three windows are deliberately
+  // independent.
+  //
+  // The last argument is item 4's "zero means reclaim everything": a non-positive
+  // `SESSION_MAX_BYTES` is the instruction "do not keep sessions", and a sweep that
+  // only reclaimed what had aged out would leave a switched-off install holding
+  // every session it ever collected. Passed from config rather than read inside the
+  // sweep, so the sweep stays a policy-free operation on the repository and is
+  // testable without config.
+  if (config.sessions.enabled) {
+    startSessionSweep(
+      new JobSessionRepository(pool, sweepStorage),
+      config.sessions.sweepIntervalMs,
+      (message) => console.error(message),
+      config.sessions.maxBytes <= 0,
     );
   }
 }

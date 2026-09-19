@@ -64,6 +64,12 @@ const WEB_CALLED_PATHS = [
   "/projects/11111111-1111-4111-8111-111111111111/tests",
   "/settings/notification-preferences",
   "/notifications",
+  // ADR 032: the session read the grill page makes to tell the user whether a run can
+  // be resumed. Job-scoped and mounted on the same `/projects` router chain as the
+  // recordings and screenshots reads, which is exactly the composition this list
+  // exists to check — #56 was four routes mounted at a doubled prefix with every unit
+  // test passing.
+  "/projects/11111111-1111-4111-8111-111111111111/jobs/22222222-2222-4222-8222-222222222222/session",
 ] as const;
 
 describe("the paths the Web client calls resolve through the real app", () => {
