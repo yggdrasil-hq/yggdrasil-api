@@ -92,8 +92,9 @@ describe.skipIf(!reachability.ok)(
       );
       if (!created.rows[0]) {
         throw new Error(
-          "the tick dispatched no run — the due-check and this fixture disagree, " +
-            "which is itself the finding rather than a test setup detail",
+          "no job exists for this test after a tick. Either the tick dispatched " +
+            "nothing, or it dispatched a run whose test_id is null — and both leave " +
+            "the relay with no topic, which is the bug this file exists to catch.",
         );
       }
       return created.rows[0].id as string;
