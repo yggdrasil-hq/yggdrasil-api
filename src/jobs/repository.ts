@@ -1,5 +1,6 @@
 import type pg from "pg";
 import type { Queryable } from "../db/pool.js";
+import type { FeatureGrillRun } from "./grill-runs.js";
 import type { Job, JobKind, JobStatus, JobTriggerSource } from "./types.js";
 
 interface JobRow {
@@ -274,6 +275,59 @@ export class JobRepository {
       [featureId],
     );
     return result.rows.map(mapJob);
+  }
+
+  /**
+   * ADR 024 item 8 / issue #28 part 2: every `spec_grill` run for a feature,
+   * **oldest first**, each carrying the run it rewound when it was produced by a
+   * rewind. `grill-runs.ts` turns this into the list a client renders.
+   *
+   * **Why a join rather than the job rows alone.** The supersession fact is already
+   * in the data: `restarted_from_event_id` (migration 037) names an event *in an
+   * earlier job*, so looking that event up yields the run whose transcript was
+   * truncated. Resolving it here means the API answers "which run superseded which"
+   * once, instead of every client walking events to reconstruct it — and no
+   * migration is needed, because a second stored column for a derivable value is
+   * two records of one fact.
+   *
+   * **Why the columns are spelled out qualified.** `jobColumns` is unqualified, and
+   * `jobs` and `job_events` share `id`, `status` and `created_at`, so reusing it
+   * over this join would be ambiguous — the exact defect that made every audit read
+   * 500 with `42702` (see `buildAuditWhere` in `audit/types.ts`). `findByIdWithScope`
+   * in `events-repository.ts` spells its own join out for the same reason.
+   *
+   * **Ordered by `created_at` with no tie-breaker, deliberately matching
+   * `findLatestJob`.** That matters beyond tidiness: this list treats its *last*
+   * element as the feature's current run (`earlierGrillRuns` drops it), and
+   * `findLatestJob` is what every other read uses to mean "the current job". If the
+   * two used different orderings, a run could be reported as both current and
+   * earlier at once. A tie in `created_at` is therefore as undefined here as it
+   * already is there, rather than defined differently.
+   */
+  async listFeatureGrillRuns(featureId: string): Promise<FeatureGrillRun[]> {
+    const result = await this.db.query<{
+      id: string;
+      status: JobStatus;
+      created_at: Date;
+      restarted_from_event_id: string | null;
+      supersedes_job_id: string | null;
+    }>(
+      `SELECT j.id, j.status, j.created_at, j.restarted_from_event_id,
+              e.job_id AS supersedes_job_id
+         FROM jobs j
+         LEFT JOIN job_events e ON e.id = j.restarted_from_event_id
+        WHERE j.feature_id = $1
+          AND j.kind = 'spec_grill'
+        ORDER BY j.created_at ASC`,
+      [featureId],
+    );
+    return result.rows.map((row) => ({
+      jobId: row.id,
+      status: row.status,
+      createdAt: row.created_at,
+      restartedFromEventId: row.restarted_from_event_id,
+      supersedesJobId: row.supersedes_job_id,
+    }));
   }
 
   async listRecentFailedTestRuns(projectId: string): Promise<Job[]> {
