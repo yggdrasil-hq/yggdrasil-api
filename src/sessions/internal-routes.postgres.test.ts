@@ -4,7 +4,9 @@ import request from "supertest";
 import { createApp } from "../app.js";
 import { config } from "../config.js";
 import { runMigrations } from "../db/migrate.js";
+import { createObjectStorage } from "../storage/client.js";
 import { livePostgresSkipWarning, probeLivePostgres } from "../testing/live-postgres.js";
+import { JobSessionRepository } from "./repository.js";
 
 /**
  * ADR 032 item 1's upload route, driven through the **real app** against a **real
@@ -30,6 +32,27 @@ import { livePostgresSkipWarning, probeLivePostgres } from "../testing/live-post
  * The bytes and the query parameters are the writer's own: `?outcome=`, `?sessionId=`,
  * `?podFilePath=`, and the body as raw JSONL with `Content-Type: application/x-ndjson`
  * (`apiclient.PostJobSession`).
+ *
+ * **Why the backend is asserted as a relationship rather than as a value.** Whether
+ * a session lands in the `data` column or in the object store is decided by
+ * *configuration*, and the three environments this file runs in disagree about it
+ * (issue #106):
+ *
+ * | environment | Postgres | MinIO | what this file does |
+ * |---|---|---|---|
+ * | `docker compose … up` | unreachable (a VPN mesh shadows the compose subnet — see `testing/live-postgres.ts`) | unreachable | **skipped** |
+ * | `scripts/test-against-real-db.sh` | reachable (host network, dev Postgres) | not published to the host | runs, takes the **postgres** path |
+ * | CI | reachable | reachable | runs, takes the **object** path |
+ *
+ * A hardcoded `expect(row.storage_backend).toBe("postgres")` here was an
+ * *environment* assertion wearing an invariant's clothes. It held in the two
+ * environments the work was normally checked in and failed in the only one nobody
+ * was watching, which is how it went red on CI for two commits without being
+ * noticed — the same class as #97 and #102, a check that cannot fail where it is
+ * usually run. What is asserted instead is the durable property (the bytes come
+ * back, read through the same method the download route uses) and the relationship
+ * that holds in *both* backends: exactly one of `data` / `object_key` carries the
+ * bytes, and it is the one `storage_backend` names — the table's own `CHECK`.
  *
  * Skipping is loud rather than silent — see `testing/live-postgres.ts`.
  */
@@ -58,6 +81,7 @@ describe.skipIf(!reachability.ok)(
     let projectId: string;
     let jobId: string;
     let app: ReturnType<typeof createApp>;
+    let sessions: JobSessionRepository;
 
     const bytes = Buffer.from(
       '{"type":"user","id":"e1","text":"hello"}\n{"type":"assistant","id":"e2"}\n',
@@ -69,6 +93,15 @@ describe.skipIf(!reachability.ok)(
       // The real app, exactly as `index.ts` builds it: this is the composition the
       // Orchestrator's call has to survive.
       app = createApp({ pool });
+      // A **second, independent reader**, built from the same expression `app.ts`
+      // builds its own from, so reading a session back has to go to the durable
+      // store rather than to anything the upload happened to leave in the app's
+      // process. It also means this file exercises whichever backend the
+      // configuration selects instead of only the one the environment supplies.
+      sessions = new JobSessionRepository(
+        pool,
+        createObjectStorage(config.storage.configured ? config.storage : null),
+      );
 
       const stamp = Date.now();
       const userId = (
@@ -129,7 +162,7 @@ describe.skipIf(!reachability.ok)(
       const row = (
         await pool.query(
           `SELECT outcome, session_id, pod_file_path, byte_size, storage_backend,
-                  data, expires_at, purged_at
+                  data, object_key, expires_at, purged_at
              FROM job_sessions WHERE job_id = $1`,
           [jobId],
         )
@@ -142,12 +175,37 @@ describe.skipIf(!reachability.ok)(
       // size field on purpose, because a value sent alongside could disagree with
       // the bytes it describes.
       expect(row.byte_size).toBe(bytes.byteLength);
-      // No object storage is configured in this environment, so the bytes are in
-      // the column — and `expires_at` is anchored to the job's own start.
-      expect(row.storage_backend).toBe("postgres");
-      expect(row.data).not.toBeNull();
+      // Where the bytes live is configuration, not a constant — CI has MinIO
+      // reachable and the local runs do not — so this asserts the code agrees with
+      // the configuration it reads rather than pinning one backend. A repository
+      // that ignored its storage would still be caught: the row would say
+      // `postgres` while the config said object.
+      expect(row.storage_backend).toBe(config.storage.configured ? "object" : "postgres");
+      // Exactly one home, and it is the one the backend names. This is the table's
+      // own CHECK restated as the relationship that is true in both backends, so it
+      // does not encode which environment is running.
+      //
+      // Both halves are asserted as present-ness *and* absence rather than only
+      // absence, because a column missing from the SELECT above reads as
+      // `undefined` and `expect(undefined).not.toBeNull()` passes — which is how the
+      // first version of this check looked green on the object path for entirely the
+      // wrong reason.
+      const [inBackend, inColumn] =
+        row.storage_backend === "object" ? [row.object_key, row.data] : [row.data, row.object_key];
+      expect(inBackend).toBeDefined();
+      expect(inBackend).not.toBeNull();
+      expect(inColumn).toBeNull();
       expect(row.purged_at).toBeNull();
       expect(row.expires_at).not.toBeNull();
+
+      // The durable property this test is really about: what was posted comes back
+      // byte for byte, through the reader the Web download route calls
+      // (`sessions/routes.ts` → `findContent`). Asserting the row's columns alone
+      // would miss a reader that cannot reach the bytes it stored, which is the
+      // failure the object backend makes possible and the postgres one cannot.
+      const readBack = await sessions.findContent(jobId);
+      expect(readBack?.data).not.toBeNull();
+      expect(Buffer.compare(readBack!.data!, bytes)).toBe(0);
     });
 
     it("rejects the upload without the internal bearer token", async () => {
