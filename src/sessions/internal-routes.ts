@@ -16,7 +16,7 @@ import {
   SESSION_CONTENT_TYPE,
   type ForkPointOutcome,
 } from "./retention.js";
-import { toPublicJobSession, type ForkPoint } from "./types.js";
+import { sessionStateExplanation, toPublicJobSession, type ForkPoint } from "./types.js";
 
 /**
  * ADR 032 item 1's upload endpoint: the Orchestrator posts the Pi session file it
@@ -294,6 +294,87 @@ export function createSessionsInternalRouter(deps: {
         // can rely on.
         forkPoints: await deps.sessions.findForkPoints(job.id),
       });
+    },
+  );
+
+  /**
+   * ADR 032 item 3: the stored session's bytes, for the Orchestrator to write into
+   * a fork job's pod.
+   *
+   * **Why this is an internal route and the pod never calls it.** The decision on
+   * issue #103 chose write-into-pod over a pod-side pull because a pod clones a
+   * user's repository and runs their build code: giving it an API authorisation —
+   * even one scoped to a single session — would add an outbound channel and a third
+   * piece of standing access to the least-trusted process in the system, with a
+   * reach that includes *other runs' conversations*. The Orchestrator already holds
+   * this token and already fetches a job's payload, its secrets and its chart, so
+   * one more artifact through the same path adds nothing to the pod.
+   *
+   * **The user-facing content route already exists** at
+   * `/:projectId/jobs/:jobId/session/content`, and this is deliberately not it: that
+   * one is scoped to a project membership the Orchestrator has no notion of, and it
+   * answers a browser. Reusing it would mean giving an internal service a user's
+   * identity or loosening the route — the loosening ADR 019 item 7 forbids. Two
+   * routes, two audiences, one repository call.
+   *
+   * **The statuses are the same split the read route makes**, because the
+   * Orchestrator turns them into different sentences: 404 is "there is nothing usable
+   * here" (never collected, a failing outcome, or a lost object) and **410 is a
+   * finished artifact** reclaimed by retention. An operator acts differently on a
+   * session that ended and one that never existed, so the two must not arrive as one
+   * error.
+   */
+  router.get(
+    "/jobs/:jobId/session/content",
+    requireInternalApiToken,
+    async (req, res) => {
+      const jobId = routeParam(req.params.jobId);
+      if (!isUuid(jobId)) {
+        res.status(404).json({ error: "Job not found" });
+        return;
+      }
+
+      const job = await deps.jobs.findById(jobId);
+      if (!job) {
+        res.status(404).json({ error: "Job not found" });
+        return;
+      }
+
+      const session = await deps.sessions.findContent(job.id);
+      if (!session) {
+        res.status(404).json({ error: "No session for this run" });
+        return;
+      }
+
+      // The same reasoning the user-facing content route gives: `data !== null`
+      // rather than trusting `purged_at` alone, so this stays honest even if a
+      // future migration relaxes the table's CHECK keeping the two in lockstep.
+      const state = sessionState(
+        {
+          outcome: session.outcome,
+          hasData: session.data !== null,
+          expiresAt: session.expiresAt,
+          purgedAt: session.purgedAt,
+        },
+        new Date(),
+      );
+      if (state === "expired" || session.data === null) {
+        // A failing outcome is not a tombstone, so it is answered from its own state
+        // rather than being reported as reclaimed — which is what keeps
+        // "this run produced no session" from reading as "this session expired".
+        if (session.outcome !== "collected") {
+          res.status(404).json({ error: sessionStateExplanation(session.outcome) });
+          return;
+        }
+        res.status(410).json({
+          error: "This session was removed after its retention window",
+        });
+        return;
+      }
+
+      res.setHeader("Content-Type", SESSION_CONTENT_TYPE);
+      res.setHeader("Content-Length", String(session.data.byteLength));
+      res.status(200).end(session.data);
     },
   );
 

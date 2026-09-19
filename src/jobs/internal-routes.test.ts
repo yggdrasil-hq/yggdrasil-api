@@ -21,7 +21,7 @@ function makeEvent(overrides: Partial<JobEvent> = {}): JobEvent {
     questionForm: null,
     reviewFindings: null,
     actionItems: null,
-    snapshot: null,
+    snapshot: null,    forkStage: null,
     createdAt: new Date(),
     ...overrides,
   };
