@@ -6,6 +6,7 @@ import {
   LIVE_JOB_EVENTS_CHANNEL,
   liveTopicForDesignSession,
   liveTopicForFeature,
+  liveTopicForTest,
   toLiveJobEvent,
   type ServerFrame,
 } from "./types.js";
@@ -83,11 +84,26 @@ export const LIVE_RELAY_RETRY_MS = 5000;
  * was never authorised for it.
  *
  * **Null still covers a real case, deliberately.** A job with no feature that is
- * not a design session — a *scheduled* `test_run` produces events and has no
- * `feature_id` — is dropped rather than guessed onto a topic, because there is no
- * surface subscribed to it and inventing a topic nobody reads would be noise
- * pretending to be a feature. Filing that as its own issue is the honest move;
- * see the note on `JobEventWithScope.jobKind`.
+ * not a design session and has no test either — nothing produces one today — is
+ * dropped rather than guessed onto a topic, because inventing a topic nobody
+ * reads would be noise pretending to be a signal.
+ *
+ * **Three topics, decided by the scope the job carries (issue #90).** A test
+ * scope is keyed on `testId`'s presence, exactly as the feature case is keyed on
+ * `featureId`'s — because `test_id` *is* a routing key that names the resource, so
+ * unlike the design case it needs no kind check to be interpreted. A scheduled
+ * `test_run` carries a `test_id` and no `feature_id`, so it reaches the topic its
+ * own surface reads (`GET /projects/:projectId/tests/:testId/runs`) instead of
+ * falling into the null case as it did before.
+ *
+ * **Ordering is part of the contract, not an implementation detail.** Feature is
+ * checked first and unconditionally, so a **feature-driven** `test_run` — which
+ * carries both a `feature_id` and a `test_id`, being one job with two surfaces —
+ * keeps routing to `feature:` where it has always gone. The Test entity's
+ * run-history page therefore receives no socket signal for feature-driven runs,
+ * only for scheduled ones. That is a pre-existing gap (#90's decision comment
+ * records it as out of scope) and it is stated here because this is the function
+ * where a reader would otherwise have to infer it.
  */
 export function relayEnvelopeFor(
   scope: JobEventWithScope,
@@ -121,6 +137,23 @@ export function relayEnvelopeFor(
       frame: {
         type: "design_session_event",
         sessionId: scope.event.jobId,
+        event: toLiveJobEvent(scope.event),
+      },
+    };
+  }
+
+  if (scope.testId) {
+    return {
+      topic: liveTopicForTest(scope.testId),
+      // Distinct from `job_event` for the same reason as the design frame: the
+      // scope id here names a `tests` row, and `job_event.featureId` would be the
+      // wrong name for it. `testId` and the event's own `jobId` are both carried
+      // because they are genuinely two different values — one names the surface
+      // that should refresh, the other the run whose event it is.
+      frame: {
+        type: "test_run_event",
+        testId: scope.testId,
+        jobId: scope.event.jobId,
         event: toLiveJobEvent(scope.event),
       },
     };

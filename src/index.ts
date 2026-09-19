@@ -5,6 +5,7 @@ import { config } from "./config.js";
 import { runMigrations } from "./db/migrate.js";
 import { closePool, createListenerClient, getPool } from "./db/pool.js";
 import { FeatureRepository } from "./features/repository.js";
+import { TestRepository } from "./tests/repository.js";
 import { JobEventRepository } from "./jobs/events-repository.js";
 import { JobRepository } from "./jobs/repository.js";
 import { PostgresDeltaPublisher } from "./live/deltas.js";
@@ -55,6 +56,9 @@ async function main(): Promise<void> {
     // Issue #25: design sessions are resolved through the job repository, so the
     // socket can authorise a design subscription the way the REST route does.
     jobs: liveJobs,
+    // Issue #90: a Test entity is resolved through this repository, so the socket
+    // can authorise a `test:` subscription the way the run-history route does.
+    tests: new TestRepository(pool),
     onError: (message) => console.error(message),
   });
   // The listener is started here, not inside `createApp`, for the same reason
