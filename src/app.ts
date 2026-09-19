@@ -82,6 +82,9 @@ import { createRecordingsInternalRouter } from "./recordings/internal-routes.js"
 import { JobScreenshotRepository } from "./screenshots/repository.js";
 import { createScreenshotsRouter } from "./screenshots/routes.js";
 import { createScreenshotsInternalRouter } from "./screenshots/internal-routes.js";
+import { JobSessionRepository } from "./sessions/repository.js";
+import { createSessionsRouter } from "./sessions/routes.js";
+import { createSessionsInternalRouter } from "./sessions/internal-routes.js";
 import { UserRepository } from "./users/repository.js";
 import { NOOP_LIVE_PUBLISHER, type LivePublisher } from "./live/deltas.js";
 
@@ -134,6 +137,7 @@ export function createApp(deps?: AppDependencies): Express {
   // that has not been given a bucket behaves exactly as it did before.
   const objectStorage = createObjectStorage(config.storage.configured ? config.storage : null);
   const recordings = new JobRecordingRepository(deps.pool, objectStorage);
+  const jobSessions = new JobSessionRepository(deps.pool, objectStorage);
   const screenshots = new JobScreenshotRepository(deps.pool, objectStorage);
   app.use(
     "/webhooks",
@@ -389,6 +393,15 @@ export function createApp(deps?: AppDependencies): Express {
     "/projects",
     createScreenshotsRouter({ users, sessions, projects, jobs, screenshots }),
   );
+  // ADR 032: what became of a job's Pi session, behind the same project-access gate
+  // as its recording and screenshots — a session holds the *full* conversation,
+  // including anything the transcript redacts, so it is no more reachable than the
+  // transcript it belongs to. Same `/projects` mount and path shape as the two
+  // routers above.
+  app.use(
+    "/projects",
+    createSessionsRouter({ users, sessions, projects, jobs, jobSessions }),
+  );
   app.use(
     "/internal",
     createOrganizationsInternalRouter({ projects, clusters: orgClusters }),
@@ -404,6 +417,13 @@ export function createApp(deps?: AppDependencies): Express {
   app.use(
     "/internal",
     createScreenshotsInternalRouter({ jobs, screenshots }),
+  );
+  // ADR 032 item 1: the Orchestrator uploads a finished job's Pi session file here
+  // before the pod is deleted. Raw body with its own parser, like the recordings
+  // route above and for the same reason.
+  app.use(
+    "/internal",
+    createSessionsInternalRouter({ jobs, sessions: jobSessions }),
   );
   app.use("/internal", createAllocationsInternalRouter({ projects, allocations }));
   app.use(

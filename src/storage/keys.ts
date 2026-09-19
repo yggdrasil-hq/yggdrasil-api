@@ -60,6 +60,23 @@ export function recordingKey(input: {
   return `recordings/${input.projectId}/${input.jobId}.${extensionFor(input.contentType)}`;
 }
 
+/**
+ * One job's Pi session (ADR 032 item 1).
+ *
+ * `.jsonl` is not a guess at a content type — the file Pi writes *is* JSONL, and
+ * the Orchestrator reads it verbatim and posts the same bytes, so the extension
+ * describes the object truthfully and makes the bucket self-explanatory. There is
+ * no content-type lookup here (unlike "extensionFor") because there is exactly one
+ * possible type: Pi's session format is not configurable, and a second one would be
+ * a different artifact rather than another format of this one.
+ *
+ * No `screenshotId`-style segment: a session is one object per job, so `jobId` is
+ * the whole of the tail.
+ */
+export function sessionKey(input: { projectId: string; jobId: string }): string {
+  return `sessions/${input.projectId}/${input.jobId}.jsonl`;
+}
+
 export function screenshotKey(input: {
   projectId: string;
   jobId: string;

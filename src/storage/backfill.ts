@@ -1,6 +1,6 @@
 import type pg from "pg";
 import type { ObjectStorage } from "./client.js";
-import { extensionFileKey, recordingKey, screenshotKey } from "./keys.js";
+import { extensionFileKey, recordingKey, screenshotKey, sessionKey } from "./keys.js";
 import { stepKeySegment } from "../screenshots/repository.js";
 
 /**
@@ -59,14 +59,19 @@ const DEFAULT_LIMIT = 200;
  * Moves recordings, screenshots and extension files.
  *
  * Ordering within the function is by table rather than by age across tables,
- * because the three are independent and a partial run that finished recordings
+ * because the four are independent and a partial run that finished recordings
  * entirely is easier to describe than one that moved a third of each.
  */
 export async function backfillObjects(deps: BackfillDeps): Promise<BackfillResult> {
   const limit = deps.limit ?? DEFAULT_LIMIT;
   const total: BackfillResult = { moved: 0, failed: 0, alreadyMoved: 0 };
 
-  for (const step of [backfillRecordings, backfillScreenshots, backfillExtensionFiles]) {
+  for (const step of [
+    backfillRecordings,
+    backfillScreenshots,
+    backfillExtensionFiles,
+    backfillSessions,
+  ]) {
     const result = await step(deps, limit);
     total.moved += result.moved;
     total.failed += result.failed;
@@ -226,6 +231,65 @@ async function backfillExtensionFiles(
       [row.extension_id, row.path, key],
     );
     result.moved += 1;
+  }
+  return result;
+}
+
+/**
+ * ADR 032 item 1's sessions.
+ *
+ * Added when sessions landed rather than later, so the backfill stays "every
+ * artifact this API stores in the database" rather than a list someone has to
+ * remember to extend — the same reason screenshots were added to it. Today there
+ * are no pre-existing rows to move (the table arrived with object storage already
+ * supported), so this drains immediately; it exists for a deployment that runs with
+ * no bucket configured and adds one later.
+ *
+ * `byte_size` is untouched: it is the API's own measurement of what it received and
+ * does not change by moving where the bytes live.
+ */
+async function backfillSessions(
+  deps: BackfillDeps,
+  limit: number,
+): Promise<BackfillResult> {
+  const candidates = await deps.db.query<{
+    job_id: string;
+    project_id: string;
+    data: Buffer;
+  }>(
+    `SELECT job_id, project_id, data
+       FROM job_sessions
+      WHERE storage_backend = 'postgres' AND data IS NOT NULL
+      ORDER BY created_at ASC
+      LIMIT $1`,
+    [limit],
+  );
+
+  const result: BackfillResult = { moved: 0, failed: 0, alreadyMoved: 0 };
+  for (const row of candidates.rows) {
+    const key = sessionKey({ projectId: row.project_id, jobId: row.job_id });
+    try {
+      await deps.storage.putObject({
+        key,
+        body: row.data,
+        contentType: "application/x-ndjson",
+      });
+    } catch (error) {
+      result.failed += 1;
+      deps.onProgress?.(`session ${row.job_id}: put failed: ${String(error)}`);
+      continue;
+    }
+
+    // One statement, so `data` and `object_key` cannot disagree — the CHECK
+    // constraint requires exactly one of them.
+    await deps.db.query(
+      `UPDATE job_sessions
+          SET data = NULL, object_key = $2, storage_backend = 'object'
+        WHERE job_id = $1 AND storage_backend = 'postgres'`,
+      [row.job_id, key],
+    );
+    result.moved += 1;
+    deps.onProgress?.(`session ${row.job_id} -> ${key}`);
   }
   return result;
 }

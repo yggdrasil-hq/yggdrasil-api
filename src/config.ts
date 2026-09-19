@@ -78,6 +78,40 @@ export function resolveGrillReplyTimeout(raw: string | undefined): {
   return { timeoutMs: parsed, source: "configured" };
 }
 
+/**
+ * Parses `SESSION_MAX_BYTES`, where **zero is a value and not an absence**.
+ *
+ * ADR 032 item 4 requires a non-positive cap to mean "reclaim everything", and the
+ * `Number(env) || default` idiom the sibling config blocks use cannot express that:
+ * `0 || 5_000_000` is the default, so the instruction would be silently replaced by
+ * the thing it was meant to switch off. Hence an explicit parser rather than the
+ * idiom — and exported, following `resolveGrillReplyTimeout`, so the interesting half
+ * (what a given string resolves to) is testable without constructing the module.
+ *
+ * An unset, empty or unparseable value is the default, which is the one case that
+ * *should* fall back: a typo must not switch collection off. A negative value is
+ * clamped to zero rather than kept, so `-1` and `0` cannot mean different things to
+ * the upload path and the sweep.
+ */
+export function sessionMaxBytesFrom(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === "") return DEFAULT_SESSION_MAX_BYTES;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return DEFAULT_SESSION_MAX_BYTES;
+  return Math.max(0, Math.floor(parsed));
+}
+
+/**
+ * The default cap on one stored session, matching the Orchestrator's own
+ * `DefaultSessionMaxBytes`.
+ *
+ * A cross-repo constant that cannot be checked by either side's tests, exactly like
+ * `DEFAULT_GRILL_REPLY_TIMEOUT_MS`: if the two disagree, the API silently declines
+ * artifacts the Orchestrator considered within policy, and the only symptom is a
+ * 202 in the Orchestrator's log. Stated as "the other service's value" rather than
+ * chosen independently so a reader knows the coupling is deliberate.
+ */
+export const DEFAULT_SESSION_MAX_BYTES = 5_000_000;
+
 function required(name: string, fallback?: string): string {
   const value = process.env[name] ?? fallback;
   if (!value) {
@@ -244,6 +278,59 @@ export const config = {
     sweepIntervalMs: Math.max(
       1_000,
       Number(process.env.RECORDING_SWEEP_INTERVAL_MS) || 15 * 60_000,
+    ),
+  },
+  /**
+   * ADR 032 item 1: Pi session files for `spec_grill` runs.
+   *
+   * A **separate block from `recordings`** rather than shared values, for the reason
+   * `screenshots` gives: the two artifacts are three orders of magnitude apart in
+   * size and have entirely different rate profiles, so a project may reasonably want
+   * a different policy for each, and shared config would be the thing preventing it.
+   * `retentionDays`' default *agrees* with recordings' because ADR 032 item 4 says
+   * the window is the same by default — that is a default, not a shared source.
+   *
+   * The three numbers:
+   *
+   * - `maxBytes` bounds one session. **Deliberately not inherited from
+   *   `RECORDING_MAX_BYTES`**: a session is text and Pi appends tool results
+   *   verbatim, so a long grill is megabytes against a video's tens of megabytes.
+   *   Borrowing the recording's 25 MB would advertise a ceiling no session reaches
+   *   and make the path that enforces it untestable in practice. 5 MB matches the
+   *   Orchestrator's own `DefaultSessionMaxBytes` — the two halves must agree about
+   *   the number or the API would silently decline artifacts the Orchestrator
+   *   considered fine, which is why this default is stated as "the same value as the
+   *   other service" rather than chosen freely.
+   *
+   *   **A value of zero is an instruction, not an absence** — ADR 032 item 4's
+   *   "if it is set to zero it must mean 'reclaim everything', not 'keep
+   *   forever'". It is parsed by `sessionMaxBytesFrom` rather than by the
+   *   `Number(env) || default` idiom the sibling blocks use, because that idiom
+   *   cannot express zero at all: `0 || 25_000_000` is the default, so an operator
+   *   writing `SESSION_MAX_BYTES=0` would silently get 5 MB. That is a real trap and
+   *   not a hypothetical — `RECORDING_MAX_BYTES=0` is unreachable the same way,
+   *   which is filed separately rather than changed here, since altering the
+   *   recording path's parsing is not this change's business.
+   *
+   * - `retentionDays` is the other half of the bound, and a session is the more
+   *   sensitive artifact: it holds the full conversation including anything the
+   *   transcript redacts, so this window is a data-retention decision and not only a
+   *   storage one (ADR 032's trade-offs). 30 days matches recordings'.
+   *
+   * - `sweepIntervalMs` is floored so a bad env var cannot turn the sweep into a busy
+   *   loop, and `enabled` follows the scheduler's reasoning: a background job that
+   *   has to be switched on is one that silently does nothing after a fresh install.
+   */
+  sessions: {
+    enabled: process.env.SESSIONS_ENABLED !== "false",
+    maxBytes: sessionMaxBytesFrom(process.env.SESSION_MAX_BYTES),
+    retentionDays: Math.max(
+      1,
+      Math.floor(Number(process.env.SESSION_RETENTION_DAYS)) || 30,
+    ),
+    sweepIntervalMs: Math.max(
+      1_000,
+      Math.floor(Number(process.env.SESSION_SWEEP_INTERVAL_MS)) || 15 * 60_000,
     ),
   },
   /**
