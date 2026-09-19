@@ -4,7 +4,7 @@ import {
   deltaFromPayload,
   LIVE_JOB_EVENT_DELTAS_CHANNEL,
   LIVE_JOB_EVENTS_CHANNEL,
-  liveScopeForJob,
+  liveScopesForJob,
   liveTopicForScope,
   toLiveJobEvent,
   type ServerFrame,
@@ -63,18 +63,39 @@ export interface LiveRelayHandle {
 export const LIVE_RELAY_RETRY_MS = 5000;
 
 /**
- * Maps a loaded event to the frame its subscribers should receive, or null when
- * there is nothing to deliver.
+ * Maps a loaded event to the frames its subscribers should receive — **one per
+ * scope the job belongs to**, primary first.
  *
  * Split out as a pure function so "which event goes to which topic" — the only
  * routing decision in the relay — is testable without a socket, a database, or
  * a Postgres connection.
  *
- * **Three topics, one rule: the job's scope (ADR 033 §2).** The decision lives in
- * `liveScopeForJob`, shared with the delta path so a stored event and a streaming
- * chunk for one job cannot reach different topics — which would leave half a
+ * **Plural since issue #100, and the plural is the fix.** A job can have two
+ * surfaces: a feature-driven `test_run` carries a `feature_id` *and* a `test_id`,
+ * and until this returned both, the Test entity's run history received no socket
+ * signal for it — the Testing tab on the feature updated live while the Test's own
+ * history sat still, for the same underlying run.
+ *
+ * **One envelope per scope, each carrying its own tag — not one envelope with two
+ * scopes**, and the difference is not cosmetic:
+ *
+ *  - A frame naming two scopes is ambiguous at the one place it is read. The
+ *    client's question is "is this event for the page I am rendering?", which with
+ *    one tag is a comparison and with two is a puzzle. ADR 033 §1 made `scope` a
+ *    closed union so a frame could not be misread; a two-scope frame hands the
+ *    ambiguity straight back.
+ *  - A subscriber to `test:<id>` was authorised for the test scope and nothing
+ *    else, so a frame that also named the feature would hand that socket a claim
+ *    its own authoriser never covered. One envelope per topic means each socket
+ *    receives exactly what its gate allowed — ADR 019 item 7, ADR 033 §2.
+ *  - The two deliveries stay independently droppable, which is what lets the
+ *    per-topic budgets and the coalescing keep treating them separately.
+ *
+ * **Where the scope decision lives.** `liveScopesForJob` decides *which* scopes and
+ * in what order — shared with the delta path, so a stored event and a streaming
+ * chunk for one job cannot reach different topics, which would leave half a
  * message's text on a topic nobody is reading. This function's remaining job is to
- * turn that scope into a topic and a frame, and to drop an unscopable job.
+ * turn each scope into a topic and a frame, and to drop an unscopable job.
  *
  * **What this replaced, and why the indirection is worth it.** Version 1 branched
  * here on the job's fields, picked one of three `liveTopicFor*` functions and built
@@ -84,29 +105,26 @@ export const LIVE_RELAY_RETRY_MS = 5000;
  * guarded, stated once so it is not re-derived: the two id spaces are both uuids
  * from the same source, so a router that confused them would deliver a feature's
  * events to a design session's subscribers with no error anywhere.
- *
- * **Ordering lives in `liveScopeForJob` now**, including the case that matters: a
- * **feature-driven** `test_run` carries both a `feature_id` and a `test_id`, is one
- * job with two surfaces, and keeps routing to `feature:` where it has always gone.
- * The Test entity's run-history page therefore receives no socket signal for
- * feature-driven runs, only for scheduled ones — a pre-existing gap, filed as its
- * own issue.
  */
-export function relayEnvelopeFor(
+export function relayEnvelopesFor(
   scope: JobEventWithScope,
-): { topic: string; frame: ServerFrame } | null {
-  const live = liveScopeForJob({
+): Array<{ topic: string; frame: ServerFrame }> {
+  const scopes = liveScopesForJob({
     jobId: scope.event.jobId,
     featureId: scope.featureId,
     jobKind: scope.jobKind,
     testId: scope.testId,
   });
-  if (!live) return null;
+  if (scopes.length === 0) return [];
 
-  return {
+  // Built once and shared by every envelope: the event is the same record, and a
+  // fan-out is not a reason to convert it twice. Each frame gets its own `scope`,
+  // which is the one field that differs.
+  const event = toLiveJobEvent(scope.event);
+  return scopes.map((live) => ({
     topic: liveTopicForScope(live),
-    frame: { type: "event", scope: live, event: toLiveJobEvent(scope.event) },
-  };
+    frame: { type: "event", scope: live, event },
+  }));
 }
 
 /**
@@ -160,9 +178,13 @@ export function startLiveRelay(deps: LiveRelayDeps): LiveRelayHandle {
     try {
       const scope = await deps.jobEvents.findByIdWithScope(payload);
       if (!scope) return;
-      const envelope = relayEnvelopeFor(scope);
-      if (!envelope) return;
-      deps.hub.publish(envelope.topic, envelope.frame);
+      // Every scope this job belongs to, so one write reaches all of them (issue
+      // #100). A job with a single scope is the common case and publishes once;
+      // the loop is what makes a second surface possible without the second
+      // surface's absence being invisible.
+      for (const envelope of relayEnvelopesFor(scope)) {
+        deps.hub.publish(envelope.topic, envelope.frame);
+      }
     } catch (error) {
       // A failed delivery is a gap in a live view, not a reason to tear the
       // listener down: the event is already durable in `job_events`, and the

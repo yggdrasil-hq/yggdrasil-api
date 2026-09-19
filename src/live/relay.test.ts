@@ -3,7 +3,7 @@ import { LiveHub } from "./hub.js";
 import {
   LIVE_JOB_EVENTS_CHANNEL,
   LIVE_RELAY_RETRY_MS,
-  relayEnvelopeFor,
+  relayEnvelopesFor,
   startLiveRelay,
   type LiveListenerClient,
 } from "./relay.js";
@@ -109,12 +109,15 @@ function build(options: { findByIdWithScope?: (...args: any[]) => any } = {}) {
   return { fake, hub, received, findByIdWithScope, onError, scheduled, cancelled, handle };
 }
 
-describe("relayEnvelopeFor", () => {
+describe("relayEnvelopesFor", () => {
   it("routes an event to its feature's topic with the wire shape", () => {
-    const envelope = relayEnvelopeFor(scope());
-    expect(envelope?.topic).toBe(`feature:${FEATURE_ID}`);
+    const envelopes = relayEnvelopesFor(scope());
+    // Exactly one. A single-scope job is the common case, and a fan-out that fanned
+    // unconditionally would show up here rather than only in the harness.
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0].topic).toBe(`feature:${FEATURE_ID}`);
     // One frame shape for every scope, with the scope as a value (ADR 033 §1).
-    expect(envelope?.frame).toEqual({
+    expect(envelopes[0].frame).toEqual({
       type: "event",
       scope: { kind: "feature", id: FEATURE_ID },
       event: expect.objectContaining({
@@ -129,15 +132,16 @@ describe("relayEnvelopeFor", () => {
     // ADR 014's `design_grill` is project-scoped, so its events carry no
     // `feature_id` and used to fall through to null — meaning the design session
     // view had no signal and could only poll. It now has a topic of its own.
-    const envelope = relayEnvelopeFor(
+    const envelopes = relayEnvelopesFor(
       scope({ featureId: null, jobKind: "design_grill", event: { ...scope().event, jobId: SESSION_ID } }),
     );
 
-    expect(envelope?.topic).toBe(`design:${SESSION_ID}`);
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0].topic).toBe(`design:${SESSION_ID}`);
     // The scope carries the session id *and* its kind, so the frame says what the
     // id means rather than leaving it to the frame's name — which is what replaced
     // version 1's separate `design_session_event` type (ADR 033 §1).
-    expect(envelope?.frame).toEqual({
+    expect(envelopes[0].frame).toEqual({
       type: "event",
       scope: { kind: "design_session", id: SESSION_ID },
       event: expect.objectContaining({ id: EVENT_ID, type: "agent_text" }),
@@ -149,9 +153,9 @@ describe("relayEnvelopeFor", () => {
     // i.e. the session id *is* the job id. Carrying both on the frame would be two
     // spellings of one value for a reader to wonder about — and under ADR 033 §1
     // there is no separate `sessionId` field left for the second spelling to live in.
-    const envelope = relayEnvelopeFor(
+    const envelope = relayEnvelopesFor(
       scope({ featureId: null, jobKind: "design_grill", event: { ...scope().event, jobId: SESSION_ID } }),
-    );
+    )[0];
 
     expect(envelope?.frame).not.toHaveProperty("featureId");
     expect(envelope?.frame).not.toHaveProperty("sessionId");
@@ -160,59 +164,76 @@ describe("relayEnvelopeFor", () => {
   });
 
   it("routes a feature-less scheduled test_run to its test's topic (issue #90)", () => {
-    // The case this branch exists for. A scheduled `test_run` carries a `test_id`
+    // The case that branch exists for. A scheduled `test_run` carries a `test_id`
     // and no `feature_id`, so before this it fell into the null case and its
     // events reached no socket at all. `test_id` is a routing key that names the
     // surface — the standalone Testing product's run history — so the id alone
     // decides the topic, exactly as `featureId` does.
-    const envelope = relayEnvelopeFor(
+    const envelopes = relayEnvelopesFor(
       scope({ featureId: null, jobKind: "test_run", testId: TEST_ID }),
     );
 
-    expect(envelope?.topic).toBe(`test:${TEST_ID}`);
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0].topic).toBe(`test:${TEST_ID}`);
     // The scope id names a `tests` row, and the `event` inside still carries its own
     // `jobId` — two genuinely different values, now in fields that say which is
     // which instead of one frame type per scope.
-    expect(envelope?.frame).toEqual({
+    expect(envelopes[0].frame).toEqual({
       type: "event",
       scope: { kind: "test", id: TEST_ID },
       event: expect.objectContaining({ id: EVENT_ID, type: "agent_text" }),
     });
   });
 
-  it("prefers the feature topic for a feature-driven test_run, which has both ids", () => {
-    // The consequence #90's decision records as out of scope, asserted so it is a
-    // known behaviour rather than a surprise: one job with two surfaces, and the
-    // Test-entity page gets no socket signal for the feature-driven case because
-    // feature is checked first. Reordering these branches should fail a test, not
-    // quietly change who receives what.
-    const envelope = relayEnvelopeFor(scope({ jobKind: "test_run", testId: TEST_ID }));
+  it("reaches the feature topic AND the test topic for a feature-driven test_run (issue #100)", () => {
+    // One job, two surfaces. This is issue #100's whole fix: the job keeps the
+    // feature delivery it has always had *and* reaches the Test entity's history,
+    // which previously received nothing for it.
+    const envelopes = relayEnvelopesFor(scope({ jobKind: "test_run", testId: TEST_ID }));
 
-    expect(envelope?.topic).toBe(`feature:${FEATURE_ID}`);
-    expect(envelope?.frame).toMatchObject({
+    expect(envelopes).toHaveLength(2);
+    // Feature first, so the ordering version 1 had is preserved as the primary.
+    expect(envelopes[0].topic).toBe(`feature:${FEATURE_ID}`);
+    expect(envelopes[1].topic).toBe(`test:${TEST_ID}`);
+    // **One scope per frame, not one frame with two scopes.** The client's question
+    // is "is this event for the page I am rendering?", and a subscriber to
+    // `test:<id>` was authorised for the test scope alone — so a frame that also
+    // named the feature would hand it a claim its gate never covered.
+    expect(envelopes[0].frame).toMatchObject({
       type: "event",
       scope: { kind: "feature", id: FEATURE_ID },
     });
+    expect(envelopes[1].frame).toMatchObject({
+      type: "event",
+      scope: { kind: "test", id: TEST_ID },
+    });
+    // The same record on both — a fan-out is one event with two destinations, not
+    // two events. Asserted because a second `findByIdWithScope` or a re-derived
+    // frame is exactly how the two copies would come to differ.
+    expect((envelopes[0].frame as { event: unknown }).event).toBe(
+      (envelopes[1].frame as { event: unknown }).event,
+    );
   });
 
-  it("still returns null for a feature-less, test-less job", () => {
-    // What null covers now: nothing produces such a job, so this is a guard rather
-    // than a live case. Dropping it is honest — inventing a topic nobody reads
-    // would be noise pretending to be a signal — and it is asserted so the
-    // fallthrough stays deliberate.
-    expect(relayEnvelopeFor(scope({ featureId: null, jobKind: "deploy", testId: null }))).toBeNull();
+  it("returns an empty list for a feature-less, test-less job", () => {
+    // What the empty list covers now: nothing produces such a job, so this is a
+    // guard rather than a live case. Dropping it is honest — inventing a topic
+    // nobody reads would be noise pretending to be a signal — and it is asserted so
+    // the fallthrough stays deliberate.
+    expect(relayEnvelopesFor(scope({ featureId: null, jobKind: "deploy", testId: null }))).toEqual([]);
   });
 
-  it("prefers the feature topic when a job somehow has both", () => {
-    // Not a shape that exists today. If one ever did, the feature topic is the
-    // safer answer: it is the one an existing authoriser already covers, so
-    // routing there cannot hand an event to a socket that was never authorised
-    // for it. Asserted so a future reordering of these branches is a failing test
-    // rather than a quiet change of who receives what.
-    const envelope = relayEnvelopeFor(scope({ jobKind: "design_grill" }));
+  it("does not add a design topic to a job that already has a feature", () => {
+    // Not a shape that exists today. If one ever did, the feature is the answer and
+    // the design topic is *not* added: a design session's scope id is the job id, so
+    // a second destination would name a design session that does not exist. Asserted
+    // so a future widening of the design branch is a failing test rather than a
+    // fabricated topic.
+    const envelopes = relayEnvelopesFor(scope({ jobKind: "design_grill" }));
 
-    expect(envelope?.topic).toBe(`feature:${FEATURE_ID}`);
-    expect(envelope?.frame).toMatchObject({
+    expect(envelopes).toHaveLength(1);
+    expect(envelopes[0].topic).toBe(`feature:${FEATURE_ID}`);
+    expect(envelopes[0].frame).toMatchObject({
       type: "event",
       scope: { kind: "feature", id: FEATURE_ID },
     });
@@ -372,6 +393,65 @@ describe("startLiveRelay", () => {
       type: "event",
       scope: { kind: "feature", id: FEATURE_ID },
     });
+  });
+
+  it("delivers a feature-driven test_run's event to both topics, once each (issue #100)", async () => {
+    // The publish half of the fan-out, which the pure-function cases above cannot
+    // reach: two topics, two sockets, one notification. Asserted as *both* sides and
+    // as exact contents, so neither a dropped second delivery nor a duplicate first
+    // one can pass.
+    const fake = fakeClient();
+    const hub = new LiveHub();
+    const featureFrames: ServerFrame[] = [];
+    const testFrames: ServerFrame[] = [];
+    hub.subscribe({ id: "conn_feature", send: (frame) => featureFrames.push(frame) }, `feature:${FEATURE_ID}`);
+    hub.subscribe({ id: "conn_test", send: (frame) => testFrames.push(frame) }, `test:${TEST_ID}`);
+
+    const handle = startLiveRelay({
+      clientFactory: () => fake.client,
+      hub,
+      jobEvents: {
+        findByIdWithScope: vi.fn(async () => scope({ jobKind: "test_run", testId: TEST_ID })),
+      } as never,
+    });
+    await flush();
+
+    fake.emit("notification", { channel: LIVE_JOB_EVENTS_CHANNEL, payload: EVENT_ID });
+    await flush();
+
+    // Each frame carries its own scope, so a socket told to expect `test:` is not
+    // handed a feature id it was never authorised for.
+    expect(featureFrames).toEqual([
+      {
+        type: "event",
+        scope: { kind: "feature", id: FEATURE_ID },
+        event: expect.objectContaining({ id: EVENT_ID, message: "hello" }),
+      },
+    ]);
+    expect(testFrames).toEqual([
+      {
+        type: "event",
+        scope: { kind: "test", id: TEST_ID },
+        event: expect.objectContaining({ id: EVENT_ID, message: "hello" }),
+      },
+    ]);
+    await handle.stop();
+  });
+
+  it("reads the row once per notification, not once per scope", async () => {
+    // The fan-out must not multiply the database work: one event, one read, two
+    // publishes. A per-scope read would double the load precisely for the jobs that
+    // are already the busiest (a test_run emits report_test_step repeatedly).
+    const { fake, findByIdWithScope, handle } = build({
+      findByIdWithScope: vi.fn(async () => scope({ jobKind: "test_run", testId: TEST_ID })),
+    });
+    await flush();
+
+    fake.emit("notification", { channel: LIVE_JOB_EVENTS_CHANNEL, payload: EVENT_ID });
+    await flush();
+
+    expect(findByIdWithScope).toHaveBeenCalledTimes(1);
+    await handle.stop();
   });
 
   it("ignores notifications on other channels and empty payloads", async () => {

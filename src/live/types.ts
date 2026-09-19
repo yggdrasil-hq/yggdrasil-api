@@ -145,14 +145,16 @@ export function liveTopicForScope(scope: LiveScope): string {
 }
 
 /**
- * The fields of a job row that decide which scope its events belong to.
+ * The fields of a job row that decide which scope — or scopes — its events belong
+ * to.
  *
  * A structural input rather than `JobEventWithScope` or a `Job`, so that the
- * *stored-event* path and the *delta* path can both use one function. That is the
- * reason this exists at all: `relayEnvelopeFor` decides the topic of a stored
- * event and `publishDelta` decides the topic of a streaming chunk, and if the two
+ * *stored-event* path and the *delta* path can both use one cascade. That is the
+ * reason this exists at all: `relayEnvelopesFor` decides the topics of a stored
+ * event, `publishDelta` decides the topic of a streaming chunk, and if the two
  * disagreed, half a message's text would reach a topic nobody is reading. One
- * function means they cannot.
+ * cascade means they cannot — the delta path takes the primary scope from the same
+ * ordered list the stored path fans out over (issue #100).
  */
 export interface JobScopeFields {
   /** The owning job's id. Needed because a design session's scope id *is* its job id. */
@@ -163,31 +165,69 @@ export interface JobScopeFields {
 }
 
 /**
- * Which scope a job's events belong to, or null when nothing reads them.
+ * Every scope a job's events belong to, **primary first** (ADR 033 §2; issue
+ * #100).
  *
- * **Ordering is the contract, not an implementation detail.** Feature is checked
- * first and unconditionally, so a **feature-driven** `test_run` — one job with two
- * surfaces, carrying both a `feature_id` and a `test_id` — keeps routing to
- * `feature:` where it has always gone. The Test entity's page therefore gets no
- * socket signal for feature-driven runs, only for scheduled ones; that is a
- * pre-existing gap, filed as its own issue, and stated here because this is the
- * function where a reader would otherwise have to infer it.
+ * One job can have two surfaces. A **feature-driven** `test_run` carries both a
+ * `feature_id` and a `test_id`: it is dispatched for a feature's Testing stage
+ * (`features/internal-routes.ts` mints its spec with both) *and* it is one of the
+ * runs a Test entity's history lists. Routing it to only one of those left the
+ * other surface with no socket signal at all (issue #100), so this returns both
+ * and `relayEnvelopesFor` publishes one envelope per topic.
  *
- * **Null is a real answer.** A job with no feature, not a design session and no
- * test — nothing produces one today — is dropped rather than guessed onto a topic,
- * because inventing a topic nobody reads would be noise pretending to be a signal.
+ * **The order is the contract, not an implementation detail**, and it is exactly
+ * version 1's precedence: feature, then design session, then test. `liveScopeForJob`
+ * is the first element, so any path that can carry only one scope keeps the routing
+ * it has always had.
+ *
+ * **Every scope returned is one somebody reads**, which is the property that makes
+ * a *plural* return safe where a guessed topic is not. Each branch below is a
+ * routing key that names a surface, and an empty array is a real answer: a job with
+ * no feature, not a design session and no test — nothing produces one today — is
+ * dropped rather than guessed onto a topic, because inventing a topic nobody reads
+ * would be noise pretending to be a signal.
  *
  * **The design branch is keyed on the kind, unlike the other two.** A feature id
  * and a test id each name a surface on their own, so the id's presence is the
  * whole test. A design session's id alone does not say what it is — it is a job id,
  * and a `feature_build` job id looks identical — so the kind is what makes it
  * interpretable. That asymmetry is why this function takes the kind at all.
+ *
+ * **A design session is also excluded when the job has a feature**, which is how
+ * version 1 read it as well: `featureId` was tested first and returned, so the
+ * design branch was unreachable for such a job. Keeping that here matters because
+ * the scope's id is the *job* id — a `design_grill` job that somehow carried a
+ * feature would otherwise be handed a `design:<jobId>` topic for a design session
+ * that does not exist. No caller produces that shape; it is refused because
+ * fabricating a second destination is worse than ignoring an impossible one.
+ */
+export function liveScopesForJob(job: JobScopeFields): LiveScope[] {
+  const scopes: LiveScope[] = [];
+  if (job.featureId) scopes.push({ kind: "feature", id: job.featureId });
+  if (!job.featureId && job.jobKind === "design_grill") {
+    scopes.push({ kind: "design_session", id: job.jobId });
+  }
+  if (job.testId) scopes.push({ kind: "test", id: job.testId });
+  return scopes;
+}
+
+/**
+ * The **primary** scope a job's events belong to, or null when nothing reads them.
+ *
+ * Defined as `liveScopesForJob`'s first element rather than as its own cascade, and
+ * that is deliberate: two functions with two orderings is precisely how a streaming
+ * chunk and the stored event that supersedes it would come to disagree about which
+ * topic they belong on. One cascade, one order, one answer to "which one".
+ *
+ * For a path that genuinely has only one destination — a delta, whose payload is
+ * built with a single `scope` (ADR 033 §5) — so a feature-driven `test_run`'s
+ * streaming text keeps going to `feature:`, where it has always gone. The stored
+ * events go to both scopes; a delta is progressive text and a surface that renders
+ * run reports and steps has nothing to append it to, so a second copy would be
+ * published and unconsumed.
  */
 export function liveScopeForJob(job: JobScopeFields): LiveScope | null {
-  if (job.featureId) return { kind: "feature", id: job.featureId };
-  if (job.jobKind === "design_grill") return { kind: "design_session", id: job.jobId };
-  if (job.testId) return { kind: "test", id: job.testId };
-  return null;
+  return liveScopesForJob(job)[0] ?? null;
 }
 
 /**
@@ -357,7 +397,7 @@ export interface LiveDeltaPayload {
  *
  * Pure and separate from the publisher so the payload contract (what the writer
  * emits and what `deltaFromPayload` reads) is testable on both sides without a
- * database — the same reason `relayEnvelopeFor` exists for stored events.
+ * database — the same reason `relayEnvelopesFor` exists for stored events.
  */
 export function encodeDeltaPayload(delta: LiveDeltaPayload): string | null {
   if (delta.text === "" || delta.jobId === "") return null;

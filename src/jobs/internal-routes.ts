@@ -665,11 +665,22 @@ async function publishDelta(
     if (!recorded) return;
 
     // ADR 033 §5: the scope is resolved from the job rather than taken from the
-    // body, and through the *same* function the stored-event path uses
-    // (`liveScopeForJob`), so a streaming chunk and the `agent_text` that
-    // supersedes it cannot be routed to different topics. Version 1 returned early
-    // on `!recorded.featureId`, which is exactly why a design session's prose
-    // arrived per message instead of per token (issue #95).
+    // body, and through the *same* function the stored-event path uses, so a
+    // streaming chunk and the `agent_text` that supersedes it cannot be routed by
+    // two different rules. Version 1 returned early on `!recorded.featureId`, which
+    // is exactly why a design session's prose arrived per message instead of per
+    // token (issue #95).
+    //
+    // **The *primary* scope, which is the deliberate half of issue #100.** A delta's
+    // payload carries exactly one `scope` (ADR 033 §5), so this path must pick one —
+    // and it picks the same one version 1 did: for a feature-driven `test_run` that
+    // is `feature:`, where the feature's own surfaces are listening. The stored
+    // event goes to *both* that job's scopes, because it is the record each surface
+    // renders; a delta is progressive text, and the Test entity's run history shows
+    // runs, steps and reports rather than agent prose, so a second copy of every
+    // chunk would be published and consumed by nobody — the shape this burn-down
+    // keeps finding. If a surface ever renders a run's live output, this is the line
+    // to revisit, and `liveScopesForJob` is already the plural it would need.
     const scope = liveScopeForJob({
       jobId,
       featureId: recorded.featureId,

@@ -30,7 +30,7 @@ import { livePostgresSkipWarning, probeLivePostgres } from "../testing/live-post
  * with the code by construction, which is how this codebase shipped #43, #56, #61,
  * #75, #76 and #86 behind a green suite.
  *
- * The pure routing half — `relayEnvelopeFor` — is covered in `relay.test.ts` and
+ * The pure routing half — `relayEnvelopesFor` — is covered in `relay.test.ts` and
  * needs no database by design. What *does* need one is the claim that
  * `findByIdWithScope` actually returns the new `jobKind` column; that is asserted
  * in `jobs/events-repository.postgres.test.ts`, where the scope read lives, since
