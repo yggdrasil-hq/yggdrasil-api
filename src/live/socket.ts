@@ -29,6 +29,33 @@ import {
  */
 export const LIVE_MAX_PROTOCOL_ERRORS = 5;
 
+/**
+ * How many client frames may be buffered while authentication is in flight
+ * (issue #77).
+ *
+ * The window is short — one session lookup — but it is a window an
+ * **unauthenticated** peer controls, so an unbounded queue is a small
+ * memory-exhaustion path: `ws`'s default `maxPayload` is 100 MiB, so a single
+ * frame can be large and a fast sender can queue several.
+ *
+ * A real client sends one `subscribe` (or one `ping`) in this window, so 8 is
+ * generous. Exceeding it is treated as a protocol failure and the socket is
+ * closed, which is the honest outcome: a client that has sent eight frames before
+ * the server finished a database lookup is not behaving like the protocol's
+ * client.
+ */
+export const LIVE_MAX_EARLY_FRAMES = 8;
+
+/**
+ * How many bytes of early frames may be buffered (issue #77).
+ *
+ * A byte bound as well as a count bound, because the count alone bounds nothing:
+ * 8 frames of 100 MiB is still 800 MiB. A real early frame is a `subscribe`
+ * carrying two uuids — under 100 bytes — so 64 KiB is orders of magnitude above
+ * legitimate use while keeping the worst case trivial.
+ */
+export const LIVE_MAX_EARLY_BYTES = 64 * 1024;
+
 export interface LiveSocketDeps {
   /** The HTTP server to attach the upgrade listener to. */
   server: Server;
@@ -53,6 +80,16 @@ export interface LiveSocketServer {
   /** Stops accepting upgrades and terminates the sockets this process holds. */
   close(): Promise<void>;
 }
+
+/**
+ * A client frame received before authentication finished, held as its raw text.
+ *
+ * Kept as text rather than parsed: parsing twice (once here, once in the real
+ * handler) would duplicate the protocol-error accounting, and a frame that is
+ * malformed should produce its error exactly once, in the place that owns
+ * `protocolErrors`.
+ */
+type EarlyFrame = string;
 
 /** A hub connection that additionally remembers who it authenticated as. */
 interface AuthedConnection extends LiveConnection {
@@ -92,7 +129,64 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
   });
 
   wss.on("connection", (socket: WebSocket, request) => {
-    void openConnection(socket, request.headers.cookie);
+    // Issue #77: the socket's listener is attached **here**, synchronously,
+    // before authentication starts — not inside `openConnection` after it
+    // finishes. `ws` emits `message` only to listeners that already exist and
+    // does not buffer, so a frame arriving during the session lookup used to be
+    // delivered to nobody: no error, no `subscribed`, socket open and answering
+    // `ping`. From the client's side that is indistinguishable from "subscribed,
+    // nothing has happened yet" — forever.
+    const pending: EarlyFrame[] = [];
+    let pendingBytes = 0;
+    let authenticated = false;
+    let overflowed = false;
+
+    socket.on("message", (data: RawData) => {
+      const text = data.toString();
+      if (authenticated) {
+        // Steady state: hand straight to the connection's own queue, which
+        // `openConnection` has by now installed.
+        deliver(text);
+        return;
+      }
+      if (overflowed) return;
+
+      // Bounded on both axes. The count alone bounds nothing, because a single
+      // frame may be up to `ws`'s `maxPayload` (100 MiB by default).
+      pendingBytes += Buffer.byteLength(text);
+      if (
+        pending.length >= LIVE_MAX_EARLY_FRAMES ||
+        pendingBytes > LIVE_MAX_EARLY_BYTES
+      ) {
+        overflowed = true;
+        pending.length = 0;
+        report(
+          `live socket sent more than ${LIVE_MAX_EARLY_FRAMES} frames / ${LIVE_MAX_EARLY_BYTES} bytes before authenticating; closing`,
+        );
+        // Closed rather than ignored: a client that floods the pre-auth window
+        // is not one to keep serving, and silence here would be the same defect
+        // in a new place.
+        reject(socket, "too many frames before authentication", LIVE_CLOSE_PROTOCOL);
+        return;
+      }
+      pending.push(text);
+    });
+
+    // Set by `openConnection` once the real queue exists. Until then, early
+    // frames are buffered; afterwards, `deliver` routes to it.
+    let deliver: (text: string) => void = () => {};
+
+    void openConnection(socket, request.headers.cookie, {
+      claim: (enqueue) => {
+        deliver = enqueue;
+        authenticated = true;
+        // Drained in arrival order. Ordering is enforced by the queue itself
+        // (each frame waits for the previous to finish), so this loop only has
+        // to preserve *arrival* order — which it does by iterating the buffer.
+        const buffered = pending.splice(0, pending.length);
+        for (const text of buffered) enqueue(text);
+      },
+    });
   });
 
   async function authenticate(cookieHeader: string | undefined) {
@@ -103,16 +197,27 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
     return deps.users.findById(session.userId);
   }
 
-  async function openConnection(socket: WebSocket, cookieHeader: string | undefined) {
+  async function openConnection(
+    socket: WebSocket,
+    cookieHeader: string | undefined,
+    early: { claim: (handler: (text: string) => void) => void },
+  ) {
     let user;
     try {
       user = await authenticate(cookieHeader);
     } catch (error) {
       report(`live socket handshake failed: ${describe(error)}`);
+      // The buffered frames are simply dropped with the socket. They must not be
+      // replayed anywhere: they arrived from a peer whose identity was never
+      // established, so processing them would be acting on an unauthenticated
+      // client's behalf.
       socket.close(LIVE_CLOSE_PROTOCOL, "handshake failed");
       return;
     }
     if (!user) {
+      // Same reasoning as above, and the reason buffering is safe at all: the
+      // early-frame buffer belongs to a connection that may still turn out not
+      // to be anyone.
       reject(socket, "Not authenticated", LIVE_CLOSE_UNAUTHORIZED);
       return;
     }
@@ -166,8 +271,26 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
       report(`live socket error: ${describe(error)}`);
     });
 
-    socket.on("message", (data: RawData) => {
-      const frame = parseClientFrame(data.toString());
+    /**
+     * Frames are processed **one at a time, in arrival order** — see
+     * `queueFrame` below. `handleFrame` does the work for a single frame.
+     *
+     * The serialization is not optional, and it is a genuine defect it fixes
+     * rather than a precaution. `unsubscribe` is handled synchronously while
+     * `subscribe` awaits an authorisation query, so two frames sent together
+     * (`subscribe` then `unsubscribe`) used to complete **out of order**: the
+     * client received `unsubscribed` before `subscribed` and the connection was
+     * left in the hub as a subscriber when its last stated intent was to leave.
+     * A stale subscription is not cosmetic — it keeps delivering events to a
+     * client that asked to stop, and it holds a hub entry the client cannot
+     * remove because it believes it already did.
+     *
+     * Verified to be pre-existing rather than introduced by the early-frame
+     * buffering: the same two frames sent *after* `ready` reproduce it. Buffering
+     * only made it easier to hit, which is how it was found.
+     */
+    async function handleFrame(text: string): Promise<void> {
+      const frame = parseClientFrame(text);
       if (!frame) {
         protocolErrors += 1;
         if (protocolErrors >= LIVE_MAX_PROTOCOL_ERRORS) {
@@ -190,10 +313,44 @@ export function createLiveSocketServer(deps: LiveSocketDeps): LiveSocketServer {
         return;
       }
 
-      void subscribe(connection, frame.projectId, frame.featureId);
-    });
+      // Awaited rather than fired and forgotten: `subscribe` does an
+      // authorisation query, and returning before it resolves is what let a
+      // later frame overtake it (see the note on `queueFrame`).
+      await subscribe(connection, frame.projectId, frame.featureId);
+    }
 
+    /**
+     * A per-connection promise chain: each frame's handling is appended after the
+     * previous one has *finished*, not merely after it was started.
+     *
+     * A chain rather than a queue of buffered frames because the order that
+     * matters is completion order, and a `subscribe` that has started but not
+     * resolved is not yet "processed". Serializing on completion is what makes
+     * `subscribe` → `unsubscribe` sent together end up unsubscribed.
+     *
+     * Rejections are swallowed per link so one failing frame cannot break the
+     * chain for every frame after it — `handleFrame` reports its own failures and
+     * a poisoned chain would silently stop responding, which is the class of bug
+     * this whole file exists to avoid.
+     */
+    let frameChain: Promise<void> = Promise.resolve();
+    function queueFrame(text: string): void {
+      frameChain = frameChain
+        .then(() => handleFrame(text))
+        .catch((error: unknown) => {
+          report(`live socket frame handling failed: ${describe(error)}`);
+        });
+    }
+
+    // `ready` is sent **before** the buffered frames are drained, and that order
+    // is the protocol's, not an implementation detail: `ready` announces the
+    // protocol version, and a client that subscribed early is entitled to see it
+    // before the `subscribed` reply. Reversing these would make the early and
+    // late paths produce different frame sequences for the same client.
     safeSend(connection, { type: "ready", protocolVersion: LIVE_PROTOCOL_VERSION });
+
+    // Drains any frames that arrived during authentication, in order.
+    early.claim(queueFrame);
   }
 
   async function subscribe(
