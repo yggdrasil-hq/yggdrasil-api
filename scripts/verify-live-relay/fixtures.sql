@@ -63,6 +63,42 @@ VALUES (
   'design_grill', 'running'
 ) ON CONFLICT (id) DO NOTHING;
 
+-- Issue #90 / #100: a `tests` row. The `test:` scope needs one for its authoriser to
+-- resolve, and both `test_run` shapes below point at it — including the
+-- feature-driven one, which is why it is also the *second* destination of a job that
+-- already has a feature.
+INSERT INTO tests (id, project_id, name, spec_markdown, schedule_cron)
+VALUES (
+  '99999999-9999-4999-8999-999999999999',
+  '33333333-3333-4333-8333-333333333333',
+  'Relay Verify Test', '# relay verify fixture', '* * * * *'
+) ON CONFLICT (id) DO NOTHING;
+
+-- Issue #90: a scheduled `test_run` — a `test_id` and **no** `feature_id`. That
+-- absence is the whole reason the `test:` topic had to exist, because a
+-- feature-less job could not be routed by the feature topic at all.
+INSERT INTO jobs (id, project_id, feature_id, test_id, kind, status, trigger_source)
+VALUES (
+  '88888888-8888-4888-8888-888888888888',
+  '33333333-3333-4333-8333-333333333333',
+  NULL,
+  '99999999-9999-4999-8999-999999999999',
+  'test_run', 'running', 'schedule'
+) ON CONFLICT (id) DO NOTHING;
+
+-- Issue #100: a **feature-driven** `test_run` — both a `feature_id` and a
+-- `test_id`. One job with two surfaces: the feature it was dispatched for, and the
+-- Test entity whose history lists it. It is the fixture the fan-out check writes
+-- to, and the reason one event must arrive on two topics.
+INSERT INTO jobs (id, project_id, feature_id, test_id, kind, status)
+VALUES (
+  'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+  '33333333-3333-4333-8333-333333333333',
+  '44444444-4444-4444-8444-444444444444',
+  '99999999-9999-4999-8999-999999999999',
+  'test_run', 'running'
+) ON CONFLICT (id) DO NOTHING;
+
 -- The session id *is* the cookie value (the relay reads an opaque id off the raw
 -- Cookie header and calls findValid on it — there is no signature), so the
 -- verifier can authenticate by sending this literal.
